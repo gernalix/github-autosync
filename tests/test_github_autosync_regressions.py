@@ -177,7 +177,7 @@ class AutosyncRegressionTests(unittest.TestCase):
     def test_dry_run_missing_upstream_uses_ls_remote_without_fetch_or_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            worktree = root / "repo"
+            worktree = root / "codex-roadmap"
             worktree.mkdir()
             repo = {
                 "name": "codex-roadmap",

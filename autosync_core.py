@@ -278,42 +278,44 @@ def git_counts(worktree: Path) -> tuple[int, int] | None:
         return None
 
 
-def _worktree_basics(entry: dict[str, Any]) -> tuple[Path, list[dict[str, Any]], str | None]:
+def _worktree_basics(
+    entry: dict[str, Any],
+) -> tuple[Path, list[dict[str, Any]], str | None, str | None]:
     worktree = Path(str(entry["worktree"])).expanduser()
     if not worktree.exists():
-        return worktree, [issue(entry, "missing_worktree")], None
+        return worktree, [issue(entry, "missing_worktree")], None, None
     probe = run(["git", "rev-parse", "--is-inside-work-tree"], worktree, timeout=30)
     if probe.returncode != 0 or probe.stdout.strip() != "true":
-        return worktree, [issue(entry, "not_git_worktree")], None
+        return worktree, [issue(entry, "not_git_worktree")], None, None
     remote = run(["git", "config", "--get", "remote.origin.url"], worktree, timeout=30)
     if remote.returncode != 0 or not remote.stdout.strip():
-        return worktree, [issue(entry, "origin_missing")], None
+        return worktree, [issue(entry, "origin_missing")], None, None
     if normalize_remote(remote.stdout) != normalize_remote(str(entry["remote_url"])):
-        return worktree, [issue(entry, "origin_mismatch")], None
+        return worktree, [issue(entry, "origin_mismatch")], None, None
     branch = run(["git", "branch", "--show-current"], worktree, timeout=30)
     if branch.returncode != 0 or not branch.stdout.strip():
-        return worktree, [issue(entry, "detached_or_unknown_branch")], None
+        return worktree, [issue(entry, "detached_or_unknown_branch")], None, None
     branch_name = branch.stdout.strip()
     upstream = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], worktree, timeout=30)
     if upstream.returncode != 0 or "/" not in upstream.stdout.strip():
         fetch = run(["git", "fetch", "--prune", "origin"], worktree, timeout=120)
         if fetch.returncode != 0:
-            return worktree, [issue(entry, "fetch_failed")], None
+            return worktree, [issue(entry, "fetch_failed")], None, None
         remote_branch = f"refs/remotes/origin/{branch_name}"
         exists = run(["git", "show-ref", "--verify", "--quiet", remote_branch], worktree, timeout=30)
         if exists.returncode != 0:
-            return worktree, [issue(entry, "no_upstream")], None
+            return worktree, [issue(entry, "no_upstream")], None, None
         tracking = run(["git", "branch", f"--set-upstream-to=origin/{branch_name}", branch_name], worktree, timeout=30)
         if tracking.returncode != 0:
-            return worktree, [issue(entry, "no_upstream")], None
-        return worktree, [], f"origin/{branch_name}"
-    return worktree, [], upstream.stdout.strip()
+            return worktree, [issue(entry, "no_upstream")], None, None
+        return worktree, [], f"origin/{branch_name}", "origin"
+    return worktree, [], upstream.stdout.strip(), None
 
 
 def audit_worktree(
     entry: dict[str, Any], *, auto_push: bool, report_behind: bool, fetch_remote: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
-    worktree, problems, upstream_name = _worktree_basics(entry)
+    worktree, problems, upstream_name, fetched_remote = _worktree_basics(entry)
     if problems:
         return problems, False
     assert upstream_name is not None
@@ -322,7 +324,7 @@ def audit_worktree(
     if status.returncode != 0:
         return [issue(entry, "status_failed")], False
     dirty = bool(status.stdout.strip())
-    if fetch_remote:
+    if fetch_remote and fetched_remote != remote_name:
         fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)
         if fetch.returncode != 0:
             return [issue(entry, "fetch_failed")], False
@@ -378,13 +380,19 @@ def audit_inventory(
     return issues, pushed
 
 
-def clone_repo(repo: dict[str, str], projects_dir: Path, *, dry_run: bool) -> str:
-    worktree = projects_dir / repo["name"]
+def clone_repo(
+    repo: dict[str, str],
+    projects_dir: Path,
+    *,
+    dry_run: bool,
+    target_worktree: Path | None = None,
+) -> str:
+    worktree = target_worktree or projects_dir / repo["name"]
     if worktree.exists():
         return "present"
     if dry_run:
         return "would_clone"
-    projects_dir.mkdir(parents=True, exist_ok=True)
+    worktree.parent.mkdir(parents=True, exist_ok=True)
     cmd = ["git", "clone", "--origin", "origin"]
     if repo.get("default_branch") and repo["default_branch"] != "UNKNOWN":
         cmd += ["--branch", repo["default_branch"], "--single-branch"]
@@ -407,7 +415,7 @@ def sync_changed_repo(
     if inventory_entry:
         entry.update(inventory_entry)
     if not worktree.exists():
-        return clone_repo(repo, projects_dir, dry_run=dry_run), None
+        return clone_repo(repo, projects_dir, dry_run=dry_run, target_worktree=worktree), None
     if not git_repo_matches_remote(worktree, repo["url"]):
         return "deferred", issue(entry, "origin_mismatch")
     status = run(["git", "status", "--porcelain"], worktree, timeout=30)
@@ -421,18 +429,28 @@ def sync_changed_repo(
     upstream = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], worktree, timeout=30)
     if upstream.returncode != 0 or "/" not in upstream.stdout.strip():
         branch_name = branch.stdout.strip()
+        remote_branch_ref = f"refs/remotes/origin/{branch_name}"
+        if dry_run:
+            exists = run(["git", "show-ref", "--verify", "--quiet", remote_branch_ref], worktree, timeout=30)
+            if exists.returncode != 0:
+                remote_probe = run(
+                    ["git", "ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch_name}"],
+                    worktree,
+                    timeout=120,
+                )
+                if remote_probe.returncode != 0:
+                    return "deferred", issue(entry, "no_upstream")
+            return "would_update", None
         fetch = run(["git", "fetch", "--prune", "origin"], worktree, timeout=120)
         if fetch.returncode != 0:
             return "deferred", issue(entry, "fetch_failed")
         fetched_remote = "origin"
-        remote_branch_ref = f"refs/remotes/origin/{branch_name}"
         exists = run(["git", "show-ref", "--verify", "--quiet", remote_branch_ref], worktree, timeout=30)
         if exists.returncode != 0:
             return "deferred", issue(entry, "no_upstream")
-        if not dry_run:
-            tracking = run(["git", "branch", f"--set-upstream-to=origin/{branch_name}", branch_name], worktree, timeout=30)
-            if tracking.returncode != 0:
-                return "deferred", issue(entry, "no_upstream")
+        tracking = run(["git", "branch", f"--set-upstream-to=origin/{branch_name}", branch_name], worktree, timeout=30)
+        if tracking.returncode != 0:
+            return "deferred", issue(entry, "no_upstream")
         upstream_name = f"origin/{branch_name}"
     else:
         upstream_name = upstream.stdout.strip()
@@ -625,7 +643,14 @@ def command_run(args: argparse.Namespace) -> int:
     telegram_enabled = not args.no_telegram and not args.dry_run
     issues: list[dict[str, Any]] = []
     registration: dict[str, int | str] = {"validation": "not_run"}
-    counts = {"cloned": 0, "updated": 0, "pushed": 0, "skipped_unchanged": 0, "deferred": 0}
+    counts = {
+        "cloned": 0,
+        "updated": 0,
+        "pushed": 0,
+        "audited_unchanged": 0,
+        "skipped_unchanged": 0,
+        "deferred": 0,
+    }
     auto_pushed = 0
     try:
         with ExclusiveLock(state_dir / "autosync.lock"):
@@ -654,7 +679,29 @@ def command_run(args: argparse.Namespace) -> int:
                 inventory_entry = inventory_by_remote.get(normalize_remote(repo["url"]))
                 worktree = Path(str(inventory_entry["worktree"])) if inventory_entry else projects_dir / repo["name"]
                 if previous == fingerprint and worktree.exists():
-                    counts["skipped_unchanged"] += 1
+                    if args.dry_run:
+                        counts["skipped_unchanged"] += 1
+                        continue
+                    local_entry = inventory_entry or {
+                        "project_id": None,
+                        "slug": repo["name"],
+                        "worktree": str(worktree),
+                        "remote_url": repo["url"],
+                        "branch": repo.get("default_branch") or "UNKNOWN",
+                    }
+                    repo_issues, did_push = audit_worktree(
+                        local_entry,
+                        auto_push=True,
+                        report_behind=False,
+                        fetch_remote=False,
+                    )
+                    counts["audited_unchanged"] += 1
+                    auto_pushed += int(did_push)
+                    if repo_issues:
+                        issues.extend(repo_issues)
+                        counts["deferred"] += 1
+                    elif not did_push:
+                        counts["skipped_unchanged"] += 1
                     continue
                 result, repo_issue = sync_changed_repo(
                     repo, projects_dir, dry_run=args.dry_run, inventory_entry=inventory_entry

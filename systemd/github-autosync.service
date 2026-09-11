@@ -1,0 +1,17 @@
+[Unit]
+Description=Safely autosync gernalix GitHub repositories with ghorg
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/daniele/projects/github-autosync
+ExecStart=/usr/bin/python3 /home/daniele/projects/github-autosync/github_autosync.py run
+TimeoutStartSec=1800
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/daniele/.local/state/codex-github-autosync /home/daniele/projects /home/daniele/MegaVault
+StandardOutput=journal
+StandardError=journal

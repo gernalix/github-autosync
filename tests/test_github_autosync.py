@@ -83,6 +83,7 @@ class AutosyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo, bare = self.make_repo_pair(Path(tmp) / "pair")
             self.assertEqual(0, git(["branch", "--unset-upstream"], repo).returncode)
+            self.assertEqual(0, git(["update-ref", "-d", "refs/remotes/origin/main"], repo).returncode)
             issues, _ = autosync.audit_worktree(self.entry(repo, bare), auto_push=False, report_behind=True)
             self.assertEqual([], issues)
             upstream = git(["rev-parse", "--abbrev-ref", "@{u}"], repo)
@@ -101,10 +102,10 @@ class AutosyncTests(unittest.TestCase):
             root = Path(tmp)
             projects = root / "projects"
             projects.mkdir()
-            (projects / "one").mkdir()
+            (projects / "codex-roadmap").mkdir()
             state = root / "state"
-            repo = {"owner": "gernalix", "name": "one", "url": "https://github.com/gernalix/one", "default_branch": "main", "pushed_at": "2026-09-11T10:00:00Z", "archived": "0"}
-            autosync.save_repo_state(state, {"one": autosync.repo_fingerprint(repo)})
+            repo = {"owner": "gernalix", "name": "codex-roadmap", "url": "https://github.com/gernalix/codex-roadmap", "default_branch": "main", "pushed_at": "2026-09-11T10:00:00Z", "archived": "0"}
+            autosync.save_repo_state(state, {"codex-roadmap": autosync.repo_fingerprint(repo)})
             args = autosync.build_parser().parse_args(["--projects-dir", str(projects), "--state-dir", str(state), "--megavault", str(root / "mv"), "--no-telegram", "run"])
             with (
                 mock.patch.object(autosync, "megavault_inventory", return_value=[]),
@@ -122,12 +123,12 @@ class AutosyncTests(unittest.TestCase):
             root = Path(tmp)
             projects = root / "projects"
             projects.mkdir()
-            for name in ("one", "two"):
+            for name in ("codex-roadmap", "github-autosync"):
                 (projects / name).mkdir()
             state = root / "state"
-            one_old = {"name": "one", "url": "https://github.com/gernalix/one", "default_branch": "main", "pushed_at": "A", "archived": "0"}
-            two = {"name": "two", "url": "https://github.com/gernalix/two", "default_branch": "main", "pushed_at": "A", "archived": "0"}
-            autosync.save_repo_state(state, {"one": autosync.repo_fingerprint(one_old), "two": autosync.repo_fingerprint(two)})
+            one_old = {"name": "codex-roadmap", "url": "https://github.com/gernalix/codex-roadmap", "default_branch": "main", "pushed_at": "A", "archived": "0"}
+            two = {"name": "github-autosync", "url": "https://github.com/gernalix/github-autosync", "default_branch": "main", "pushed_at": "A", "archived": "0"}
+            autosync.save_repo_state(state, {"codex-roadmap": autosync.repo_fingerprint(one_old), "github-autosync": autosync.repo_fingerprint(two)})
             one_new = {**one_old, "pushed_at": "B"}
             args = autosync.build_parser().parse_args(["--projects-dir", str(projects), "--state-dir", str(state), "--megavault", str(root / "mv"), "--no-telegram", "run"])
             with (
@@ -140,7 +141,7 @@ class AutosyncTests(unittest.TestCase):
             ):
                 self.assertEqual(0, autosync.command_run(args))
                 self.assertEqual(1, sync.call_count)
-                self.assertEqual("one", sync.call_args.args[0]["name"])
+                self.assertEqual("codex-roadmap", sync.call_args.args[0]["name"])
 
     def test_new_repo_is_cloned_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -175,9 +176,9 @@ class AutosyncTests(unittest.TestCase):
             root = Path(tmp)
             worktree = root / "canonical"
             worktree.mkdir()
-            remote = "https://github.com/gernalix/one"
-            inventory = {"project_id": 42, "slug": "one", "worktree": str(worktree), "remote_url": remote, "branch": "main"}
-            repo = {"name": "one", "url": remote, "default_branch": "main", "pushed_at": "A", "archived": "0"}
+            remote = "https://github.com/gernalix/codex-roadmap"
+            inventory = {"project_id": 42, "slug": "codex-roadmap", "worktree": str(worktree), "remote_url": remote, "branch": "main"}
+            repo = {"name": "codex-roadmap", "url": remote, "default_branch": "main", "pushed_at": "A", "archived": "0"}
             args = autosync.build_parser().parse_args(["--projects-dir", str(root / "projects"), "--state-dir", str(root / "state"), "--megavault", str(root / "mv"), "--no-telegram", "run"])
             with (
                 mock.patch.object(autosync, "megavault_inventory", return_value=[inventory]),
@@ -191,6 +192,85 @@ class AutosyncTests(unittest.TestCase):
             audit.assert_called_once_with([], auto_push=True, report_behind=False, fetch_remote=False)
             self.assertEqual(1, sync.call_count)
             self.assertEqual(42, sync.call_args.kwargs["inventory_entry"]["project_id"])
+
+    def test_unchanged_fingerprint_uses_canonical_worktree_before_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            duplicate = root / "projects" / "codex-roadmap"
+            duplicate.mkdir(parents=True)
+            canonical = root / "canonical"
+            remote = "https://github.com/gernalix/codex-roadmap"
+            inventory = {"project_id": 42, "slug": "codex-roadmap", "worktree": str(canonical), "remote_url": remote, "branch": "main"}
+            repo = {"name": "codex-roadmap", "url": remote, "default_branch": "main", "pushed_at": "A", "archived": "0"}
+            state = root / "state"
+            autosync.save_repo_state(state, {"codex-roadmap": autosync.repo_fingerprint(repo)})
+            args = autosync.build_parser().parse_args(["--projects-dir", str(root / "projects"), "--state-dir", str(state), "--megavault", str(root / "mv"), "--no-telegram", "run"])
+            with (
+                mock.patch.object(autosync, "megavault_inventory", return_value=[inventory]),
+                mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
+                mock.patch.object(autosync, "github_repos", return_value=[repo]),
+                mock.patch.object(autosync, "sync_changed_repo", return_value=("updated", None)) as sync,
+                mock.patch.object(autosync, "megavault_registered_remotes", return_value={autosync.normalize_remote(remote)}),
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}),
+            ):
+                self.assertEqual(0, autosync.command_run(args))
+            sync.assert_called_once()
+            self.assertEqual(str(canonical), sync.call_args.kwargs["inventory_entry"]["worktree"])
+
+    def test_github_repo_outside_allowlist_is_ignored_and_state_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            autosync.save_repo_state(state, {"unmanaged": "old"})
+            unmanaged = {"name": "unmanaged", "url": "https://github.com/gernalix/unmanaged", "default_branch": "main", "pushed_at": "A", "archived": "0"}
+            args = autosync.build_parser().parse_args(["--projects-dir", str(root / "projects"), "--state-dir", str(state), "--megavault", str(root / "mv"), "--no-telegram", "run"])
+            with (
+                mock.patch.object(autosync, "megavault_inventory", return_value=[]),
+                mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
+                mock.patch.object(autosync, "github_repos", return_value=[unmanaged]),
+                mock.patch.object(autosync, "sync_changed_repo") as sync,
+                mock.patch.object(autosync, "megavault_registered_remotes", return_value=set()),
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}) as register,
+                mock.patch.object(autosync, "update_telegram_alert_state", return_value="disabled") as alerts,
+            ):
+                self.assertEqual(0, autosync.command_run(args))
+            sync.assert_not_called()
+            register.assert_called_once_with(root / "mv", root / "projects", [], dry_run=False)
+            alerts.assert_called_once()
+            self.assertEqual({}, autosync.load_repo_state(state))
+
+    def test_megavault_worktree_outside_allowlist_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unmanaged = {"project_id": 99, "slug": "unmanaged", "worktree": str(root / "dirty"), "remote_url": "https://github.com/gernalix/unmanaged", "branch": "main"}
+            args = autosync.build_parser().parse_args(["--projects-dir", str(root / "projects"), "--state-dir", str(root / "state"), "--megavault", str(root / "mv"), "--no-telegram", "run"])
+            with (
+                mock.patch.object(autosync, "megavault_inventory", return_value=[unmanaged]),
+                mock.patch.object(autosync, "audit_inventory", return_value=([], 0)) as audit,
+                mock.patch.object(autosync, "github_repos", return_value=[]),
+                mock.patch.object(autosync, "megavault_registered_remotes", return_value=set()),
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}),
+                mock.patch.object(autosync, "update_telegram_alert_state", return_value="disabled") as alerts,
+            ):
+                self.assertEqual(0, autosync.command_run(args))
+            audit.assert_called_once_with([], auto_push=True, report_behind=False, fetch_remote=False)
+            alerts.assert_called_once()
+
+    def test_allowed_repo_is_still_synced_normally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = {"name": "salute", "url": "https://github.com/gernalix/salute", "default_branch": "main", "pushed_at": "A", "archived": "0"}
+            args = autosync.build_parser().parse_args(["--projects-dir", str(root / "projects"), "--state-dir", str(root / "state"), "--megavault", str(root / "mv"), "--no-telegram", "run"])
+            with (
+                mock.patch.object(autosync, "megavault_inventory", return_value=[]),
+                mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
+                mock.patch.object(autosync, "github_repos", return_value=[repo]),
+                mock.patch.object(autosync, "sync_changed_repo", return_value=("updated", None)) as sync,
+                mock.patch.object(autosync, "megavault_registered_remotes", return_value={autosync.normalize_remote(repo["url"])}),
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}),
+            ):
+                self.assertEqual(0, autosync.command_run(args))
+            sync.assert_called_once()
 
     def test_telegram_alert_fingerprint_suppresses_identical_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

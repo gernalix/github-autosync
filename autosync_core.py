@@ -17,6 +17,21 @@ DEFAULT_STATE_DIR = Path.home() / ".local/state/codex-github-autosync"
 DEFAULT_MEGAVAULT = Path.home() / "MegaVault"
 ALERT_STATE_FILE = "telegram-alert-state.json"
 REPO_STATE_FILE = "repo-state.json"
+ALLOWED_REPOSITORIES = frozenset(
+    {
+        "gernalix/codex-roadmap",
+        "gernalix/vm_oracle",
+        "gernalix/MegaVault",
+        "gernalix/fedora-system-monitor",
+        "gernalix/codex-usage",
+        "gernalix/github-autosync",
+        "gernalix/PersonalHub",
+        "gernalix/codex-usage-monitor",
+        "gernalix/fedora-t7-backup",
+        "gernalix/amici_fb",
+        "gernalix/salute",
+    }
+)
 
 
 class AutosyncError(RuntimeError):
@@ -100,6 +115,37 @@ def github_repos(owner: str) -> list[dict[str, str]]:
             }
         )
     return sorted(repos, key=lambda row: row["name"])
+
+
+def allowed_repo_key(owner: str, name: str) -> str:
+    return f"{owner}/{name}"
+
+
+def is_allowed_repo(owner: str, name: str) -> bool:
+    return allowed_repo_key(owner, name) in ALLOWED_REPOSITORIES
+
+
+def github_remote_key(url: str) -> str | None:
+    normalized = normalize_remote(url)
+    prefix = "https://github.com/"
+    if not normalized.startswith(prefix):
+        return None
+    parts = normalized.removeprefix(prefix).split("/")
+    if len(parts) != 2:
+        return None
+    for allowed in ALLOWED_REPOSITORIES:
+        owner, name = allowed.split("/", 1)
+        if parts[0].lower() == owner.lower() and parts[1].lower() == name.lower():
+            return allowed
+    return None
+
+
+def filter_allowed_repos(owner: str, repos: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [repo for repo in repos if is_allowed_repo(owner, repo["name"])]
+
+
+def filter_allowed_inventory(inventory: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [entry for entry in inventory if github_remote_key(str(entry["remote_url"])) in ALLOWED_REPOSITORIES]
 
 
 def repo_fingerprint(repo: dict[str, str]) -> str:
@@ -250,6 +296,9 @@ def _worktree_basics(entry: dict[str, Any]) -> tuple[Path, list[dict[str, Any]],
     branch_name = branch.stdout.strip()
     upstream = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], worktree, timeout=30)
     if upstream.returncode != 0 or "/" not in upstream.stdout.strip():
+        fetch = run(["git", "fetch", "--prune", "origin"], worktree, timeout=120)
+        if fetch.returncode != 0:
+            return worktree, [issue(entry, "fetch_failed")], None
         remote_branch = f"refs/remotes/origin/{branch_name}"
         exists = run(["git", "show-ref", "--verify", "--quiet", remote_branch], worktree, timeout=30)
         if exists.returncode != 0:
@@ -372,6 +421,10 @@ def sync_changed_repo(
     upstream = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], worktree, timeout=30)
     if upstream.returncode != 0 or "/" not in upstream.stdout.strip():
         branch_name = branch.stdout.strip()
+        fetch = run(["git", "fetch", "--prune", "origin"], worktree, timeout=120)
+        if fetch.returncode != 0:
+            return "deferred", issue(entry, "fetch_failed")
+        fetched_remote = "origin"
         remote_branch_ref = f"refs/remotes/origin/{branch_name}"
         exists = run(["git", "show-ref", "--verify", "--quiet", remote_branch_ref], worktree, timeout=30)
         if exists.returncode != 0:
@@ -383,12 +436,14 @@ def sync_changed_repo(
         upstream_name = f"origin/{branch_name}"
     else:
         upstream_name = upstream.stdout.strip()
+        fetched_remote = None
     if dry_run:
         return "would_update", None
     remote_name, remote_branch = upstream_name.split("/", 1)
-    fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)
-    if fetch.returncode != 0:
-        raise AutosyncError(f"fetch_failed:{repo['name']}")
+    if fetched_remote != remote_name:
+        fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)
+        if fetch.returncode != 0:
+            raise AutosyncError(f"fetch_failed:{repo['name']}")
     counts = git_counts(worktree)
     if counts is None:
         raise AutosyncError(f"relation_check_failed:{repo['name']}")
@@ -574,8 +629,8 @@ def command_run(args: argparse.Namespace) -> int:
     auto_pushed = 0
     try:
         with ExclusiveLock(state_dir / "autosync.lock"):
-            inventory = megavault_inventory(megavault)
-            repos = [{**repo, "owner": args.owner} for repo in github_repos(args.owner)]
+            inventory = filter_allowed_inventory(megavault_inventory(megavault))
+            repos = [{**repo, "owner": args.owner} for repo in filter_allowed_repos(args.owner, github_repos(args.owner))]
             inventory_by_remote: dict[str, dict[str, Any]] = {}
             for entry in inventory:
                 key = normalize_remote(str(entry["remote_url"]))
@@ -595,12 +650,12 @@ def command_run(args: argparse.Namespace) -> int:
             next_state = dict(old_state)
             for repo in repos:
                 fingerprint = repo_fingerprint(repo)
-                worktree = projects_dir / repo["name"]
                 previous = old_state.get(repo["name"])
+                inventory_entry = inventory_by_remote.get(normalize_remote(repo["url"]))
+                worktree = Path(str(inventory_entry["worktree"])) if inventory_entry else projects_dir / repo["name"]
                 if previous == fingerprint and worktree.exists():
                     counts["skipped_unchanged"] += 1
                     continue
-                inventory_entry = inventory_by_remote.get(normalize_remote(repo["url"]))
                 result, repo_issue = sync_changed_repo(
                     repo, projects_dir, dry_run=args.dry_run, inventory_entry=inventory_entry
                 )
@@ -652,6 +707,7 @@ def command_run(args: argparse.Namespace) -> int:
         "status": _status_for(issues, work_done),
         "owner": args.owner,
         "discovered": len(repos),
+        "managed_repos": [repo["name"] for repo in repos],
         "auto_pushed": auto_pushed,
         "issues": len(issues),
         "telegram": notify,

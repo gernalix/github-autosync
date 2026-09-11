@@ -79,6 +79,23 @@ class AutosyncTests(unittest.TestCase):
             self.assertFalse(pushed)
             self.assertEqual("diverged", issues[0]["kind"])
 
+    def test_missing_upstream_tracks_matching_origin_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, bare = self.make_repo_pair(Path(tmp) / "pair")
+            self.assertEqual(0, git(["branch", "--unset-upstream"], repo).returncode)
+            issues, _ = autosync.audit_worktree(self.entry(repo, bare), auto_push=False, report_behind=True)
+            self.assertEqual([], issues)
+            upstream = git(["rev-parse", "--abbrev-ref", "@{u}"], repo)
+            self.assertEqual("origin/main", upstream.stdout.strip())
+
+    def test_missing_upstream_without_matching_origin_stays_deferred(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, bare = self.make_repo_pair(Path(tmp) / "pair")
+            self.assertEqual(0, git(["checkout", "-b", "local-only"], repo).returncode)
+            entry = {**self.entry(repo, bare), "branch": "local-only"}
+            issues, _ = autosync.audit_worktree(entry, auto_push=False, report_behind=True)
+            self.assertEqual("no_upstream", issues[0]["kind"])
+
     def test_second_unchanged_run_does_not_sync_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -152,6 +169,41 @@ class AutosyncTests(unittest.TestCase):
                 self.assertEqual(0, autosync.command_run(args))
             payload = json.loads(printer.call_args.args[0])
             self.assertEqual("deferred", payload["status"])
+
+    def test_double_discovery_syncs_once_and_preserves_project_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "canonical"
+            worktree.mkdir()
+            remote = "https://github.com/gernalix/one"
+            inventory = {"project_id": 42, "slug": "one", "worktree": str(worktree), "remote_url": remote, "branch": "main"}
+            repo = {"name": "one", "url": remote, "default_branch": "main", "pushed_at": "A", "archived": "0"}
+            args = autosync.build_parser().parse_args(["--projects-dir", str(root / "projects"), "--state-dir", str(root / "state"), "--megavault", str(root / "mv"), "--no-telegram", "run"])
+            with (
+                mock.patch.object(autosync, "megavault_inventory", return_value=[inventory]),
+                mock.patch.object(autosync, "audit_inventory", return_value=([], 0)) as audit,
+                mock.patch.object(autosync, "github_repos", return_value=[repo]),
+                mock.patch.object(autosync, "sync_changed_repo", return_value=("updated", None)) as sync,
+                mock.patch.object(autosync, "megavault_registered_remotes", return_value={autosync.normalize_remote(remote)}),
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}),
+            ):
+                self.assertEqual(0, autosync.command_run(args))
+            audit.assert_called_once_with([], auto_push=True, report_behind=False, fetch_remote=False)
+            self.assertEqual(1, sync.call_count)
+            self.assertEqual(42, sync.call_args.kwargs["inventory_entry"]["project_id"])
+
+    def test_telegram_alert_fingerprint_suppresses_identical_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            first = [autosync.issue({"project_id": 1, "slug": "one", "worktree": "/one"}, "dirty_worktree")]
+            changed = [autosync.issue({"project_id": 1, "slug": "one", "worktree": "/one"}, "diverged")]
+            with mock.patch.object(autosync, "send_telegram", return_value=True) as sender:
+                self.assertEqual("alert_sent", autosync.update_telegram_alert_state(state, first, enabled=True))
+                self.assertEqual("unchanged", autosync.update_telegram_alert_state(state, first, enabled=True))
+                self.assertEqual("alert_sent", autosync.update_telegram_alert_state(state, changed, enabled=True))
+            self.assertEqual(2, sender.call_count)
+            saved = json.loads((state / autosync.ALERT_STATE_FILE).read_text(encoding="utf-8"))
+            self.assertIn("fingerprint", saved)
 
     def test_real_github_failure_is_nonzero(self) -> None:
         with mock.patch.object(autosync, "megavault_inventory", return_value=[]), mock.patch.object(autosync, "audit_inventory", return_value=([], 0)), mock.patch.object(autosync, "github_repos", side_effect=autosync.AutosyncError("github_repo_list_failed")):

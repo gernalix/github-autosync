@@ -247,9 +247,17 @@ def _worktree_basics(entry: dict[str, Any]) -> tuple[Path, list[dict[str, Any]],
     branch = run(["git", "branch", "--show-current"], worktree, timeout=30)
     if branch.returncode != 0 or not branch.stdout.strip():
         return worktree, [issue(entry, "detached_or_unknown_branch")], None
+    branch_name = branch.stdout.strip()
     upstream = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], worktree, timeout=30)
     if upstream.returncode != 0 or "/" not in upstream.stdout.strip():
-        return worktree, [issue(entry, "no_upstream")], None
+        remote_branch = f"refs/remotes/origin/{branch_name}"
+        exists = run(["git", "show-ref", "--verify", "--quiet", remote_branch], worktree, timeout=30)
+        if exists.returncode != 0:
+            return worktree, [issue(entry, "no_upstream")], None
+        tracking = run(["git", "branch", f"--set-upstream-to=origin/{branch_name}", branch_name], worktree, timeout=30)
+        if tracking.returncode != 0:
+            return worktree, [issue(entry, "no_upstream")], None
+        return worktree, [], f"origin/{branch_name}"
     return worktree, [], upstream.stdout.strip()
 
 
@@ -336,14 +344,19 @@ def clone_repo(repo: dict[str, str], projects_dir: Path, *, dry_run: bool) -> st
     return "cloned"
 
 
-def sync_changed_repo(repo: dict[str, str], projects_dir: Path, *, dry_run: bool) -> tuple[str, dict[str, Any] | None]:
-    worktree = projects_dir / repo["name"]
+def sync_changed_repo(
+    repo: dict[str, str], projects_dir: Path, *, dry_run: bool,
+    inventory_entry: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    worktree = Path(str(inventory_entry["worktree"])) if inventory_entry else projects_dir / repo["name"]
     entry: dict[str, Any] = {
         "project_id": None,
         "slug": repo["name"],
         "worktree": str(worktree),
         "remote_url": repo["url"],
     }
+    if inventory_entry:
+        entry.update(inventory_entry)
     if not worktree.exists():
         return clone_repo(repo, projects_dir, dry_run=dry_run), None
     if not git_repo_matches_remote(worktree, repo["url"]):
@@ -358,10 +371,21 @@ def sync_changed_repo(repo: dict[str, str], projects_dir: Path, *, dry_run: bool
         return "deferred", issue(entry, "detached_or_unknown_branch")
     upstream = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], worktree, timeout=30)
     if upstream.returncode != 0 or "/" not in upstream.stdout.strip():
-        return "deferred", issue(entry, "no_upstream")
+        branch_name = branch.stdout.strip()
+        remote_branch_ref = f"refs/remotes/origin/{branch_name}"
+        exists = run(["git", "show-ref", "--verify", "--quiet", remote_branch_ref], worktree, timeout=30)
+        if exists.returncode != 0:
+            return "deferred", issue(entry, "no_upstream")
+        if not dry_run:
+            tracking = run(["git", "branch", f"--set-upstream-to=origin/{branch_name}", branch_name], worktree, timeout=30)
+            if tracking.returncode != 0:
+                return "deferred", issue(entry, "no_upstream")
+        upstream_name = f"origin/{branch_name}"
+    else:
+        upstream_name = upstream.stdout.strip()
     if dry_run:
         return "would_update", None
-    remote_name, remote_branch = upstream.stdout.strip().split("/", 1)
+    remote_name, remote_branch = upstream_name.split("/", 1)
     fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)
     if fetch.returncode != 0:
         raise AutosyncError(f"fetch_failed:{repo['name']}")
@@ -420,15 +444,24 @@ def update_telegram_alert_state(state_dir: Path, items: list[dict[str, Any]], *,
         return "state_failed"
     path = state_dir / ALERT_STATE_FILE
     current = dedupe_issues(items)
+    current_fingerprint = json.dumps(
+        [issue_identity(item) for item in current], sort_keys=True, separators=(",", ":")
+    )
     previous: list[dict[str, Any]] = []
+    previous_fingerprint: str | None = None
     if path.is_file():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict) and isinstance(data.get("issues"), list):
                 previous = dedupe_issues([item for item in data["issues"] if isinstance(item, dict)])
+                previous_fingerprint = str(data.get("fingerprint") or "") or None
         except (OSError, json.JSONDecodeError):
             return "state_failed"
-    if [issue_identity(x) for x in current] == [issue_identity(x) for x in previous]:
+    if previous_fingerprint is None:
+        previous_fingerprint = json.dumps(
+            [issue_identity(item) for item in previous], sort_keys=True, separators=(",", ":")
+        )
+    if current_fingerprint == previous_fingerprint:
         return "unchanged"
     if current:
         sent = send_telegram("GitHub autosync: attenzione", format_issue_message(current))
@@ -439,7 +472,10 @@ def update_telegram_alert_state(state_dir: Path, items: list[dict[str, Any]], *,
     if not sent:
         return "notify_failed"
     try:
-        path.write_text(json.dumps({"issues": current}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        path.write_text(
+            json.dumps({"fingerprint": current_fingerprint, "issues": current}, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
     except OSError:
         return "state_failed"
     return "alert_sent" if current else "resolved_sent"
@@ -539,15 +575,22 @@ def command_run(args: argparse.Namespace) -> int:
     try:
         with ExclusiveLock(state_dir / "autosync.lock"):
             inventory = megavault_inventory(megavault)
+            repos = [{**repo, "owner": args.owner} for repo in github_repos(args.owner)]
+            inventory_by_remote: dict[str, dict[str, Any]] = {}
+            for entry in inventory:
+                key = normalize_remote(str(entry["remote_url"]))
+                current = inventory_by_remote.get(key)
+                if current is None or (current.get("project_id") is None and entry.get("project_id") is not None):
+                    inventory_by_remote[key] = entry
+            github_remotes = {normalize_remote(repo["url"]) for repo in repos}
             local_issues, auto_pushed = audit_inventory(
-                inventory,
+                [entry for key, entry in inventory_by_remote.items() if key not in github_remotes],
                 auto_push=not args.dry_run,
                 report_behind=False,
                 fetch_remote=False,
             )
             issues.extend(x for x in local_issues if x["kind"] != "missing_worktree")
 
-            repos = [{**repo, "owner": args.owner} for repo in github_repos(args.owner)]
             old_state = load_repo_state(state_dir)
             next_state = dict(old_state)
             for repo in repos:
@@ -557,7 +600,10 @@ def command_run(args: argparse.Namespace) -> int:
                 if previous == fingerprint and worktree.exists():
                     counts["skipped_unchanged"] += 1
                     continue
-                result, repo_issue = sync_changed_repo(repo, projects_dir, dry_run=args.dry_run)
+                inventory_entry = inventory_by_remote.get(normalize_remote(repo["url"]))
+                result, repo_issue = sync_changed_repo(
+                    repo, projects_dir, dry_run=args.dry_run, inventory_entry=inventory_entry
+                )
                 if repo_issue is not None:
                     issues.append(repo_issue)
                     counts["deferred"] += 1

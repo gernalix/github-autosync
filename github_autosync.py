@@ -246,8 +246,7 @@ def audit_worktree(
             kind = "dirty_behind"
         else:
             kind = "dirty_worktree"
-        detail = f"ahead={ahead},behind={behind}"
-        return [issue(entry, kind, detail)], False
+        return [issue(entry, kind, f"ahead={ahead},behind={behind}")], False
 
     if ahead and behind:
         return [issue(entry, "diverged", f"ahead={ahead},behind={behind}")], False
@@ -255,6 +254,7 @@ def audit_worktree(
     if ahead:
         if not auto_push:
             return [issue(entry, "unpushed_commits", f"ahead={ahead}")], False
+        # No --force: a remote race after the fetch is rejected by Git.
         push = run(["git", "push", remote_name, f"HEAD:{remote_branch}"], worktree, timeout=240)
         if push.returncode != 0:
             return [issue(entry, "push_failed", f"ahead={ahead}")], False
@@ -313,7 +313,12 @@ def send_telegram(title: str, message: str) -> bool:
 def update_telegram_alert_state(
     state_dir: Path, items: list[dict[str, Any]], *, enabled: bool,
 ) -> str:
-    state_dir.mkdir(parents=True, exist_ok=True)
+    if not enabled:
+        return "disabled"
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return "state_failed"
     path = state_dir / ALERT_STATE_FILE
     current = dedupe_issues(items)
     previous: list[dict[str, Any]] = []
@@ -323,14 +328,10 @@ def update_telegram_alert_state(
             if isinstance(data, dict) and isinstance(data.get("issues"), list):
                 previous = dedupe_issues([item for item in data["issues"] if isinstance(item, dict)])
         except (OSError, json.JSONDecodeError):
-            previous = []
+            return "state_failed"
 
     if [issue_identity(x) for x in current] == [issue_identity(x) for x in previous]:
         return "unchanged"
-    if not enabled:
-        path.write_text(json.dumps({"issues": current}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        return "disabled"
-
     if current:
         sent = send_telegram("GitHub autosync: attenzione", format_issue_message(current))
     elif previous:
@@ -339,7 +340,10 @@ def update_telegram_alert_state(
         sent = True
     if not sent:
         return "notify_failed"
-    path.write_text(json.dumps({"issues": current}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    try:
+        path.write_text(json.dumps({"issues": current}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        return "state_failed"
     return "alert_sent" if current else "resolved_sent"
 
 
@@ -413,10 +417,12 @@ def command_run(args: argparse.Namespace) -> int:
     projects_dir = Path(args.projects_dir).expanduser()
     state_dir = Path(args.state_dir).expanduser()
     megavault = Path(args.megavault).expanduser()
+    telegram_enabled = not args.no_telegram and not args.dry_run
     issues: list[dict[str, Any]] = []
     auto_pushed = 0
     ghorg_result: subprocess.CompletedProcess[str] | None = None
     registration: dict[str, int | str] = {"validation": "not_run"}
+    summary = {"cloned": 0, "updated": 0, "protected_skipped": 0, "errors": 0}
 
     try:
         with ExclusiveLock(state_dir / "autosync.lock"):
@@ -428,10 +434,18 @@ def command_run(args: argparse.Namespace) -> int:
 
             repos = [{**repo, "owner": args.owner} for repo in github_repos(args.owner)]
             ghorg_result = run_ghorg(args.owner, projects_dir, dry_run=args.dry_run)
+            summary = summarize_ghorg_output((ghorg_result.stdout or "") + "\n" + (ghorg_result.stderr or ""))
             if ghorg_result.returncode == 0:
+                if summary["errors"]:
+                    issues.append(issue(None, "ghorg_reported_errors", f"count={summary['errors']}"))
+                if summary["protected_skipped"]:
+                    issues.append(issue(None, "ghorg_protected_skips", f"count={summary['protected_skipped']}"))
                 registration = register_in_megavault(megavault, projects_dir, repos, dry_run=args.dry_run)
                 if str(registration.get("validation")) not in {"PASS", "dry_run"}:
                     issues.append(issue(None, f"megavault_{registration['validation']}"))
+                deferred = int(registration.get("deferred") or 0)
+                if deferred:
+                    issues.append(issue(None, "megavault_registration_deferred", f"count={deferred}"))
             else:
                 registration = {
                     "already_registered": 0,
@@ -448,9 +462,8 @@ def command_run(args: argparse.Namespace) -> int:
                 post_inventory, auto_push=not args.dry_run, report_behind=True
             )
             auto_pushed += post_pushed
-            # Pre-run anomalies may have been resolved by ghorg; only residual
-            # post-run anomalies are user-actionable. Keep only pre issues that
-            # represent failed pushes/fetches and are not represented post-run.
+            # Pre-run anomalies may have been resolved by ghorg; only failed
+            # automatic pushes remain relevant after the post-run audit.
             residual_pre = [x for x in pre_issues if x["kind"] in {"push_failed", "post_push_fetch_failed", "post_push_verify_failed"}]
             issues.extend(residual_pre)
             issues.extend(post_issues)
@@ -458,22 +471,19 @@ def command_run(args: argparse.Namespace) -> int:
         raise
     except AutosyncError as exc:
         issues.append(issue(None, str(exc)))
-        notify = update_telegram_alert_state(state_dir, issues, enabled=not args.no_telegram)
-        if notify == "notify_failed":
-            raise AutosyncError("telegram_notify_failed") from exc
+        notify = update_telegram_alert_state(state_dir, issues, enabled=telegram_enabled)
+        if notify in {"notify_failed", "state_failed"}:
+            raise AutosyncError(f"telegram_{notify}") from exc
         raise
     except Exception as exc:
         issues.append(issue(None, f"unexpected_{type(exc).__name__}"))
-        notify = update_telegram_alert_state(state_dir, issues, enabled=not args.no_telegram)
-        if notify == "notify_failed":
-            raise AutosyncError("telegram_notify_failed") from exc
+        notify = update_telegram_alert_state(state_dir, issues, enabled=telegram_enabled)
+        if notify in {"notify_failed", "state_failed"}:
+            raise AutosyncError(f"telegram_{notify}") from exc
         raise AutosyncError(f"unexpected_{type(exc).__name__}") from exc
 
     issues = dedupe_issues(issues)
-    notify = update_telegram_alert_state(state_dir, issues, enabled=not args.no_telegram)
-    summary = summarize_ghorg_output(
-        ((ghorg_result.stdout if ghorg_result else "") or "") + "\n" + ((ghorg_result.stderr if ghorg_result else "") or "")
-    )
+    notify = update_telegram_alert_state(state_dir, issues, enabled=telegram_enabled)
     payload = {
         "status": "ok" if ghorg_result and ghorg_result.returncode == 0 and not issues else "issues",
         "owner": args.owner,
@@ -485,7 +495,7 @@ def command_run(args: argparse.Namespace) -> int:
         "megavault": registration,
     }
     print(json.dumps(payload, sort_keys=True))
-    if notify == "notify_failed":
+    if notify in {"notify_failed", "state_failed"}:
         return 75
     return 0 if ghorg_result and ghorg_result.returncode == 0 else 75
 

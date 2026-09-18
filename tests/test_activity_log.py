@@ -141,8 +141,11 @@ class ActivityLogTests(unittest.TestCase):
 
                 self.assertEqual("unchanged", autosync.mirror_pending_activity(state, enabled=True))
 
-                # Simulate a crash after remote persistence but before the cursor was durable.
+                # Simulate a crash after remote persistence but before the cursor was durable,
+                # plus an interrupted generated-file write in the service-owned checkout.
                 (state / autosync.ACTIVITY_DATA_STATE_FILE).unlink()
+                with day_two.open("a", encoding="utf-8") as handle:
+                    handle.write("{interrupted-write}\n")
                 self.assertEqual("reconciled:2", autosync.mirror_pending_activity(state, enabled=True))
                 self.assertEqual("2", git(["rev-list", "--count", "HEAD"], checkout).stdout.strip())
                 self.assertEqual(1, len(day_one.read_text(encoding="utf-8").splitlines()))

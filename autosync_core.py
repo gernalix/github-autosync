@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -16,6 +17,9 @@ DEFAULT_PROJECTS_DIR = Path.home() / "projects"
 DEFAULT_STATE_DIR = Path.home() / ".local/state/codex-github-autosync"
 DEFAULT_MEGAVAULT = Path.home() / "MegaVault"
 ALERT_STATE_FILE = "telegram-alert-state.json"
+ACTIVITY_LOG_FILE = "activity.jsonl"
+ACTIVITY_NOTIFY_STATE_FILE = "telegram-activity-state.json"
+ACTIVITY_NOTIFY_ACTIONS = frozenset({"push", "pull"})
 REPO_STATE_FILE = "repo-state.json"
 ALLOWED_REPOSITORIES = frozenset(
     {
@@ -181,6 +185,36 @@ def save_repo_state(state_dir: Path, state: dict[str, str]) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps({"repos": state}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def append_activity(
+    state_dir: Path,
+    *,
+    action: str,
+    repo: str,
+    branch: str | None = None,
+    project_id: int | None = None,
+    worktree: str | None = None,
+    detail: str = "",
+) -> dict[str, Any]:
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "action": action,
+        "repo": repo,
+        "branch": branch,
+        "project_id": project_id,
+        "worktree": worktree,
+        "detail": detail,
+    }
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        with (state_dir / ACTIVITY_LOG_FILE).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise AutosyncError("activity_log_write_failed") from exc
+    return event
 
 
 def normalize_remote(url: str) -> str:
@@ -508,6 +542,71 @@ def send_telegram(title: str, message: str) -> bool:
     return result.returncode == 0
 
 
+def _save_activity_notify_cursor(state_dir: Path, next_line: int) -> bool:
+    path = state_dir / ACTIVITY_NOTIFY_STATE_FILE
+    tmp = path.with_suffix(".tmp")
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps({"next_line": next_line}, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def format_activity_message(event: dict[str, Any]) -> str:
+    lines = [
+        f"Repo: {event.get('repo') or 'UNKNOWN'}",
+        f"Azione automatica: {event.get('action') or 'UNKNOWN'}",
+    ]
+    if event.get("branch"):
+        lines.append(f"Branch: {event['branch']}")
+    if event.get("project_id") is not None:
+        lines.append(f"project_id: {event['project_id']}")
+    if event.get("detail"):
+        lines.append(f"Dettaglio: {event['detail']}")
+    if event.get("timestamp"):
+        lines.append(f"UTC: {event['timestamp']}")
+    return "\n".join(lines)
+
+
+def notify_pending_activity(state_dir: Path, *, enabled: bool) -> str:
+    if not enabled:
+        return "disabled"
+    log_path = state_dir / ACTIVITY_LOG_FILE
+    if not log_path.is_file():
+        return "unchanged"
+    state_path = state_dir / ACTIVITY_NOTIFY_STATE_FILE
+    try:
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        next_line = 0
+        if state_path.is_file():
+            raw = json.loads(state_path.read_text(encoding="utf-8"))
+            next_line = int(raw.get("next_line", 0))
+        if next_line < 0 or next_line > len(lines):
+            return "state_failed"
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return "state_failed"
+
+    sent = 0
+    for index in range(next_line, len(lines)):
+        try:
+            event = json.loads(lines[index])
+        except json.JSONDecodeError:
+            return "state_failed"
+        if not isinstance(event, dict):
+            return "state_failed"
+        action = str(event.get("action") or "")
+        if action in ACTIVITY_NOTIFY_ACTIONS:
+            title = f"GitHub autosync: {action}"
+            if not send_telegram(title, format_activity_message(event)):
+                return "notify_failed"
+            sent += 1
+        if not _save_activity_notify_cursor(state_dir, index + 1):
+            return "state_failed"
+    return f"sent:{sent}" if sent else "unchanged"
+
+
 def update_telegram_alert_state(state_dir: Path, items: list[dict[str, Any]], *, enabled: bool) -> str:
     if not enabled:
         return "disabled"
@@ -652,6 +751,7 @@ def command_run(args: argparse.Namespace) -> int:
         "deferred": 0,
     }
     auto_pushed = 0
+    activity_events = 0
     try:
         with ExclusiveLock(state_dir / "autosync.lock"):
             inventory = filter_allowed_inventory(megavault_inventory(megavault))
@@ -697,6 +797,17 @@ def command_run(args: argparse.Namespace) -> int:
                     )
                     counts["audited_unchanged"] += 1
                     auto_pushed += int(did_push)
+                    if did_push:
+                        append_activity(
+                            state_dir,
+                            action="push",
+                            repo=allowed_repo_key(args.owner, repo["name"]),
+                            branch=str(local_entry.get("branch") or repo.get("default_branch") or "UNKNOWN"),
+                            project_id=local_entry.get("project_id"),
+                            worktree=str(worktree),
+                            detail="clean ahead-only checkout",
+                        )
+                        activity_events += 1
                     if repo_issues:
                         issues.extend(repo_issues)
                         counts["deferred"] += 1
@@ -716,6 +827,39 @@ def command_run(args: argparse.Namespace) -> int:
                     counts["updated"] += 1
                 elif result == "pushed":
                     counts["pushed"] += 1
+                if result == "cloned":
+                    append_activity(
+                        state_dir,
+                        action="clone",
+                        repo=allowed_repo_key(args.owner, repo["name"]),
+                        branch=repo.get("default_branch") or None,
+                        project_id=inventory_entry.get("project_id") if inventory_entry else None,
+                        worktree=str(worktree),
+                        detail="managed repository cloned",
+                    )
+                    activity_events += 1
+                elif result == "updated":
+                    append_activity(
+                        state_dir,
+                        action="pull",
+                        repo=allowed_repo_key(args.owner, repo["name"]),
+                        branch=repo.get("default_branch") or None,
+                        project_id=inventory_entry.get("project_id") if inventory_entry else None,
+                        worktree=str(worktree),
+                        detail="fast-forward only",
+                    )
+                    activity_events += 1
+                elif result == "pushed":
+                    append_activity(
+                        state_dir,
+                        action="push",
+                        repo=allowed_repo_key(args.owner, repo["name"]),
+                        branch=repo.get("default_branch") or None,
+                        project_id=inventory_entry.get("project_id") if inventory_entry else None,
+                        worktree=str(worktree),
+                        detail="clean ahead-only checkout",
+                    )
+                    activity_events += 1
                 if not args.dry_run:
                     next_state[repo["name"]] = fingerprint
 
@@ -732,6 +876,17 @@ def command_run(args: argparse.Namespace) -> int:
                 missing_reg,
                 dry_run=args.dry_run,
             )
+            if str(registration.get("commit_changed") or "").lower() == "true":
+                append_activity(
+                    state_dir,
+                    action="push",
+                    repo=allowed_repo_key(args.owner, "MegaVault"),
+                    branch=None,
+                    project_id=None,
+                    worktree=str(megavault),
+                    detail="registered autosynced repositories in MegaVault",
+                )
+                activity_events += 1
             validation = str(registration.get("validation"))
             if validation.startswith("deferred_"):
                 issues.append(issue(None, f"megavault_{validation}"))
@@ -749,6 +904,9 @@ def command_run(args: argparse.Namespace) -> int:
     notify = update_telegram_alert_state(state_dir, issues, enabled=telegram_enabled)
     if notify in {"notify_failed", "state_failed"}:
         raise AutosyncError(f"telegram_{notify}")
+    activity_notify = notify_pending_activity(state_dir, enabled=telegram_enabled)
+    if activity_notify in {"notify_failed", "state_failed"}:
+        raise AutosyncError(f"telegram_activity_{activity_notify}")
     work_done = counts["cloned"] + counts["updated"] + counts["pushed"] + auto_pushed
     payload = {
         "status": _status_for(issues, work_done),
@@ -758,6 +916,9 @@ def command_run(args: argparse.Namespace) -> int:
         "auto_pushed": auto_pushed,
         "issues": len(issues),
         "telegram": notify,
+        "activity_telegram": activity_notify,
+        "activity_events": activity_events,
+        "activity_log": str(state_dir / ACTIVITY_LOG_FILE),
         **counts,
         "megavault": registration,
     }

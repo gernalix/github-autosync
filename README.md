@@ -28,6 +28,8 @@ All other current or future GitHub repositories are ignored completely until exp
 - fetch/update a managed repository when its GitHub metadata fingerprint changes;
 - perform a lightweight **local-only audit** even when the remote fingerprint is unchanged, so dirty worktrees and local commits are not hidden by the remote fast path;
 - automatically push clean, ahead-only managed repositories using a normal non-force push;
+- append every successful automatic repository mutation (`clone`, fast-forward `pull`, `push`) to a durable JSONL activity ledger;
+- send one Telegram notification for every automatic `push` or fast-forward `pull`, with a persistent delivery cursor so failed sends are retried on a later run;
 - skip network reconciliation for unchanged, clean, synchronized repositories;
 - never stash, reset, force-pull or force-push dirty/ahead/diverged repositories;
 - register genuinely new managed repositories in MegaVault when its worktree is clean and synchronized;
@@ -78,6 +80,24 @@ The final JSON distinguishes outcomes explicitly:
 Useful counters include `audited_unchanged`, `skipped_unchanged`, `auto_pushed`, `updated`, `pushed`, `cloned`, and `deferred`.
 
 Expected MegaVault conditions such as `deferred_dirty` and `deferred_not_synced` therefore never appear as a false `ok`, while remaining exit-code 0 so the timer does not treat a safe defer as a service crash.
+
+## Activity audit log
+
+Successful automatic mutations are written outside every Git worktree to avoid recursive self-commits:
+
+```text
+/home/daniele/.local/state/codex-github-autosync/activity.jsonl
+```
+
+Each JSONL row records the UTC timestamp, action, repository, branch, project ID when known, worktree, and a short detail. The ledger currently records `clone`, fast-forward `pull`, and `push`. Read-only audits, no-op checks, and fetches that do not change the checkout are intentionally not logged as mutations.
+
+Telegram delivery progress for activity events is persisted separately in:
+
+```text
+/home/daniele/.local/state/codex-github-autosync/telegram-activity-state.json
+```
+
+Only `push` and `pull` activity rows generate a Telegram message. The cursor advances only after successful delivery, so a transient Telegram failure is retried on a later service run. Keeping the ledger in the state directory rather than this repository prevents an activity-log write from creating another commit/push and recursively generating more activity.
 
 ## Telegram alerts
 

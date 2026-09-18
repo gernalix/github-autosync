@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 from typing import Any
+from uuid import uuid4
 
 DEFAULT_OWNER = "gernalix"
 DEFAULT_PROJECTS_DIR = Path.home() / "projects"
@@ -20,6 +22,11 @@ ALERT_STATE_FILE = "telegram-alert-state.json"
 ACTIVITY_LOG_FILE = "activity.jsonl"
 ACTIVITY_NOTIFY_STATE_FILE = "telegram-activity-state.json"
 ACTIVITY_NOTIFY_ACTIONS = frozenset({"push", "pull"})
+ACTIVITY_DATA_STATE_FILE = "activity-data-state.json"
+ACTIVITY_DATA_CHECKOUT_DIR = "github-autosync-data"
+ACTIVITY_DATA_REMOTE = "https://github.com/gernalix/github-autosync-data.git"
+ACTIVITY_DATA_BRANCH = "main"
+ACTIVITY_SCHEMA_VERSION = 1
 REPO_STATE_FILE = "repo-state.json"
 ALLOWED_REPOSITORIES = frozenset(
     {
@@ -198,6 +205,8 @@ def append_activity(
     detail: str = "",
 ) -> dict[str, Any]:
     event = {
+        "schema_version": ACTIVITY_SCHEMA_VERSION,
+        "event_id": uuid4().hex,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "action": action,
         "repo": repo,
@@ -215,6 +224,232 @@ def append_activity(
     except OSError as exc:
         raise AutosyncError("activity_log_write_failed") from exc
     return event
+
+
+def _activity_data_state_path(state_dir: Path) -> Path:
+    return state_dir / ACTIVITY_DATA_STATE_FILE
+
+
+def _load_activity_data_cursor(state_dir: Path, total_lines: int) -> int:
+    path = _activity_data_state_path(state_dir)
+    if not path.is_file():
+        return 0
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        next_line = int(raw.get("next_line", 0))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise AutosyncError("activity_data_state_invalid") from exc
+    if next_line < 0 or next_line > total_lines:
+        raise AutosyncError("activity_data_state_invalid")
+    return next_line
+
+
+def _save_activity_data_cursor(state_dir: Path, next_line: int) -> None:
+    path = _activity_data_state_path(state_dir)
+    tmp = path.with_suffix(".tmp")
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps({"next_line": next_line}, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        raise AutosyncError("activity_data_state_write_failed") from exc
+
+
+def _normalize_activity_event(raw: dict[str, Any], *, line_number: int, raw_line: str) -> dict[str, Any]:
+    event = dict(raw)
+    timestamp = str(event.get("timestamp") or "")
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise AutosyncError(f"activity_data_invalid_timestamp:line={line_number + 1}") from exc
+    if parsed.tzinfo is None:
+        raise AutosyncError(f"activity_data_invalid_timestamp:line={line_number + 1}")
+    event["schema_version"] = int(event.get("schema_version") or ACTIVITY_SCHEMA_VERSION)
+    event_id = str(event.get("event_id") or "").strip()
+    if not event_id:
+        digest = hashlib.sha256(f"{line_number}:{raw_line}".encode("utf-8")).hexdigest()
+        event_id = f"legacy-{digest[:32]}"
+    event["event_id"] = event_id
+    event["timestamp"] = timestamp
+    for key in ("action", "repo", "detail"):
+        event[key] = str(event.get(key) or "")
+    event["branch"] = event.get("branch")
+    event["project_id"] = event.get("project_id")
+    event["worktree"] = event.get("worktree")
+    return event
+
+
+def _ensure_activity_data_checkout(state_dir: Path) -> Path:
+    checkout = state_dir / ACTIVITY_DATA_CHECKOUT_DIR
+    if not checkout.exists():
+        state_dir.mkdir(parents=True, exist_ok=True)
+        clone = run(
+            [
+                "git",
+                "clone",
+                "--origin",
+                "origin",
+                "--branch",
+                ACTIVITY_DATA_BRANCH,
+                "--single-branch",
+                ACTIVITY_DATA_REMOTE,
+                str(checkout),
+            ],
+            timeout=300,
+        )
+        require_ok(clone, "activity_data_clone_failed")
+    if not (checkout / ".git").exists():
+        raise AutosyncError("activity_data_not_git")
+    remote = run(["git", "config", "--get", "remote.origin.url"], checkout, timeout=30)
+    require_ok(remote, "activity_data_origin_missing")
+    if normalize_remote(remote.stdout) != normalize_remote(ACTIVITY_DATA_REMOTE):
+        raise AutosyncError("activity_data_origin_mismatch")
+    branch = run(["git", "branch", "--show-current"], checkout, timeout=30)
+    require_ok(branch, "activity_data_branch_check_failed")
+    if branch.stdout.strip() != ACTIVITY_DATA_BRANCH:
+        raise AutosyncError("activity_data_wrong_branch")
+    status = run(["git", "status", "--porcelain"], checkout, timeout=30)
+    require_ok(status, "activity_data_status_failed")
+    if status.stdout.strip():
+        raise AutosyncError("activity_data_dirty")
+    fetch = run(["git", "fetch", "--prune", "origin"], checkout, timeout=120)
+    require_ok(fetch, "activity_data_fetch_failed")
+    relation = run(
+        ["git", "rev-list", "--left-right", "--count", f"HEAD...origin/{ACTIVITY_DATA_BRANCH}"],
+        checkout,
+        timeout=30,
+    )
+    require_ok(relation, "activity_data_relation_failed")
+    parts = relation.stdout.split()
+    if len(parts) != 2:
+        raise AutosyncError("activity_data_relation_failed")
+    ahead, behind = int(parts[0]), int(parts[1])
+    if ahead and behind:
+        raise AutosyncError("activity_data_diverged")
+    if behind:
+        merge = run(["git", "merge", "--ff-only", f"origin/{ACTIVITY_DATA_BRANCH}"], checkout, timeout=120)
+        require_ok(merge, "activity_data_fast_forward_failed")
+    elif ahead:
+        push = run(["git", "push", "origin", f"HEAD:{ACTIVITY_DATA_BRANCH}"], checkout, timeout=240)
+        require_ok(push, "activity_data_recovery_push_failed")
+        verify_fetch = run(["git", "fetch", "--prune", "origin"], checkout, timeout=120)
+        require_ok(verify_fetch, "activity_data_recovery_verify_failed")
+        verify = run(
+            ["git", "rev-list", "--left-right", "--count", f"HEAD...origin/{ACTIVITY_DATA_BRANCH}"],
+            checkout,
+            timeout=30,
+        )
+        require_ok(verify, "activity_data_recovery_verify_failed")
+        if verify.stdout.strip() not in {"0\t0", "0 0"}:
+            raise AutosyncError("activity_data_recovery_verify_failed")
+    return checkout
+
+
+def mirror_pending_activity(state_dir: Path, *, enabled: bool) -> str:
+    if not enabled:
+        return "disabled"
+    log_path = state_dir / ACTIVITY_LOG_FILE
+    if not log_path.is_file():
+        return "unchanged"
+    try:
+        raw_lines = log_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise AutosyncError("activity_data_log_read_failed") from exc
+    next_line = _load_activity_data_cursor(state_dir, len(raw_lines))
+    if next_line == len(raw_lines):
+        return "unchanged"
+
+    pending: list[dict[str, Any]] = []
+    for index in range(next_line, len(raw_lines)):
+        raw_line = raw_lines[index]
+        try:
+            raw = json.loads(raw_line)
+        except json.JSONDecodeError as exc:
+            raise AutosyncError(f"activity_data_invalid_json:line={index + 1}") from exc
+        if not isinstance(raw, dict):
+            raise AutosyncError(f"activity_data_invalid_json:line={index + 1}")
+        pending.append(_normalize_activity_event(raw, line_number=index, raw_line=raw_line))
+
+    checkout = _ensure_activity_data_checkout(state_dir)
+    added = 0
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for event in pending:
+        timestamp = str(event["timestamp"])
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        date = parsed.date().isoformat()
+        grouped.setdefault(date, []).append(event)
+
+    for date, events in sorted(grouped.items()):
+        year, month, _ = date.split("-", 2)
+        path = checkout / "activity" / year / month / f"{date}.jsonl"
+        existing_ids: set[str] = set()
+        if path.is_file():
+            try:
+                for existing_line in path.read_text(encoding="utf-8").splitlines():
+                    if not existing_line.strip():
+                        continue
+                    existing = json.loads(existing_line)
+                    if isinstance(existing, dict) and existing.get("event_id"):
+                        existing_ids.add(str(existing["event_id"]))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise AutosyncError(f"activity_data_existing_file_invalid:{path.name}") from exc
+        new_lines: list[str] = []
+        for event in events:
+            event_id = str(event["event_id"])
+            if event_id in existing_ids:
+                continue
+            new_lines.append(json.dumps(event, sort_keys=True, separators=(",", ":")))
+            existing_ids.add(event_id)
+            added += 1
+        if new_lines:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                for line in new_lines:
+                    handle.write(line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+
+    if not added:
+        _save_activity_data_cursor(state_dir, len(raw_lines))
+        return f"reconciled:{len(pending)}"
+
+    require_ok(run(["git", "add", "activity"], checkout, timeout=30), "activity_data_git_add_failed")
+    status = run(["git", "status", "--porcelain"], checkout, timeout=30)
+    require_ok(status, "activity_data_status_failed")
+    if not status.stdout.strip():
+        _save_activity_data_cursor(state_dir, len(raw_lines))
+        return f"reconciled:{len(pending)}"
+
+    last_timestamp = str(pending[-1]["timestamp"])
+    commit = run(
+        [
+            "git",
+            "-c",
+            "user.name=github-autosync",
+            "-c",
+            "user.email=github-autosync@localhost",
+            "commit",
+            "-m",
+            f"Record autosync activity through {last_timestamp}",
+        ],
+        checkout,
+        timeout=120,
+    )
+    require_ok(commit, "activity_data_commit_failed")
+    push = run(["git", "push", "origin", f"HEAD:{ACTIVITY_DATA_BRANCH}"], checkout, timeout=240)
+    require_ok(push, "activity_data_push_failed")
+    verify_fetch = run(["git", "fetch", "--prune", "origin"], checkout, timeout=120)
+    require_ok(verify_fetch, "activity_data_verify_failed")
+    verify = run(
+        ["git", "rev-list", "--left-right", "--count", f"HEAD...origin/{ACTIVITY_DATA_BRANCH}"],
+        checkout,
+        timeout=30,
+    )
+    require_ok(verify, "activity_data_verify_failed")
+    if verify.stdout.strip() not in {"0\t0", "0 0"}:
+        raise AutosyncError("activity_data_verify_failed")
+    _save_activity_data_cursor(state_dir, len(raw_lines))
+    return f"pushed:{added}"
 
 
 def normalize_remote(url: str) -> str:
@@ -740,6 +975,7 @@ def command_run(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir).expanduser()
     megavault = Path(args.megavault).expanduser()
     telegram_enabled = not args.no_telegram and not args.dry_run
+    activity_data_enabled = not args.no_data_mirror and not args.dry_run
     issues: list[dict[str, Any]] = []
     registration: dict[str, int | str] = {"validation": "not_run"}
     counts = {
@@ -893,6 +1129,8 @@ def command_run(args: argparse.Namespace) -> int:
             deferred_reg = int(registration.get("deferred") or 0)
             if deferred_reg:
                 issues.append(issue(None, "megavault_registration_deferred", f"count={deferred_reg}"))
+
+            activity_data = mirror_pending_activity(state_dir, enabled=activity_data_enabled)
     except BlockingIOError:
         raise
     except AutosyncError:
@@ -919,6 +1157,7 @@ def command_run(args: argparse.Namespace) -> int:
         "activity_telegram": activity_notify,
         "activity_events": activity_events,
         "activity_log": str(state_dir / ACTIVITY_LOG_FILE),
+        "activity_data": activity_data,
         **counts,
         "megavault": registration,
     }
@@ -934,6 +1173,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--megavault", default=str(DEFAULT_MEGAVAULT))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-telegram", action="store_true", help="Disable Telegram issue/resolution notifications")
+    parser.add_argument("--no-data-mirror", action="store_true", help="Disable the private github-autosync-data mirror")
     sub = parser.add_subparsers(dest="command", required=True)
     run_p = sub.add_parser("run")
     run_p.set_defaults(func=command_run)

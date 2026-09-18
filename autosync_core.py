@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -265,6 +266,8 @@ def _normalize_activity_event(raw: dict[str, Any], *, line_number: int, raw_line
     if parsed.tzinfo is None:
         raise AutosyncError(f"activity_data_invalid_timestamp:line={line_number + 1}")
     event["schema_version"] = int(event.get("schema_version") or ACTIVITY_SCHEMA_VERSION)
+    if event["schema_version"] != ACTIVITY_SCHEMA_VERSION:
+        raise AutosyncError(f"activity_data_unsupported_schema:line={line_number + 1}")
     event_id = str(event.get("event_id") or "").strip()
     if not event_id:
         digest = hashlib.sha256(f"{line_number}:{raw_line}".encode("utf-8")).hexdigest()
@@ -281,8 +284,13 @@ def _normalize_activity_event(raw: dict[str, Any], *, line_number: int, raw_line
 
 def _ensure_activity_data_checkout(state_dir: Path) -> Path:
     checkout = state_dir / ACTIVITY_DATA_CHECKOUT_DIR
+    state_dir.mkdir(parents=True, exist_ok=True)
+    if checkout.exists() and not (checkout / ".git").exists():
+        shutil.rmtree(checkout)
     if not checkout.exists():
-        state_dir.mkdir(parents=True, exist_ok=True)
+        clone_tmp = state_dir / f"{ACTIVITY_DATA_CHECKOUT_DIR}.clone-tmp"
+        if clone_tmp.exists():
+            shutil.rmtree(clone_tmp)
         clone = run(
             [
                 "git",
@@ -293,11 +301,13 @@ def _ensure_activity_data_checkout(state_dir: Path) -> Path:
                 ACTIVITY_DATA_BRANCH,
                 "--single-branch",
                 ACTIVITY_DATA_REMOTE,
-                str(checkout),
+                str(clone_tmp),
             ],
             timeout=300,
         )
-        require_ok(clone, "activity_data_clone_failed")
+        if clone.returncode != 0:
+            raise AutosyncError("activity_data_clone_failed")
+        os.replace(clone_tmp, checkout)
     if not (checkout / ".git").exists():
         raise AutosyncError("activity_data_not_git")
     remote = run(["git", "config", "--get", "remote.origin.url"], checkout, timeout=30)
@@ -311,7 +321,16 @@ def _ensure_activity_data_checkout(state_dir: Path) -> Path:
     status = run(["git", "status", "--porcelain"], checkout, timeout=30)
     require_ok(status, "activity_data_status_failed")
     if status.stdout.strip():
-        raise AutosyncError("activity_data_dirty")
+        dirty_paths: list[str] = []
+        for line in status.stdout.splitlines():
+            path = line[3:].strip()
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            dirty_paths.append(path)
+        if not dirty_paths or any(not path.startswith("activity/") for path in dirty_paths):
+            raise AutosyncError("activity_data_dirty")
+        require_ok(run(["git", "reset", "--hard", "HEAD"], checkout, timeout=60), "activity_data_recovery_reset_failed")
+        require_ok(run(["git", "clean", "-fd", "--", "activity"], checkout, timeout=60), "activity_data_recovery_clean_failed")
     fetch = run(["git", "fetch", "--prune", "origin"], checkout, timeout=120)
     require_ok(fetch, "activity_data_fetch_failed")
     relation = run(

@@ -97,7 +97,35 @@ Telegram delivery progress for activity events is persisted separately in:
 /home/daniele/.local/state/codex-github-autosync/telegram-activity-state.json
 ```
 
-Only `push` and `pull` activity rows generate a Telegram message. The cursor advances only after successful delivery, so a transient Telegram failure is retried on a later service run. Keeping the ledger in the state directory rather than this repository prevents an activity-log write from creating another commit/push and recursively generating more activity.
+Only `push` and `pull` activity rows generate a Telegram message. The cursor advances only after successful delivery, so a transient Telegram failure is retried on a later service run.
+
+### Private Git mirror
+
+The local ledger is also mirrored to the dedicated private repository `gernalix/github-autosync-data`. It is deliberately **not** part of `ALLOWED_REPOSITORIES`: its own infrastructure push must not generate another autosync event and recursively feed itself.
+
+The service-owned checkout lives at:
+
+```text
+/home/daniele/.local/state/codex-github-autosync/github-autosync-data
+```
+
+Events are stored as daily JSONL files:
+
+```text
+activity/YYYY/MM/YYYY-MM-DD.jsonl
+```
+
+Each event has `schema_version=1` and a unique `event_id`. Legacy local rows without an ID receive a deterministic synthetic ID during export. One timer execution creates at most one data commit/push, even if it produced multiple events or touched multiple daily files.
+
+Mirror progress is persisted in:
+
+```text
+/home/daniele/.local/state/codex-github-autosync/activity-data-state.json
+```
+
+The cursor advances only after the remote push is verified. A crash after commit, after push, or before cursor persistence is therefore recoverable without duplicate rows: an ahead-only data checkout is pushed on the next run and already-exported `event_id` values are de-duplicated before the cursor advances.
+
+The local ledger remains the immediate recovery source; the private repository is the durable, remotely accessible history. Use `--no-data-mirror` only for tests or manual diagnostics.
 
 ## Telegram alerts
 

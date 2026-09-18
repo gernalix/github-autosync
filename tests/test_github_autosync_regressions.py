@@ -50,6 +50,7 @@ class AutosyncRegressionTests(unittest.TestCase):
                     "--megavault",
                     str(root / "mv"),
                     "--no-telegram",
+                    "--no-data-mirror",
                     "run",
                 ]
             )
@@ -113,6 +114,7 @@ class AutosyncRegressionTests(unittest.TestCase):
                     "--megavault",
                     str(root / "mv"),
                     "--no-telegram",
+                    "--no-data-mirror",
                     "run",
                 ]
             )

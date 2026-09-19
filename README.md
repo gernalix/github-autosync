@@ -28,10 +28,12 @@ All other current or future GitHub repositories are ignored completely until exp
 - fetch/update a managed repository when its GitHub metadata fingerprint changes;
 - perform a lightweight **local-only audit** even when the remote fingerprint is unchanged, so dirty worktrees and local commits are not hidden by the remote fast path;
 - automatically push clean, ahead-only managed repositories using a normal non-force push;
+- recover a rejected clean push with one evidence-producing fetch, then retry or rebase-and-push only when the new relation makes that safe;
+- always reconcile `codex-roadmap` through its canonical `tools/roadmap_pull.py` path, even when the GitHub fingerprint is unchanged, so generated-view dirt, interrupted guarded fast-forwards, and stale/missing pull guards heal automatically;
 - append every successful automatic repository mutation (`clone`, fast-forward `pull`, `push`) to a durable JSONL activity ledger;
 - send one Telegram notification for every automatic `push` or fast-forward `pull`, with a persistent delivery cursor so failed sends are retried on a later run;
-- skip network reconciliation for unchanged, clean, synchronized repositories;
-- never stash, reset, force-pull or force-push dirty/ahead/diverged repositories;
+- skip network reconciliation for unchanged, clean, synchronized repositories except `codex-roadmap`, whose guarded reconciler is intentionally checked every run;
+- never stash, hard-reset, force-pull or force-push user work; unresolved semantic conflicts remain deferred for review;
 - register genuinely new managed repositories in MegaVault when its worktree is clean and synchronized;
 - expose truthful machine-readable states: `ok`, `partial`, `deferred`, `error`, or `locked`;
 - notify through the shared `telegram_notify` package when unresolved sync problems change;
@@ -53,15 +55,19 @@ If a managed repository's fingerprint changed, that repository enters the networ
 
 An unchanged, clean, synchronized checkout is counted as `audited_unchanged` and then `skipped_unchanged`: it avoids `git fetch`/pull while remaining visible to the local safety audit.
 
+`codex-roadmap` is the deliberate exception. Its local checkout is reconciled every timer run through `tools/roadmap_pull.py --bootstrap-guard`, never through a generic `git pull`. That helper owns the roadmap-specific invariants: it restores generated-view dirt when safe, recovers the interrupted fast-forward shape left by a rejected unguarded pull, preserves running prompts, verifies the canonical SQLite/rendered views, and refreshes the installed guard. Local commits that touch canonical roadmap state are not auto-pushed; they are surfaced as a real blocker.
+
 ## Git safety policy
 
 For a managed repository selected as remotely changed:
 
 - **missing**: clone it directly into the canonical MegaVault worktree when known, otherwise `/home/daniele/projects/<repo>`;
 - **clean + behind only**: fetch that repository and fast-forward with `git merge --ff-only @{u}`;
-- **clean + ahead only**: normal `git push`, never `--force`; a remote race is rejected by Git;
+- **clean + ahead only**: normal `git push`, never `--force`; if that push loses a remote race, fetch once, inspect the new relation, and perform at most one evidence-based recovery attempt;
+- **clean + push-race divergence**: rebase onto the freshly fetched upstream and retry once; on any rebase conflict, abort the rebase and defer instead of guessing;
 - **clean + synced**: no mutation;
-- **dirty**, **diverged**, **detached**, **no upstream**, **wrong origin**, or failed relation check: no destructive recovery; report it as deferred/error as appropriate.
+- **`codex-roadmap`**: route through its guarded reconciler; generated-state dirt and interrupted guarded fast-forwards are mechanical recovery cases, while local canonical commits or semantic conflicts remain blocked;
+- **dirty non-roadmap**, **pre-existing divergence**, **detached**, **no upstream**, **wrong origin**, or failed relation check: no destructive recovery; report it as deferred/error as appropriate.
 
 When a branch has no upstream, normal execution fetches that repository once, checks for `origin/<local-branch>`, configures the matching upstream when available, and reuses that fetch instead of immediately fetching again. During `--dry-run`, the service does not fetch or mutate refs merely to repair a missing upstream; it uses `git ls-remote` when it needs to verify that the matching remote branch exists.
 

@@ -102,6 +102,71 @@ class AutosyncTests(unittest.TestCase):
             reconcile.assert_called_once()
             self.assertEqual(worktree, reconcile.call_args.args[1])
 
+    def test_reconcile_all_checkpoints_dirty_generic_repo_and_pushes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path, bare = self.make_repo_pair(root / "pair")
+            (repo_path / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+            repo = {
+                "name": "repo",
+                "url": str(bare),
+                "default_branch": "main",
+                "pushed_at": "A",
+                "archived": "0",
+            }
+            result, problem = autosync.sync_changed_repo(
+                repo,
+                root,
+                dry_run=False,
+                inventory_entry=self.entry(repo_path, bare),
+                auto_commit_dirty=True,
+            )
+            self.assertEqual("pushed", result)
+            self.assertIsNone(problem)
+            self.assertEqual("", git(["status", "--porcelain"], repo_path).stdout.strip())
+            self.assertEqual((0, 0), autosync.git_counts(repo_path))
+            self.assertTrue((repo_path / "dirty.txt").is_file())
+
+    def test_reconcile_all_rebases_generic_divergence_then_pushes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path, bare = self.make_repo_pair(root / "pair")
+            other = root / "other"
+            self.assertEqual(0, git(["clone", str(bare), str(other)]).returncode)
+            self.assertEqual(0, git(["config", "user.email", "test@example.invalid"], other).returncode)
+            self.assertEqual(0, git(["config", "user.name", "Test"], other).returncode)
+            self.assertEqual(0, git(["checkout", "main"], other).returncode)
+            (other / "remote.txt").write_text("remote\n", encoding="utf-8")
+            self.assertEqual(0, git(["add", "remote.txt"], other).returncode)
+            self.assertEqual(0, git(["commit", "-m", "remote"], other).returncode)
+            self.assertEqual(0, git(["push", "origin", "main"], other).returncode)
+
+            (repo_path / "local.txt").write_text("local\n", encoding="utf-8")
+            repo = {
+                "name": "repo",
+                "url": str(bare),
+                "default_branch": "main",
+                "pushed_at": "B",
+                "archived": "0",
+            }
+            result, problem = autosync.sync_changed_repo(
+                repo,
+                root,
+                dry_run=False,
+                inventory_entry=self.entry(repo_path, bare),
+                auto_commit_dirty=True,
+            )
+            self.assertEqual("pushed", result)
+            self.assertIsNone(problem)
+            self.assertEqual((0, 0), autosync.git_counts(repo_path))
+            self.assertTrue((repo_path / "local.txt").is_file())
+            self.assertTrue((repo_path / "remote.txt").is_file())
+
+    def test_reconcile_all_parser_enables_full_reconcile_and_dirty_checkpointing(self) -> None:
+        args = autosync.build_parser().parse_args(["reconcile-all"])
+        self.assertTrue(args.full_reconcile)
+        self.assertTrue(args.auto_commit_dirty)
+
     def test_dirty_repo_is_never_pushed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, bare = self.make_repo_pair(Path(tmp) / "pair")
@@ -197,6 +262,45 @@ class AutosyncTests(unittest.TestCase):
                 self.assertEqual(0, autosync.command_run(args))
                 self.assertEqual(1, sync.call_count)
                 self.assertEqual("codex-roadmap", sync.call_args.args[0]["name"])
+
+    def test_reconcile_all_includes_non_allowlisted_repo_already_present_locally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            local = projects / "workflowy-importer"
+            local.mkdir(parents=True)
+            remote = "https://github.com/gernalix/workflowy-importer"
+            repo = {
+                "name": "workflowy-importer",
+                "url": remote,
+                "default_branch": "main",
+                "pushed_at": "A",
+                "archived": "0",
+            }
+            args = autosync.build_parser().parse_args(
+                [
+                    "--projects-dir",
+                    str(projects),
+                    "--state-dir",
+                    str(root / "state"),
+                    "--megavault",
+                    str(root / "mv"),
+                    "--no-telegram",
+                    "--no-data-mirror",
+                    "reconcile-all",
+                ]
+            )
+            with (
+                mock.patch.object(autosync, "megavault_inventory", return_value=[]),
+                mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
+                mock.patch.object(autosync, "github_repos", return_value=[repo]),
+                mock.patch.object(autosync, "sync_changed_repo", return_value=("up_to_date", None)) as sync,
+                mock.patch.object(autosync, "megavault_registered_remotes", return_value={autosync.normalize_remote(remote)}),
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}),
+            ):
+                self.assertEqual(0, autosync.command_run(args))
+            sync.assert_called_once()
+            self.assertTrue(sync.call_args.kwargs["auto_commit_dirty"])
 
     def test_new_repo_is_cloned_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

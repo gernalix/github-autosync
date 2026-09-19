@@ -20,6 +20,36 @@ The service manages **only** these repositories:
 
 All other current or future GitHub repositories are ignored completely until explicitly added to `ALLOWED_REPOSITORIES`. They are not cloned, fetched, pulled, pushed, audited, registered in MegaVault, persisted in repo state, or included in Telegram alerts.
 
+## One-command global reconcile
+
+Install the global command once:
+
+```bash
+cd ~/projects/github-autosync
+python3 install_global_command.py
+```
+
+Then reconcile everything relevant with one command:
+
+```bash
+github-reconcile
+```
+
+This forces a fresh network reconciliation instead of relying on the normal fingerprint fast path. It covers every non-archived GitHub repository already represented by an active MegaVault worktree, already present under `~/projects/<repo>`, or included in the normal autosync allowlist.
+
+For ordinary repositories, current non-ignored local changes are checkpointed into one explicit `github-reconcile: ...` commit, then the command fetches upstream, fast-forwards remote-only changes, rebases clean local/remote divergence, and pushes the resulting branch. If a real rebase conflict remains, the rebase is aborted and the repository is reported rather than resolved by guessing.
+
+`codex-roadmap` remains special: it is delegated to the canonical guarded `roadmap_pull.py` path and canonical roadmap state is never auto-committed, preserving the single-writer boundary.
+
+Optional forms:
+
+```bash
+github-reconcile --dry-run
+github-reconcile --no-telegram
+```
+
+The periodic timer keeps its conservative behavior. Automatic dirty-worktree checkpoint commits happen only when `github-reconcile` / `reconcile-all` is invoked explicitly.
+
 ## Responsibilities
 
 - execute one GitHub metadata discovery query per timer run, then immediately filter it to the managed allowlist;

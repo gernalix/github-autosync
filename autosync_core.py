@@ -29,6 +29,24 @@ ACTIVITY_DATA_REMOTE = "https://github.com/gernalix/github-autosync-data.git"
 ACTIVITY_DATA_BRANCH = "main"
 ACTIVITY_SCHEMA_VERSION = 1
 REPO_STATE_FILE = "repo-state.json"
+ROADMAP_REPOSITORY = "gernalix/codex-roadmap"
+ROADMAP_PULL_SCRIPT = Path("tools/roadmap_pull.py")
+ROADMAP_CANONICAL_FILES = frozenset(
+    {
+        "roadmap.sqlite",
+        "roadmap.md",
+        "spiegazioni.md",
+        "prompt-registry.md",
+    }
+)
+ROADMAP_CANONICAL_PREFIXES = (
+    "obsidian/",
+    "prompts/",
+    "completed/",
+    "falliti/",
+    "mutations/inbox/",
+    "mutations/applied/",
+)
 ALLOWED_REPOSITORIES = frozenset(
     {
         "gernalix/codex-roadmap",
@@ -566,6 +584,197 @@ def git_counts(worktree: Path) -> tuple[int, int] | None:
         return None
 
 
+def _is_roadmap_canonical_path(path: str) -> bool:
+    return path in ROADMAP_CANONICAL_FILES or path.startswith(ROADMAP_CANONICAL_PREFIXES)
+
+
+def _roadmap_local_ahead_paths(worktree: Path) -> set[str] | None:
+    base = run(["git", "merge-base", "HEAD", "@{u}"], worktree, timeout=30)
+    if base.returncode != 0 or not base.stdout.strip():
+        return None
+    diff = run(
+        ["git", "diff", "--name-only", "-z", f"{base.stdout.strip()}..HEAD"],
+        worktree,
+        timeout=30,
+    )
+    if diff.returncode != 0:
+        return None
+    return _nul_paths(diff.stdout)
+
+
+def _push_with_race_recovery(
+    worktree: Path,
+    remote_name: str,
+    remote_branch: str,
+    *,
+    allow_rebase: bool,
+) -> tuple[str, str]:
+    """Push once, then use one fresh fetch as evidence for a bounded recovery.
+
+    Returns (action, detail), where action is one of:
+    pushed, synced, remote_ahead, blocked.
+    """
+    push = run(["git", "push", remote_name, f"HEAD:{remote_branch}"], worktree, timeout=240)
+    if push.returncode == 0:
+        return "pushed", ""
+
+    fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)
+    if fetch.returncode != 0:
+        return "blocked", "push_failed_then_fetch_failed"
+    counts = git_counts(worktree)
+    if counts is None:
+        return "blocked", "push_failed_relation_check_failed"
+    ahead, behind = counts
+    if not ahead and not behind:
+        return "synced", "remote_already_contains_head"
+    if not ahead and behind:
+        return "remote_ahead", f"behind={behind}"
+    if ahead and behind:
+        if not allow_rebase:
+            return "blocked", f"diverged_after_push_race:ahead={ahead},behind={behind}"
+        status = run(["git", "status", "--porcelain"], worktree, timeout=30)
+        if status.returncode != 0 or status.stdout.strip():
+            return "blocked", f"diverged_dirty_after_push_race:ahead={ahead},behind={behind}"
+        rebase = run(["git", "rebase", "@{u}"], worktree, timeout=300)
+        if rebase.returncode != 0:
+            run(["git", "rebase", "--abort"], worktree, timeout=120)
+            return "blocked", f"rebase_conflict_after_push_race:ahead={ahead},behind={behind}"
+
+    retry = run(["git", "push", remote_name, f"HEAD:{remote_branch}"], worktree, timeout=240)
+    if retry.returncode != 0:
+        return "blocked", "push_retry_failed_after_fresh_fetch"
+    verify_fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)
+    if verify_fetch.returncode != 0:
+        return "blocked", "post_push_fetch_failed"
+    verify = git_counts(worktree)
+    if verify != (0, 0):
+        return "blocked", f"post_push_verify_failed:counts={verify}"
+    return "pushed", ""
+
+
+def _run_roadmap_pull(worktree: Path, remote_name: str, remote_branch: str) -> tuple[bool, dict[str, Any]]:
+    script = worktree / ROADMAP_PULL_SCRIPT
+    if not script.is_file():
+        return False, {"status": "BLOCKED", "reason": "roadmap_pull_script_missing"}
+    result = run(
+        [
+            sys.executable,
+            str(script),
+            "--repo",
+            str(worktree),
+            "--remote",
+            remote_name,
+            "--branch",
+            remote_branch,
+            "--bootstrap-guard",
+        ],
+        worktree,
+        timeout=300,
+    )
+    payload: dict[str, Any] = {}
+    for line in reversed(result.stdout.splitlines()):
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            payload = parsed
+            break
+    if result.returncode != 0 or payload.get("status") != "PASS":
+        if not payload:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit={result.returncode}"
+            payload = {"status": "FAIL", "reason": detail}
+        return False, payload
+    return True, payload
+
+
+def sync_roadmap_repo(
+    repo: dict[str, str],
+    worktree: Path,
+    entry: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> tuple[str, dict[str, Any] | None]:
+    """Use codex-roadmap's canonical guarded pull instead of generic Git pull logic."""
+    if dry_run:
+        return "would_update", None
+
+    resolved, problems, upstream_name, fetched_remote = _worktree_basics(entry)
+    if problems:
+        return "deferred", problems[0]
+    assert resolved == worktree
+    assert upstream_name is not None
+    remote_name, remote_branch = upstream_name.split("/", 1)
+
+    if fetched_remote != remote_name:
+        fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)
+        if fetch.returncode != 0:
+            return "deferred", issue(entry, "fetch_failed")
+
+    before_head = run(["git", "rev-parse", "HEAD"], worktree, timeout=30)
+    if before_head.returncode != 0:
+        return "deferred", issue(entry, "head_check_failed")
+    before = before_head.stdout.strip()
+
+    counts = git_counts(worktree)
+    if counts is None:
+        return "deferred", issue(entry, "relation_check_failed")
+    ahead, behind = counts
+    did_push = False
+
+    if ahead:
+        if behind:
+            return "deferred", issue(entry, "roadmap_diverged", f"ahead={ahead},behind={behind}")
+        ahead_paths = _roadmap_local_ahead_paths(worktree)
+        if ahead_paths is None:
+            return "deferred", issue(entry, "roadmap_ahead_diff_failed", f"ahead={ahead}")
+        canonical = sorted(path for path in ahead_paths if _is_roadmap_canonical_path(path))
+        if canonical:
+            return "deferred", issue(
+                entry,
+                "roadmap_local_canonical_commit",
+                "paths=" + ",".join(canonical[:20]),
+            )
+        action, detail = _push_with_race_recovery(
+            worktree,
+            remote_name,
+            remote_branch,
+            allow_rebase=False,
+        )
+        if action == "blocked":
+            return "deferred", issue(entry, "push_failed", detail or f"ahead={ahead}")
+        did_push = action == "pushed"
+        # "remote_ahead" and "synced" are safe to hand to roadmap_pull, which
+        # performs the guarded canonical fast-forward/no-op below.
+
+    ok, payload = _run_roadmap_pull(worktree, remote_name, remote_branch)
+    if not ok:
+        return "deferred", issue(
+            entry,
+            "roadmap_reconcile_blocked",
+            str(payload.get("reason") or payload.get("status") or "unknown"),
+        )
+
+    status = run(["git", "status", "--porcelain"], worktree, timeout=30)
+    if status.returncode != 0:
+        return "deferred", issue(entry, "status_failed")
+    if status.stdout.strip():
+        return "deferred", issue(entry, "roadmap_post_reconcile_dirty")
+
+    final_counts = git_counts(worktree)
+    if final_counts != (0, 0):
+        return "deferred", issue(entry, "roadmap_post_reconcile_relation", f"counts={final_counts}")
+
+    after_head = run(["git", "rev-parse", "HEAD"], worktree, timeout=30)
+    if after_head.returncode != 0:
+        return "deferred", issue(entry, "head_check_failed")
+    if did_push:
+        return "pushed", None
+    if after_head.stdout.strip() != before:
+        return "updated", None
+    return "up_to_date", None
+
+
 def _worktree_basics(
     entry: dict[str, Any],
 ) -> tuple[Path, list[dict[str, Any]], str | None, str | None]:
@@ -704,6 +913,8 @@ def sync_changed_repo(
         entry.update(inventory_entry)
     if not worktree.exists():
         return clone_repo(repo, projects_dir, dry_run=dry_run, target_worktree=worktree), None
+    if github_remote_key(repo["url"]) == ROADMAP_REPOSITORY:
+        return sync_roadmap_repo(repo, worktree, entry, dry_run=dry_run)
     if not git_repo_matches_remote(worktree, repo["url"]):
         return "deferred", issue(entry, "origin_mismatch")
     status = run(["git", "status", "--porcelain"], worktree, timeout=30)
@@ -757,10 +968,22 @@ def sync_changed_repo(
     if ahead and behind:
         return "deferred", issue(entry, "diverged", f"ahead={ahead},behind={behind}")
     if ahead:
-        push = run(["git", "push", remote_name, f"HEAD:{remote_branch}"], worktree, timeout=240)
-        if push.returncode != 0:
-            return "deferred", issue(entry, "push_failed", f"ahead={ahead}")
-        return "pushed", None
+        action, detail = _push_with_race_recovery(
+            worktree,
+            remote_name,
+            remote_branch,
+            allow_rebase=True,
+        )
+        if action == "pushed":
+            return "pushed", None
+        if action == "synced":
+            return "up_to_date", None
+        if action == "remote_ahead":
+            merge = run(["git", "merge", "--ff-only", "@{u}"], worktree, timeout=120)
+            if merge.returncode != 0:
+                return "deferred", issue(entry, "fast_forward_failed", detail)
+            return "updated", None
+        return "deferred", issue(entry, "push_failed", detail or f"ahead={ahead}")
     if behind:
         merge = run(["git", "merge", "--ff-only", "@{u}"], worktree, timeout=120)
         if merge.returncode != 0:
@@ -1033,7 +1256,11 @@ def command_run(args: argparse.Namespace) -> int:
                 previous = old_state.get(repo["name"])
                 inventory_entry = inventory_by_remote.get(normalize_remote(repo["url"]))
                 worktree = Path(str(inventory_entry["worktree"])) if inventory_entry else projects_dir / repo["name"]
-                if previous == fingerprint and worktree.exists():
+                if (
+                    previous == fingerprint
+                    and worktree.exists()
+                    and github_remote_key(repo["url"]) != ROADMAP_REPOSITORY
+                ):
                     if args.dry_run:
                         counts["skipped_unchanged"] += 1
                         continue

@@ -18,14 +18,13 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
+import repo_single_writer
+
 DEFAULT_OWNER = "gernalix"
 DEFAULT_PROJECTS_DIR = Path.home() / "projects"
 DEFAULT_STATE_DIR = Path.home() / ".local/state/codex-github-autosync"
 DEFAULT_MEGAVAULT = Path.home() / "MegaVault"
-ALERT_STATE_FILE = "telegram-alert-state.json"
 ACTIVITY_LOG_FILE = "activity.jsonl"
-ACTIVITY_NOTIFY_STATE_FILE = "telegram-activity-state.json"
-ACTIVITY_NOTIFY_ACTIONS = frozenset({"push", "pull"})
 ACTIVITY_DATA_STATE_FILE = "activity-data-state.json"
 ACTIVITY_DATA_CHECKOUT_DIR = "github-autosync-data"
 ACTIVITY_DATA_REMOTE = "https://github.com/gernalix/github-autosync-data.git"
@@ -1281,133 +1280,6 @@ def dedupe_issues(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [unique[key] for key in sorted(unique, key=lambda value: tuple(str(part) for part in value))]
 
 
-def format_issue_message(items: list[dict[str, Any]]) -> str:
-    lines = [f"Rilevati {len(items)} intoppi nell'autosync GitHub:"]
-    for item in items[:20]:
-        project = f"project_id={item['project_id']}" if item.get("project_id") is not None else "sistema"
-        detail = f" ({item['detail']})" if item.get("detail") else ""
-        lines.append(f"- {item['repo']} [{project}]: {item['kind']}{detail}")
-    if len(items) > 20:
-        lines.append(f"- ... e altri {len(items) - 20}")
-    return "\n".join(lines)
-
-
-def send_telegram(title: str, message: str) -> bool:
-    result = run([sys.executable, "-m", "telegram_notify", title, message], timeout=60)
-    return result.returncode == 0
-
-
-def _save_activity_notify_cursor(state_dir: Path, next_line: int) -> bool:
-    path = state_dir / ACTIVITY_NOTIFY_STATE_FILE
-    tmp = path.with_suffix(".tmp")
-    try:
-        state_dir.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps({"next_line": next_line}, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
-        return False
-    return True
-
-
-def format_activity_message(event: dict[str, Any]) -> str:
-    lines = [
-        f"Repo: {event.get('repo') or 'UNKNOWN'}",
-        f"Azione automatica: {event.get('action') or 'UNKNOWN'}",
-    ]
-    if event.get("branch"):
-        lines.append(f"Branch: {event['branch']}")
-    if event.get("project_id") is not None:
-        lines.append(f"project_id: {event['project_id']}")
-    if event.get("detail"):
-        lines.append(f"Dettaglio: {event['detail']}")
-    if event.get("timestamp"):
-        lines.append(f"UTC: {event['timestamp']}")
-    return "\n".join(lines)
-
-
-def notify_pending_activity(state_dir: Path, *, enabled: bool) -> str:
-    if not enabled:
-        return "disabled"
-    log_path = state_dir / ACTIVITY_LOG_FILE
-    if not log_path.is_file():
-        return "unchanged"
-    state_path = state_dir / ACTIVITY_NOTIFY_STATE_FILE
-    try:
-        lines = log_path.read_text(encoding="utf-8").splitlines()
-        next_line = 0
-        if state_path.is_file():
-            raw = json.loads(state_path.read_text(encoding="utf-8"))
-            next_line = int(raw.get("next_line", 0))
-        if next_line < 0 or next_line > len(lines):
-            return "state_failed"
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return "state_failed"
-
-    sent = 0
-    for index in range(next_line, len(lines)):
-        try:
-            event = json.loads(lines[index])
-        except json.JSONDecodeError:
-            return "state_failed"
-        if not isinstance(event, dict):
-            return "state_failed"
-        action = str(event.get("action") or "")
-        if action in ACTIVITY_NOTIFY_ACTIONS:
-            title = f"GitHub autosync: {action}"
-            if not send_telegram(title, format_activity_message(event)):
-                return "notify_failed"
-            sent += 1
-        if not _save_activity_notify_cursor(state_dir, index + 1):
-            return "state_failed"
-    return f"sent:{sent}" if sent else "unchanged"
-
-
-def update_telegram_alert_state(state_dir: Path, items: list[dict[str, Any]], *, enabled: bool) -> str:
-    if not enabled:
-        return "disabled"
-    try:
-        state_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return "state_failed"
-    path = state_dir / ALERT_STATE_FILE
-    current = dedupe_issues(items)
-    current_fingerprint = json.dumps(
-        [issue_identity(item) for item in current], sort_keys=True, separators=(",", ":")
-    )
-    previous: list[dict[str, Any]] = []
-    previous_fingerprint: str | None = None
-    if path.is_file():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("issues"), list):
-                previous = dedupe_issues([item for item in data["issues"] if isinstance(item, dict)])
-                previous_fingerprint = str(data.get("fingerprint") or "") or None
-        except (OSError, json.JSONDecodeError):
-            return "state_failed"
-    if previous_fingerprint is None:
-        previous_fingerprint = json.dumps(
-            [issue_identity(item) for item in previous], sort_keys=True, separators=(",", ":")
-        )
-    if current_fingerprint == previous_fingerprint:
-        return "unchanged"
-    if current:
-        sent = send_telegram("GitHub autosync: attenzione", format_issue_message(current))
-    elif previous:
-        sent = send_telegram("GitHub autosync: risolto", "Tutti gli intoppi precedentemente rilevati risultano risolti.")
-    else:
-        sent = True
-    if not sent:
-        return "notify_failed"
-    try:
-        path.write_text(
-            json.dumps({"fingerprint": current_fingerprint, "issues": current}, sort_keys=True, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    except OSError:
-        return "state_failed"
-    return "alert_sent" if current else "resolved_sent"
-
-
 def register_in_megavault(
     megavault: Path,
     projects_dir: Path,
@@ -1496,7 +1368,6 @@ def command_run(args: argparse.Namespace) -> int:
     auto_commit_dirty = bool(getattr(args, "auto_commit_dirty", False))
     state_dir = Path(args.state_dir).expanduser()
     megavault = Path(args.megavault).expanduser()
-    telegram_enabled = not args.no_telegram and not args.dry_run
     activity_data_enabled = not args.no_data_mirror and not args.dry_run
     issues: list[dict[str, Any]] = []
     registration: dict[str, int | str] = {"validation": "not_run"}
@@ -1512,6 +1383,7 @@ def command_run(args: argparse.Namespace) -> int:
     activity_events = 0
     try:
         with ExclusiveLock(state_dir / "autosync.lock"):
+            writer = repo_single_writer.process_ready_prs(args.owner) if full_reconcile and not args.dry_run else {"found": 0, "merged": 0, "deferred": 0, "results": []}
             raw_inventory = megavault_inventory(megavault)
             inventory = raw_inventory if full_reconcile else filter_allowed_inventory(raw_inventory)
             try:
@@ -1550,6 +1422,30 @@ def command_run(args: argparse.Namespace) -> int:
                 current = inventory_by_remote.get(key)
                 if current is None or (current.get("project_id") is None and entry.get("project_id") is not None):
                     inventory_by_remote[key] = entry
+            if full_reconcile and not args.dry_run:
+                for repo in repos:
+                    inventory_entry = inventory_by_remote.get(normalize_remote(repo["url"]))
+                    worktree = Path(str(inventory_entry["worktree"])) if inventory_entry else projects_dir / repo["name"]
+                    if not worktree.exists() or allowed_repo_key(args.owner, repo["name"]).lower() == ROADMAP_REPOSITORY.lower():
+                        continue
+                    try:
+                        repo_single_writer.ensure_guard(
+                            worktree,
+                            repo.get("default_branch") if repo.get("default_branch") not in {None, "", "UNKNOWN"} else None,
+                        )
+                    except Exception as exc:
+                        issues.append(
+                            issue(
+                                inventory_entry or {
+                                    "project_id": None,
+                                    "slug": repo["name"],
+                                    "worktree": str(worktree),
+                                    "remote_url": repo["url"],
+                                },
+                                "writer_guard_failed",
+                                type(exc).__name__,
+                            )
+                        )
             github_remotes = {normalize_remote(repo["url"]) for repo in repos}
             local_issues, auto_pushed = audit_inventory(
                 [entry for key, entry in inventory_by_remote.items() if key not in github_remotes],
@@ -1617,7 +1513,7 @@ def command_run(args: argparse.Namespace) -> int:
                         projects_dir,
                         dry_run=args.dry_run,
                         inventory_entry=inventory_entry,
-                        auto_commit_dirty=auto_commit_dirty,
+                        auto_commit_dirty=False if full_reconcile else auto_commit_dirty,
                     )
                 except Exception as exc:
                     if not full_reconcile:
@@ -1725,12 +1621,6 @@ def command_run(args: argparse.Namespace) -> int:
         raise AutosyncError(f"unexpected_{type(exc).__name__}") from exc
 
     issues = dedupe_issues(issues)
-    notify = update_telegram_alert_state(state_dir, issues, enabled=telegram_enabled)
-    if notify in {"notify_failed", "state_failed"}:
-        raise AutosyncError(f"telegram_{notify}")
-    activity_notify = notify_pending_activity(state_dir, enabled=telegram_enabled)
-    if activity_notify in {"notify_failed", "state_failed"}:
-        raise AutosyncError(f"telegram_activity_{activity_notify}")
     work_done = counts["cloned"] + counts["updated"] + counts["pushed"] + auto_pushed
     payload = {
         "status": _status_for(issues, work_done),
@@ -1748,11 +1638,10 @@ def command_run(args: argparse.Namespace) -> int:
             }
             for item in issues
         ] if full_reconcile else [],
-        "telegram": notify,
-        "activity_telegram": activity_notify,
         "activity_events": activity_events,
         "activity_log": str(state_dir / ACTIVITY_LOG_FILE),
         "activity_data": activity_data,
+        "single_writer": writer,
         **counts,
         "megavault": registration,
     }
@@ -1818,7 +1707,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR))
     parser.add_argument("--megavault", default=str(DEFAULT_MEGAVAULT))
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--no-telegram", action="store_true", help="Disable Telegram issue/resolution notifications")
+    parser.add_argument("--no-telegram", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no-data-mirror", action="store_true", help="Disable the private github-autosync-data mirror")
     parser.add_argument("--json", action="store_true", help="Emit full machine-readable result")
     sub = parser.add_subparsers(dest="command", required=True)

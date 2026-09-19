@@ -218,12 +218,17 @@ github-autosync.timer
 Install or update the global command and user timer with `python3 install_systemd.py`.
 The one-minute calendar timer has `Persistent=true`; systemd coalesces ticks while
 the oneshot service is already running. A process lock also excludes manual runs.
-The service reads its private Kuma Push URL from
+The timer deliberately executes the lightweight fingerprint/audit `run` path, not
+the forced `reconcile-all` path, so routine heartbeats do not require a full network
+reconciliation of every repository. The service reads its private Kuma Push URL from
 `~/.config/github-autosync/reconcile.env`, installed by `python3 configure_kuma.py`.
+Every non-dry periodic run sends a Kuma heartbeat; fatal autosync errors send an
+explicit DOWN heartbeat instead of silently aging into "No heartbeat in the time window".
+A missing/unusable Push URL is treated as a heartbeat failure rather than success.
 
-`github-reconcile` prints a short Italian summary. `--json` emits the full
-machine-readable result; an unresolved repository returns exit code 2 after
-the other repositories have been processed.
+`github-reconcile` remains the manual forced `reconcile-all` command. It prints a
+short Italian summary. `--json` emits the full machine-readable result; an unresolved
+repository returns exit code 2 after the other repositories have been processed.
 
 The canonical checkout is never a worker workspace. Agent changes belong in `repo-task` worktrees. Completed task PRs are serialized asynchronously by `repo-integrator`; pending checks remain queued, canonical advances are rebased automatically on clean task branches, and only real semantic conflicts require repair. The roadmap keeps its own guarded mutation writer.
 

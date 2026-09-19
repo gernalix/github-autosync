@@ -1778,7 +1778,7 @@ def command_run(args: argparse.Namespace) -> int:
         **counts,
         "megavault": registration,
     }
-    if full_reconcile and not args.dry_run:
+    if not args.dry_run:
         if not _push_kuma_heartbeat(not issues, len(repos), issues):
             issues.append(issue(None, "heartbeat_failed"))
             payload["issues"] = len(issues)
@@ -1788,22 +1788,27 @@ def command_run(args: argparse.Namespace) -> int:
         _print_human_summary(payload)
     else:
         print(json.dumps(payload, sort_keys=True))
-    return 2 if full_reconcile and issues else 0
+    heartbeat_failed = any(item.get("kind") == "heartbeat_failed" for item in issues)
+    return 2 if issues and (full_reconcile or heartbeat_failed) else 0
 
 
-def _push_kuma_heartbeat(healthy: bool, total: int, issues: list[dict[str, Any]]) -> bool:
+def _push_kuma_status(status: str, message: str) -> bool:
     url = os.environ.get("GITHUB_RECONCILE_PUSH_URL", "").strip()
     if not url:
-        return True
-    message = f"{total} repository sincronizzati" if healthy else f"{len(issues)} repository richiedono attenzione"
+        return False
     separator = "&" if "?" in url else "?"
-    target = url + separator + urlencode({"status": "up" if healthy else "down", "msg": message})
+    target = url + separator + urlencode({"status": status, "msg": message})
     try:
         request = Request(target, headers={"User-Agent": "github-autosync/kuma-heartbeat"}, method="GET")
         with urlopen(request, timeout=10) as response:
             return response.status == 200 and json.loads(response.read(4096)).get("ok") is True
     except Exception:
         return False
+
+
+def _push_kuma_heartbeat(healthy: bool, total: int, issues: list[dict[str, Any]]) -> bool:
+    message = f"{total} repository sincronizzati" if healthy else f"{len(issues)} repository richiedono attenzione"
+    return _push_kuma_status("up" if healthy else "down", message)
 
 
 def _print_human_summary(payload: dict[str, Any]) -> None:
@@ -1860,8 +1865,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except BlockingIOError:
+        if not args.dry_run:
+            _push_kuma_status("up", "reconcile gia in corso")
         print(json.dumps({"status": "locked"}, sort_keys=True) if args.json else "GitHub reconcile: un'altra esecuzione è già in corso.")
         return 0
     except AutosyncError as exc:
+        if not args.dry_run:
+            _push_kuma_status("down", f"errore fatale: {str(exc)[:160]}")
         print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True) if args.json else "GitHub reconcile: controllo non completato.", file=sys.stderr)
         return 75

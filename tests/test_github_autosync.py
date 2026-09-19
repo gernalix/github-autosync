@@ -177,6 +177,22 @@ class AutosyncTests(unittest.TestCase):
             self.assertTrue((repo_path / "local.txt").is_file())
             self.assertTrue((repo_path / "remote.txt").is_file())
 
+    def test_independent_canonical_writer_repo_is_not_reconciled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = {
+                "owner": "gernalix",
+                "name": "activity-watch-data",
+                "url": "https://github.com/gernalix/activity-watch-data.git",
+                "default_branch": "main",
+                "pushed_at": "A",
+                "archived": "0",
+            }
+            result, problem = autosync.sync_changed_repo(repo, root, dry_run=False)
+            self.assertEqual("external-writer", result)
+            self.assertIsNone(problem)
+            self.assertFalse((root / "activity-watch-data").exists())
+
     def test_reconcile_all_parser_enables_full_reconcile_and_dirty_checkpointing(self) -> None:
         args = autosync.build_parser().parse_args(["reconcile-all"])
         self.assertTrue(args.full_reconcile)

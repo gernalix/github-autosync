@@ -37,7 +37,9 @@ github-reconcile
 
 This forces a fresh network reconciliation instead of relying on the normal fingerprint fast path. It covers every non-archived GitHub repository already represented by an active MegaVault worktree, already present under `~/projects/<repo>`, or included in the normal autosync allowlist.
 
-For ordinary repositories, current non-ignored local changes are checkpointed into one explicit `github-reconcile: ...` commit, then the command fetches upstream, fast-forwards remote-only changes, rebases clean local/remote divergence, and pushes the resulting branch. If a real rebase conflict remains, the rebase is aborted and the repository is reported rather than resolved by guessing.
+For ordinary repositories, current non-ignored local changes are checkpointed into one explicit `github-reconcile: ...` commit, then the command fetches upstream, fast-forwards remote-only changes, rebases clean local/remote divergence, and pushes the resulting branch. Stale/deleted tracking branches are repaired mechanically to the matching remote branch or the repository default branch when available. If a real rebase conflict remains, the rebase is aborted and the repository is reported rather than resolved by guessing.
+
+A failure in one repository does not abort the global pass: the remaining repositories are still reconciled, and the final JSON exposes any unresolved entries in `reconcile_issues`.
 
 `codex-roadmap` remains special: it is delegated to the canonical guarded `roadmap_pull.py` path and canonical roadmap state is never auto-committed, preserving the single-writer boundary.
 

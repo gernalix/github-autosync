@@ -167,6 +167,91 @@ class AutosyncTests(unittest.TestCase):
         self.assertTrue(args.full_reconcile)
         self.assertTrue(args.auto_commit_dirty)
 
+    def test_reconcile_all_repairs_stale_upstream_to_default_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path, bare = self.make_repo_pair(root / "pair")
+            self.assertEqual(0, git(["checkout", "-b", "legacy"], repo_path).returncode)
+            self.assertEqual(0, git(["push", "-u", "origin", "legacy"], repo_path).returncode)
+
+            other = root / "other"
+            self.assertEqual(0, git(["clone", str(bare), str(other)]).returncode)
+            self.assertEqual(0, git(["config", "user.email", "test@example.invalid"], other).returncode)
+            self.assertEqual(0, git(["config", "user.name", "Test"], other).returncode)
+            self.assertEqual(0, git(["push", "origin", "--delete", "legacy"], other).returncode)
+
+            repo = {
+                "name": "repo",
+                "url": str(bare),
+                "default_branch": "main",
+                "pushed_at": "B",
+                "archived": "0",
+            }
+            result, problem = autosync.sync_changed_repo(
+                repo,
+                root,
+                dry_run=False,
+                inventory_entry=self.entry(repo_path, bare),
+                auto_commit_dirty=True,
+            )
+            self.assertEqual("up_to_date", result)
+            self.assertIsNone(problem)
+            upstream = git(["rev-parse", "--abbrev-ref", "@{u}"], repo_path)
+            self.assertEqual("origin/main", upstream.stdout.strip())
+
+    def test_reconcile_all_continues_after_one_repo_operational_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            (projects / "one").mkdir(parents=True)
+            (projects / "two").mkdir(parents=True)
+            repos = [
+                {"name": "one", "url": "https://github.com/gernalix/one", "default_branch": "main", "pushed_at": "A", "archived": "0"},
+                {"name": "two", "url": "https://github.com/gernalix/two", "default_branch": "main", "pushed_at": "A", "archived": "0"},
+            ]
+            args = autosync.build_parser().parse_args(
+                [
+                    "--projects-dir",
+                    str(projects),
+                    "--state-dir",
+                    str(root / "state"),
+                    "--megavault",
+                    str(root / "mv"),
+                    "--no-telegram",
+                    "--no-data-mirror",
+                    "reconcile-all",
+                ]
+            )
+            with (
+                mock.patch.object(autosync, "megavault_inventory", return_value=[]),
+                mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
+                mock.patch.object(autosync, "github_repos", return_value=repos),
+                mock.patch.object(
+                    autosync,
+                    "sync_changed_repo",
+                    side_effect=[autosync.AutosyncError("boom"), ("up_to_date", None)],
+                ) as sync,
+                mock.patch.object(
+                    autosync,
+                    "megavault_registered_remotes",
+                    return_value={autosync.normalize_remote(repo["url"]) for repo in repos},
+                ),
+                mock.patch.object(
+                    autosync,
+                    "register_in_megavault",
+                    return_value={"validation": "not_needed", "deferred": 0},
+                ),
+                mock.patch("builtins.print") as printer,
+            ):
+                self.assertEqual(0, autosync.command_run(args))
+
+            self.assertEqual(2, sync.call_count)
+            payload = json.loads(printer.call_args.args[0])
+            self.assertEqual("deferred", payload["status"])
+            self.assertEqual(1, payload["issues"])
+            self.assertEqual("one", payload["reconcile_issues"][0]["repo"])
+            self.assertEqual("reconcile_error", payload["reconcile_issues"][0]["kind"])
+
     def test_dirty_repo_is_never_pushed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, bare = self.make_repo_pair(Path(tmp) / "pair")

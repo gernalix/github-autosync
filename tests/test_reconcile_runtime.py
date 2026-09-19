@@ -36,6 +36,61 @@ class ReconcileRuntimeTests(unittest.TestCase):
         self.assertIn("verifica di 2 repo", output.getvalue())
         self.assertNotIn("Aggiornati", output.getvalue())
 
+    def test_repo_discovery_prefers_rest_and_filters_owner(self) -> None:
+        rest_payload = [[
+            {
+                "name": "one",
+                "html_url": "https://github.com/gernalix/one",
+                "default_branch": "main",
+                "pushed_at": "2026-09-20T00:00:00Z",
+                "archived": False,
+                "owner": {"login": "gernalix"},
+            },
+            {
+                "name": "foreign",
+                "html_url": "https://github.com/other/foreign",
+                "default_branch": "main",
+                "pushed_at": "2026-09-20T00:00:00Z",
+                "archived": False,
+                "owner": {"login": "other"},
+            },
+        ]]
+        completed = __import__("subprocess").CompletedProcess(
+            [], 0, stdout=__import__("json").dumps(rest_payload), stderr=""
+        )
+        with mock.patch.object(autosync, "run", return_value=completed) as runner:
+            rows = autosync.github_repos("gernalix")
+        self.assertEqual(["one"], [row["name"] for row in rows])
+        self.assertEqual("main", rows[0]["default_branch"])
+        self.assertEqual("gh", runner.call_args.args[0][0])
+        self.assertEqual("api", runner.call_args.args[0][1])
+
+    def test_repo_discovery_falls_back_to_graphql_when_rest_fails(self) -> None:
+        import json
+        import subprocess
+
+        rest_failure = subprocess.CompletedProcess([], 1, stdout="", stderr="rate limited")
+        graphql = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps([
+                {
+                    "name": "one",
+                    "url": "https://github.com/gernalix/one",
+                    "defaultBranchRef": {"name": "main"},
+                    "pushedAt": "2026-09-20T00:00:00Z",
+                    "isArchived": False,
+                }
+            ]),
+            stderr="",
+        )
+        with mock.patch.object(autosync, "run", side_effect=[rest_failure, graphql]) as runner:
+            rows = autosync.github_repos("gernalix")
+        self.assertEqual(["one"], [row["name"] for row in rows])
+        self.assertEqual(2, runner.call_count)
+        self.assertEqual("api", runner.call_args_list[0].args[0][1])
+        self.assertEqual("repo", runner.call_args_list[1].args[0][1])
+
     def test_kuma_push_uses_result_without_exposing_token(self) -> None:
         class Response:
             status = 200

@@ -15,7 +15,7 @@ import sys
 import time
 from typing import Any
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 DEFAULT_OWNER = "gernalix"
@@ -1777,8 +1777,9 @@ def _push_kuma_heartbeat(healthy: bool, total: int, issues: list[dict[str, Any]]
     separator = "&" if "?" in url else "?"
     target = url + separator + urlencode({"status": "up" if healthy else "down", "msg": message})
     try:
-        with urlopen(target, timeout=10) as response:
-            return response.status == 200
+        request = Request(target, headers={"User-Agent": "github-autosync/kuma-heartbeat"}, method="GET")
+        with urlopen(request, timeout=10) as response:
+            return response.status == 200 and json.loads(response.read(4096)).get("ok") is True
     except Exception:
         return False
 

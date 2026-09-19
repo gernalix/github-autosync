@@ -11,7 +11,7 @@ import install_global_command
 
 
 ROOT = Path(__file__).resolve().parent
-UNITS = ("github-autosync.service", "github-autosync.timer", "repo-integrator.service", "repo-integrator.timer")
+UNITS = ("github-autosync.service", "github-autosync.timer", "repo-integrator.service", "repo-integrator.timer", "github-autosync-watchdog.service", "github-autosync-watchdog.timer")
 
 
 def checked(*args: str) -> None:
@@ -33,11 +33,12 @@ def main() -> int:
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     checked("systemctl", "--user", "enable", "--now", "github-autosync.timer")
     checked("systemctl", "--user", "enable", "--now", "repo-integrator.timer")
+    checked("systemctl", "--user", "enable", "--now", "github-autosync-watchdog.timer")
     # Fedora permits an ordinary user to enable their own lingering when logind
     # policy allows it; leave the installed timer intact if policy rejects it.
     linger = subprocess.run(["loginctl", "enable-linger", getpass.getuser()],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    print("github-autosync.timer + repo-integrator.timer active; linger " + ("enabled" if linger.returncode == 0 else "requires administrator"))
+    print("github-autosync.timer + repo-integrator.timer + watchdog active; linger " + ("enabled" if linger.returncode == 0 else "requires administrator"))
     return 0
 
 

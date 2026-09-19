@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically recover github-autosync runtime
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=github-autosync-watchdog.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Recover github-autosync runtime if the primary timer stops
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/daniele/projects/github-autosync
+ExecStart=/usr/bin/python3 /home/daniele/projects/github-autosync/runtime_watchdog.py --repair
+TimeoutStartSec=4min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/daniele/.config/systemd/user /home/daniele/.local/state/codex-github-autosync /home/daniele/projects/github-autosync
+StandardOutput=journal
+StandardError=journal

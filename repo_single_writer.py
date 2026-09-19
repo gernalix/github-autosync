@@ -242,6 +242,10 @@ def start_task(repo: Path, task_id: str, actor: str = "agent") -> dict[str, Any]
     if record_path.exists():
         existing = json.loads(record_path.read_text(encoding="utf-8"))
         if existing.get("status") in {"active", "ready"} and Path(existing["worktree"]).exists():
+            if existing.get("status") == "active":
+                existing["heartbeat_at"] = _iso_now()
+                existing["lease_expires_at"] = _lease_expires_at()
+                _atomic_json(record_path, existing)
             return existing
 
     _git(repo, "fetch", "--prune", "origin", timeout=180)
@@ -269,10 +273,52 @@ def start_task(repo: Path, task_id: str, actor: str = "agent") -> dict[str, Any]
         "branch": branch,
         "worktree": str(worktree),
         "status": "active",
-        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "created_at": _iso_now(),
+        "heartbeat_at": _iso_now(),
+        "lease_expires_at": _lease_expires_at(),
     }
     _atomic_json(record_path, payload)
     return payload
+
+
+def heartbeat_task(repo: Path, task_id: str) -> dict[str, Any]:
+    repo = repo.expanduser().resolve()
+    task_id = _safe_task_id(task_id)
+    record_path = _task_record(repo, task_id)
+    if not record_path.exists():
+        raise RuntimeError(f"unknown task: {task_id}")
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    if payload.get("status") != "active":
+        raise RuntimeError(f"task is not active: {payload.get('status')}")
+    worktree = Path(str(payload.get("worktree") or ""))
+    if not worktree.exists():
+        payload["status"] = "orphaned"
+        payload["orphaned_at"] = _iso_now()
+        _atomic_json(record_path, payload)
+        raise RuntimeError("task worktree is missing")
+    payload["heartbeat_at"] = _iso_now()
+    payload["lease_expires_at"] = _lease_expires_at()
+    _atomic_json(record_path, payload)
+    return payload
+
+
+def _task_dir_for_slug(slug: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", slug)
+    return STATE_ROOT / safe / "tasks"
+
+
+def _task_by_branch(repo_slug: str, branch: str) -> tuple[Path, dict[str, Any]] | None:
+    root = _task_dir_for_slug(repo_slug)
+    if not root.is_dir():
+        return None
+    for path in sorted(root.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(payload.get("branch") or "") == branch:
+            return path, payload
+    return None
 
 
 def _operation_in_progress(worktree: Path) -> bool:

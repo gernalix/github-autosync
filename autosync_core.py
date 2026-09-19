@@ -32,6 +32,11 @@ ACTIVITY_DATA_BRANCH = "main"
 ACTIVITY_SCHEMA_VERSION = 1
 REPO_STATE_FILE = "repo-state.json"
 ROADMAP_REPOSITORY = "gernalix/codex-roadmap"
+INDEPENDENT_CANONICAL_WRITER_REPOSITORIES = frozenset(
+    {
+        "gernalix/activity-watch-data",
+    }
+)
 ROADMAP_PULL_SCRIPT = Path("tools/roadmap_pull.py")
 ROADMAP_CANONICAL_FILES = frozenset(
     {
@@ -155,6 +160,11 @@ def allowed_repo_key(owner: str, name: str) -> str:
 
 def is_allowed_repo(owner: str, name: str) -> bool:
     return allowed_repo_key(owner, name) in ALLOWED_REPOSITORIES
+
+
+def is_independent_canonical_writer_repo(owner: str, name: str) -> bool:
+    key = allowed_repo_key(owner, name).lower()
+    return any(key == repo.lower() for repo in INDEPENDENT_CANONICAL_WRITER_REPOSITORIES)
 
 
 def github_remote_key(url: str) -> str | None:
@@ -1186,6 +1196,8 @@ def sync_changed_repo(
     }
     if inventory_entry:
         entry.update(inventory_entry)
+    if is_independent_canonical_writer_repo(str(repo.get("owner") or DEFAULT_OWNER), repo["name"]):
+        return "external-writer", None
     if not worktree.exists():
         return clone_repo(repo, projects_dir, dry_run=dry_run, target_worktree=worktree), None
     if not git_repo_matches_remote(worktree, repo["url"]):
@@ -1507,6 +1519,9 @@ def command_run(args: argparse.Namespace) -> int:
                     ):
                         continue
                     try:
+                        if is_independent_canonical_writer_repo(args.owner, repo["name"]):
+                            repo_single_writer.remove_guard(worktree)
+                            continue
                         repo_single_writer.ensure_guard(
                             worktree,
                             repo.get("default_branch") if repo.get("default_branch") not in {None, "", "UNKNOWN"} else None,
@@ -1540,6 +1555,11 @@ def command_run(args: argparse.Namespace) -> int:
                 previous = old_state.get(repo["name"])
                 inventory_entry = inventory_by_remote.get(normalize_remote(repo["url"]))
                 worktree = Path(str(inventory_entry["worktree"])) if inventory_entry else projects_dir / repo["name"]
+                if is_independent_canonical_writer_repo(args.owner, repo["name"]):
+                    counts["skipped_unchanged"] += 1
+                    if not args.dry_run:
+                        next_state[repo["name"]] = fingerprint
+                    continue
                 if (
                     not full_reconcile
                     and previous == fingerprint

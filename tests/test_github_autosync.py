@@ -193,6 +193,10 @@ class AutosyncTests(unittest.TestCase):
             self.assertIsNone(problem)
             self.assertFalse((root / "activity-watch-data").exists())
 
+    def test_autosync_does_not_own_repository_integration_queue(self) -> None:
+        source = Path(autosync.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("repo_single_writer.process_ready_prs(args.owner)", source)
+
     def test_queue_merged_roadmap_completions_marks_only_successful_submission(self) -> None:
         pending = [{"task_id": "123456"}, {"task_id": "654321"}]
         calls: list[str] = []

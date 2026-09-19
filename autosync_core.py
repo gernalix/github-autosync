@@ -687,6 +687,34 @@ def _remote_tracking(
     return ref, None
 
 
+def _recover_unborn_branch(worktree: Path, repo: dict[str, str], entry: dict[str, Any], *, dry_run: bool) -> dict[str, Any] | None:
+    """Attach a clean unborn local branch to the same named remote branch."""
+    status = run(["git", "status", "--porcelain=v1", "-z"], worktree, timeout=30)
+    if status.returncode != 0 or status.stdout:
+        return issue(entry, "unborn_branch_with_local_files")
+    local = run(["git", "branch", "--show-current"], worktree, timeout=30)
+    if local.returncode != 0 or not local.stdout.strip():
+        return issue(entry, "unborn_branch")
+    branch = local.stdout.strip()
+    remote = _matching_remote(worktree, repo["url"])
+    if remote is None:
+        return issue(entry, "remote_ambiguous_or_missing")
+    probe = run(["git", "ls-remote", "--exit-code", "--heads", remote, f"refs/heads/{branch}"], worktree, timeout=120)
+    if probe.returncode != 0 or len(probe.stdout.split()) < 2:
+        return issue(entry, "unborn_remote_branch_missing")
+    if dry_run:
+        return None
+    fetched = run(["git", "fetch", "--no-tags", remote,
+                   f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"], worktree, timeout=120)
+    if fetched.returncode != 0:
+        return issue(entry, "fetch_failed")
+    switched = run(["git", "switch", "--no-overwrite-ignore", "-C", branch,
+                    "--track", f"{remote}/{branch}"], worktree, timeout=120)
+    if switched.returncode != 0:
+        return issue(entry, "unborn_checkout_failed")
+    return None
+
+
 def _repair_tracking_branch(
     worktree: Path,
     *,
@@ -1142,7 +1170,12 @@ def sync_changed_repo(
         return "deferred", issue(entry, operation)
     head = run(["git", "rev-parse", "--verify", "HEAD"], worktree, timeout=30)
     if head.returncode != 0:
-        return "deferred", issue(entry, "unborn_branch")
+        problem = _recover_unborn_branch(worktree, repo, entry, dry_run=dry_run)
+        if problem:
+            return "deferred", problem
+        if dry_run:
+            return "would_update", None
+        return "updated", None
     status = run(["git", "status", "--porcelain"], worktree, timeout=30)
     if status.returncode != 0:
         return "deferred", issue(entry, "status_failed")

@@ -56,6 +56,32 @@ class ReconcileIntegration(unittest.TestCase):
         self.assertIn("refs/heads/main", git(self.local, "config", "--get-all", "remote.origin.fetch").stdout)
         self.assertEqual(("up_to_date", None), self.reconcile())
 
+    def test_clean_unborn_branch_checks_out_existing_remote(self) -> None:
+        unborn = self.root / "unborn"
+        self.assertEqual(0, git(None, "init", str(unborn)).returncode)
+        self.assertEqual(0, git(unborn, "symbolic-ref", "HEAD", "refs/heads/main").returncode)
+        self.assertEqual(0, git(unborn, "remote", "add", "origin", str(self.bare)).returncode)
+        repo = {**self.repo, "name": "unborn"}
+        entry = {**self.entry, "slug": "unborn", "worktree": str(unborn)}
+        result, problem = autosync.sync_changed_repo(repo, self.root, dry_run=False,
+                                                     inventory_entry=entry, auto_commit_dirty=True)
+        self.assertEqual(("updated", None), (result, problem))
+        self.assertEqual((0, 0), autosync.git_counts(unborn))
+        self.assertEqual("", git(unborn, "status", "--porcelain").stdout)
+
+    def test_unborn_branch_with_untracked_data_is_preserved(self) -> None:
+        unborn = self.root / "unborn"
+        self.assertEqual(0, git(None, "init", str(unborn)).returncode)
+        self.assertEqual(0, git(unborn, "symbolic-ref", "HEAD", "refs/heads/main").returncode)
+        self.assertEqual(0, git(unborn, "remote", "add", "origin", str(self.bare)).returncode)
+        (unborn / "local.txt").write_bytes(b"preserve me")
+        repo = {**self.repo, "name": "unborn"}
+        entry = {**self.entry, "slug": "unborn", "worktree": str(unborn)}
+        result, problem = autosync.sync_changed_repo(repo, self.root, dry_run=False,
+                                                     inventory_entry=entry, auto_commit_dirty=True)
+        self.assertEqual(("deferred", "unborn_branch_with_local_files"), (result, problem["kind"]))
+        self.assertEqual(b"preserve me", (unborn / "local.txt").read_bytes())
+
     def test_stale_upstream_and_local_branch_different_from_default(self) -> None:
         self.assertEqual(0, git(self.local, "checkout", "-b", "legacy").returncode)
         self.assertEqual(0, git(self.local, "push", "-u", "origin", "legacy").returncode)

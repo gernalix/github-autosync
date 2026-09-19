@@ -1061,6 +1061,10 @@ def clone_repo(
     return "cloned"
 
 
+def _stability_pause() -> None:
+    time.sleep(0.2)
+
+
 def _commit_dirty_for_reconcile(
     worktree: Path,
     entry: dict[str, Any],
@@ -1094,7 +1098,7 @@ def _commit_dirty_for_reconcile(
     before = snapshot()
     if before is None:
         return issue(entry, "worktree_snapshot_failed")
-    time.sleep(0.2)
+    _stability_pause()
     if snapshot() != before:
         return issue(entry, "worktree_changing")
     content_before = snapshot(include_status=False)

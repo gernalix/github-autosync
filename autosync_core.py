@@ -1412,6 +1412,24 @@ def command_run(args: argparse.Namespace) -> int:
     try:
         with ExclusiveLock(state_dir / "autosync.lock"):
             writer = repo_single_writer.process_ready_prs(args.owner) if full_reconcile and not args.dry_run else {"found": 0, "merged": 0, "deferred": 0, "results": []}
+            for item in writer.get("results", []):
+                if item.get("status") == "merged":
+                    append_activity(
+                        state_dir,
+                        action="merge",
+                        repo=str(item.get("repo") or "UNKNOWN"),
+                        detail=f"single-writer PR #{item.get('number')}",
+                    )
+                    activity_events += 1
+                elif item.get("status") == "deferred" and str(item.get("reason") or "") not in {
+                    "draft", "checks-pending", "mergeable-unknown"
+                }:
+                    issues.append(
+                        issue(
+                            {"project_id": None, "slug": str(item.get("repo") or "single-writer"), "worktree": None},
+                            "single_writer_" + str(item.get("reason") or "deferred").replace("-", "_"),
+                        )
+                    )
             raw_inventory = megavault_inventory(megavault)
             inventory = raw_inventory if full_reconcile else filter_allowed_inventory(raw_inventory)
             try:
@@ -1725,8 +1743,8 @@ def _print_human_summary(payload: dict[str, Any]) -> None:
 def _human_issue(kind: str) -> str:
     if kind in {"remote_branch_missing", "remote_probe_failed", "upstream_repair_failed", "tracking_ref_missing_after_fetch", "refspec_repair_failed", "relation_check_failed"}:
         return "collegamento al branch remoto da riparare"
-    if kind in {"unresolved_conflicts", "rebase_conflict", "rebase_abort_failed"}:
-        return "conflitto Git da risolvere"
+    if kind in {"unresolved_conflicts", "rebase_conflict", "rebase_abort_failed"} or kind.startswith("single_writer_"):
+        return "integrazione del task da verificare"
     if kind in {"worktree_changing", "git_lock_present", "merge_in_progress", "rebase_in_progress", "cherry_pick_in_progress", "revert_in_progress", "sequencer_in_progress"}:
         return "modifiche locali o operazione Git in corso"
     return "sincronizzazione da verificare"

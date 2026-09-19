@@ -110,6 +110,74 @@ class SingleWriterTests(unittest.TestCase):
                 again = writer.start_task(repo, "123456", "codex")
                 self.assertEqual(payload["worktree"], again["worktree"])
 
+    def test_task_lease_is_created_and_heartbeat_is_renewable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, _ = self.make_repo(root / "git")
+            state = root / "state"
+            worktrees = root / "worktrees"
+            with (
+                mock.patch.object(writer, "STATE_ROOT", state),
+                mock.patch.object(writer, "WORKTREE_ROOT", worktrees),
+            ):
+                payload = writer.start_task(repo, "lease-demo", "codex")
+                self.assertEqual("active", payload["status"])
+                self.assertTrue(payload["heartbeat_at"])
+                self.assertTrue(payload["lease_expires_at"])
+                renewed = writer.heartbeat_task(repo, "lease-demo")
+                self.assertEqual("active", renewed["status"])
+                self.assertTrue(Path(renewed["worktree"]).exists())
+
+    def test_cleanup_after_merge_preserves_safety_and_removes_clean_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, _ = self.make_repo(root / "git")
+            state = root / "state"
+            worktrees = root / "worktrees"
+            with (
+                mock.patch.object(writer, "STATE_ROOT", state),
+                mock.patch.object(writer, "WORKTREE_ROOT", worktrees),
+            ):
+                payload = writer.start_task(repo, "cleanup-demo", "codex")
+                task = Path(payload["worktree"])
+                (task / "feature.txt").write_text("feature\n", encoding="utf-8")
+                self.assertEqual(0, git(["add", "feature.txt"], task).returncode)
+                self.assertEqual(0, git(["commit", "-m", "feature"], task).returncode)
+                head = git(["rev-parse", "HEAD"], task).stdout.strip()
+                self.assertEqual(0, git(["push", "-u", "origin", payload["branch"]], task).returncode)
+                result = writer.cleanup_task_after_merge(
+                    payload["repo"],
+                    payload["branch"],
+                    expected_head=head,
+                    merge_sha="merged123",
+                )
+                self.assertEqual("merged", result["status"])
+                self.assertFalse(task.exists())
+                record = json.loads(writer._task_record(repo, "cleanup-demo").read_text(encoding="utf-8"))
+                self.assertEqual("merged", record["status"])
+                self.assertIsNone(record["lease_expires_at"])
+
+    def test_start_roadmap_task_resolves_canonical_repo_and_creates_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, _ = self.make_repo(root / "git")
+            state = root / "state"
+            worktrees = root / "worktrees"
+            with (
+                mock.patch.object(writer, "STATE_ROOT", state),
+                mock.patch.object(writer, "WORKTREE_ROOT", worktrees),
+                mock.patch.object(writer, "resolve_repo_path", return_value=repo),
+            ):
+                payload = writer.start_roadmap_task("gernalix/example", "1", "654321")
+                self.assertEqual("task/654321", payload["branch"])
+                self.assertTrue(Path(payload["worktree"]).exists())
+
+    def test_wait_any_is_noop_for_non_git_roadmap_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(writer, "STATE_ROOT", Path(tmp) / "state"):
+                payload = writer.wait_task_any("654321", timeout=0.1)
+                self.assertEqual("no-task-record", payload["status"])
+
     def test_finish_task_pushes_branch_and_queues_pr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

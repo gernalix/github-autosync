@@ -52,13 +52,17 @@ For every repository except `codex-roadmap`, use one isolated worktree per task:
 repo-task start --repo ~/projects/PersonalHub --task-id 123456 --actor codex
 ```
 
-The command prints the worktree path. Work only there. When the task is complete:
+The command prints the worktree path. Work only there. Each active task has a renewable lease in the autosync state directory; `repo-task heartbeat` can extend it for long-running/manual sessions. Roadmap-launched Codex tasks use `repo-task start-roadmap` automatically and receive the worktree path directly from `roadmap_start.py`.
+
+When the task is complete:
 
 ```bash
 repo-task finish --repo ~/projects/PersonalHub --task-id 123456
 ```
 
-This checkpoints the completed task, pushes its `task/123456` branch and creates a `[single-writer]` PR. The minute-by-minute `github-reconcile` service serializes eligible PRs into the repository's canonical branch after checks pass. Multiple ChatGPT/Codex sessions can therefore work on the same repository concurrently without sharing a checkout.
+This checkpoints the completed task, pushes its `task/123456` branch and creates a `[single-writer]` PR. The minute-by-minute `github-reconcile` service serializes eligible PRs into the repository's canonical branch after checks pass. `repo-task wait`/the roadmap finish bridge can wait for that merge. After integration, clean task worktrees and unchanged task branches are cleaned up safely; dirty or changed post-merge work is preserved rather than force-deleted.
+
+Multiple ChatGPT/Codex sessions can therefore work on the same repository concurrently without sharing a checkout. The canonical checkout is never a worker workspace.
 
 The canonical branch is guarded locally: direct commits/merges to it are rejected. A local fast-forward to the exact fetched remote canonical tip is allowed because it is synchronization, not a new canonical write. `codex-roadmap` keeps its existing dedicated writer/guard instead of this generic path.
 

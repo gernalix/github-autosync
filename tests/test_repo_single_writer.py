@@ -75,6 +75,23 @@ class SingleWriterTests(unittest.TestCase):
                 auth.unlink(missing_ok=True)
             self.assertEqual(new, git(["rev-parse", "main"], repo).stdout.strip())
 
+    def test_guard_allows_fast_forward_to_fetched_remote_tip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, bare = self.make_repo(root)
+            writer.ensure_guard(repo, "main")
+            other = root / "other"
+            self.assertEqual(0, git(["clone", str(bare), str(other)]).returncode)
+            self.assertEqual(0, git(["config", "user.name", "Test"], other).returncode)
+            self.assertEqual(0, git(["config", "user.email", "test@example.invalid"], other).returncode)
+            (other / "remote.txt").write_text("remote\n", encoding="utf-8")
+            self.assertEqual(0, git(["add", "remote.txt"], other).returncode)
+            self.assertEqual(0, git(["commit", "-m", "remote"], other).returncode)
+            self.assertEqual(0, git(["push", "origin", "main"], other).returncode)
+            self.assertEqual(0, git(["fetch", "origin"], repo).returncode)
+            merged = git(["merge", "--ff-only", "origin/main"], repo)
+            self.assertEqual(0, merged.returncode, merged.stderr)
+
     def test_start_task_creates_isolated_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -143,6 +160,8 @@ class SingleWriterTests(unittest.TestCase):
                     "headRefOid": "abc123",
                     "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
                 }))
+            if cmd[:3] == ["gh", "repo", "view"]:
+                return cp(stdout=json.dumps({"defaultBranchRef": {"name": "main"}}))
             if cmd[:3] == ["gh", "api", "--method"]:
                 return cp(stdout=json.dumps({"merged": True, "sha": "merge123"}))
             raise AssertionError(cmd)
@@ -167,6 +186,8 @@ class SingleWriterTests(unittest.TestCase):
                     "headRefOid": "abc123",
                     "statusCheckRollup": [{"status": "IN_PROGRESS", "conclusion": ""}],
                 }))
+            if cmd[:3] == ["gh", "repo", "view"]:
+                return cp(stdout=json.dumps({"defaultBranchRef": {"name": "main"}}))
             raise AssertionError(cmd)
 
         with (

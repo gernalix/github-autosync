@@ -457,7 +457,8 @@ def finish_task(repo: Path, task_id: str) -> dict[str, Any]:
                 pr_url = str(rows[0].get("url") or pr_url)
     payload.update({
         "status": "ready",
-        "ready_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "ready_at": _iso_now(),
+        "lease_expires_at": None,
         "pr_number": pr_number,
         "pr_url": pr_url,
     })

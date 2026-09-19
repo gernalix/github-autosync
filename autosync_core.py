@@ -1471,6 +1471,8 @@ SYSTEMD_RUNTIME_UNITS = (
     "github-autosync.timer",
     "repo-integrator.service",
     "repo-integrator.timer",
+    "github-autosync-watchdog.service",
+    "github-autosync-watchdog.timer",
 )
 
 

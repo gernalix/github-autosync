@@ -157,6 +157,27 @@ class SingleWriterTests(unittest.TestCase):
                 self.assertEqual("merged", record["status"])
                 self.assertIsNone(record["lease_expires_at"])
 
+    def test_start_roadmap_task_resolves_canonical_repo_and_creates_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, _ = self.make_repo(root / "git")
+            state = root / "state"
+            worktrees = root / "worktrees"
+            with (
+                mock.patch.object(writer, "STATE_ROOT", state),
+                mock.patch.object(writer, "WORKTREE_ROOT", worktrees),
+                mock.patch.object(writer, "resolve_repo_path", return_value=repo),
+            ):
+                payload = writer.start_roadmap_task("gernalix/example", "1", "654321")
+                self.assertEqual("task/654321", payload["branch"])
+                self.assertTrue(Path(payload["worktree"]).exists())
+
+    def test_wait_any_is_noop_for_non_git_roadmap_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(writer, "STATE_ROOT", Path(tmp) / "state"):
+                payload = writer.wait_task_any("654321", timeout=0.1)
+                self.assertEqual("no-task-record", payload["status"])
+
     def test_finish_task_pushes_branch_and_queues_pr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

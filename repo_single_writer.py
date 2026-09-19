@@ -9,7 +9,7 @@ requests into each repository's canonical branch.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 import os
@@ -26,6 +26,7 @@ STATE_ROOT = Path.home() / ".local/state/codex-github-autosync/single-writer"
 WORKTREE_ROOT = Path.home() / ".local/share/codex-github-autosync/worktrees"
 ROADMAP_REPOSITORY = "gernalix/codex-roadmap"
 HOOK_MARKER = "github-autosync-single-writer-v1"
+LEASE_SECONDS = int(os.environ.get("REPO_TASK_LEASE_SECONDS", "86400"))
 
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
@@ -57,6 +58,18 @@ def _safe_task_id(value: str) -> str:
     if not text:
         raise ValueError("task_id is empty")
     return text[:80]
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_now() -> str:
+    return _utc_now().isoformat(timespec="seconds")
+
+
+def _lease_expires_at() -> str:
+    return (_utc_now() + timedelta(seconds=LEASE_SECONDS)).isoformat(timespec="seconds")
 
 
 def _remote_url(repo: Path) -> str:

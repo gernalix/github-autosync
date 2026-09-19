@@ -844,17 +844,21 @@ def audit_worktree(
     if ahead:
         if not auto_push:
             return [issue(entry, "unpushed_commits", f"ahead={ahead}")], False
-        push = run(["git", "push", remote_name, f"HEAD:{remote_branch}"], worktree, timeout=240)
-        if push.returncode != 0:
-            return [issue(entry, "push_failed", f"ahead={ahead}")], False
-        if fetch_remote:
-            verify_fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)
-            if verify_fetch.returncode != 0:
-                return [issue(entry, "post_push_fetch_failed")], True
-            verify = git_counts(worktree)
-            if verify != (0, 0):
-                return [issue(entry, "post_push_verify_failed", f"counts={verify}")], True
-        return [], True
+        action, detail = _push_with_race_recovery(
+            worktree,
+            remote_name,
+            remote_branch,
+            allow_rebase=True,
+        )
+        if action == "pushed":
+            return [], True
+        if action == "synced":
+            return [], False
+        if action == "remote_ahead":
+            if report_behind:
+                return [issue(entry, "still_behind_remote", detail)], False
+            return [], False
+        return [issue(entry, "push_failed", detail or f"ahead={ahead}")], False
     if behind and report_behind:
         return [issue(entry, "still_behind_remote", f"behind={behind}")], False
     return [], False

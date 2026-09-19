@@ -306,6 +306,39 @@ class SingleWriterTests(unittest.TestCase):
         self.assertEqual("queue-behind-earlier", result["results"][1]["reason"])
         self.assertEqual("merged", result["results"][2]["status"])
 
+    def test_status_contract_exposes_pipeline_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, _ = self.make_repo(root / "git")
+            state = root / "state"
+            worktrees = root / "worktrees"
+            with (
+                mock.patch.object(writer, "STATE_ROOT", state),
+                mock.patch.object(writer, "WORKTREE_ROOT", worktrees),
+            ):
+                payload = writer.start_task(repo, "514458", "codex")
+                path = writer._task_record(repo, "514458")
+                payload["roadmap_prompt_id"] = "514458"
+                payload["status"] = "queued"
+                payload["integration_state"] = "checks-pending"
+                payload["pr_number"] = 27
+                payload["pr_url"] = "https://example/pr/27"
+                payload["queue_position"] = 2
+                payload["queue_size"] = 4
+                writer._atomic_json(path, payload)
+
+                status = writer.task_status_any("514458")
+                self.assertEqual("integration", status["pipeline_state"])
+                self.assertEqual("checks-pending", status["integration_state"])
+                self.assertEqual(27, status["pr_number"])
+                self.assertEqual(2, status["queue_position"])
+                all_status = writer.all_task_statuses(roadmap_only=True)
+                self.assertEqual(["514458"], [item["task_id"] for item in all_status])
+
+    def test_semantic_conflict_maps_to_needs_fix(self) -> None:
+        payload = {"status": "queued", "integration_state": "semantic-conflict"}
+        self.assertEqual("needs-fix", writer._pipeline_state(payload))
+
     def test_integrate_pr_merges_only_ready_task_pr(self) -> None:
         calls: list[list[str]] = []
 

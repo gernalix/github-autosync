@@ -1291,29 +1291,45 @@ def register_in_megavault(
         return {"already_registered": 0, "newly_registered": 0, "deferred": 0, "validation": "not_needed"}
     if dry_run:
         return {"already_registered": 0, "newly_registered": 0, "deferred": 0, "validation": "dry_run"}
-    status = run(["git", "status", "--porcelain"], megavault, timeout=30)
-    require_ok(status, "megavault_status_failed")
-    if status.stdout.strip():
-        return {"already_registered": 0, "newly_registered": 0, "deferred": len(repos), "validation": "deferred_dirty"}
-    fetch = run(["git", "fetch", "origin"], megavault, timeout=120)
-    require_ok(fetch, "megavault_fetch_failed")
-    sync = run(["git", "rev-list", "--left-right", "--count", "HEAD...@{u}"], megavault, timeout=30)
-    require_ok(sync, "megavault_sync_check_failed")
-    if sync.stdout.strip() != "0\t0":
-        return {"already_registered": 0, "newly_registered": 0, "deferred": len(repos), "validation": "deferred_not_synced"}
-    before = run(["git", "rev-parse", "HEAD"], megavault, timeout=30)
-    require_ok(before, "megavault_head_failed")
-    before_sha = before.stdout.strip()
-    already = created = deferred = 0
+
+    candidates: list[dict[str, str]] = []
+    deferred = 0
     for repo in repos:
         worktree = projects_dir / repo["name"]
-        if not git_repo_matches_remote(worktree, repo["url"]):
+        if git_repo_matches_remote(worktree, repo["url"]):
+            candidates.append(repo)
+        else:
             deferred += 1
-            continue
+    if not candidates:
+        return {
+            "already_registered": 0,
+            "newly_registered": 0,
+            "deferred": deferred,
+            "validation": "deferred_missing_worktree",
+        }
+
+    digest = hashlib.sha256(
+        "\n".join(sorted(str(repo["url"]) for repo in candidates)).encode("utf-8")
+    ).hexdigest()[:12]
+    task_id = f"autosync-register-{digest}"
+    try:
+        task = repo_single_writer.start_task(megavault, task_id, "github-autosync")
+    except Exception as exc:
+        return {
+            "already_registered": 0,
+            "newly_registered": 0,
+            "deferred": len(candidates) + deferred,
+            "validation": f"deferred_writer:{type(exc).__name__}",
+        }
+
+    task_repo = Path(str(task["worktree"]))
+    already = created = 0
+    for repo in candidates:
+        worktree = projects_dir / repo["name"]
         result = run(
             [
                 "python3",
-                str(megavault / "megavault.py"),
+                str(task_repo / "megavault.py"),
                 "register-github-repo",
                 "--owner",
                 repo["owner"],
@@ -1326,7 +1342,7 @@ def register_in_megavault(
                 "--worktree",
                 str(worktree),
             ],
-            cwd=megavault,
+            cwd=task_repo,
             timeout=60,
         )
         if result.returncode != 0:
@@ -1335,26 +1351,38 @@ def register_in_megavault(
             created += 1
         else:
             already += 1
-    validation = run(["python3", str(megavault / "megavault.py"), "validate"], cwd=megavault, timeout=120)
+
+    validation = run(
+        ["python3", str(task_repo / "megavault.py"), "validate"],
+        cwd=task_repo,
+        timeout=120,
+    )
     require_ok(validation, "megavault_validate_failed")
     if created:
-        require_ok(run(["git", "add", "megavault.sqlite"], megavault, timeout=30), "megavault_git_add_failed")
-        require_ok(run(["git", "commit", "-m", "Register autosynced GitHub repositories"], megavault, timeout=120), "megavault_metadata_commit_failed")
-        require_ok(run(["git", "push", "origin", "HEAD"], megavault, timeout=240), "megavault_metadata_push_failed")
-        verify = run(["git", "rev-list", "--left-right", "--count", "HEAD...@{u}"], megavault, timeout=30)
-        require_ok(verify, "megavault_metadata_verify_failed")
-        if verify.stdout.strip() != "0\t0":
-            raise AutosyncError("megavault_metadata_verify_failed")
-    after = run(["git", "rev-parse", "HEAD"], megavault, timeout=30)
-    require_ok(after, "megavault_head_verify_failed")
+        try:
+            ready = repo_single_writer.finish_task(megavault, task_id)
+        except Exception as exc:
+            return {
+                "already_registered": already,
+                "newly_registered": created,
+                "deferred": deferred,
+                "validation": f"deferred_writer_finish:{type(exc).__name__}",
+            }
+        return {
+            "already_registered": already,
+            "newly_registered": created,
+            "deferred": deferred,
+            "validation": "queued_single_writer",
+            "commit_changed": "False",
+            "pr": str(ready.get("pr_number") or ""),
+        }
     return {
         "already_registered": already,
-        "newly_registered": created,
+        "newly_registered": 0,
         "deferred": deferred,
         "validation": "PASS",
-        "commit_changed": str(before_sha != after.stdout.strip()),
+        "commit_changed": "False",
     }
-
 
 def _status_for(issues: list[dict[str, Any]], work_done: int) -> str:
     if not issues:

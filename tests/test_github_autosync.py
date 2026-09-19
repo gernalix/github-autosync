@@ -263,6 +263,45 @@ class AutosyncTests(unittest.TestCase):
                 self.assertEqual(1, sync.call_count)
                 self.assertEqual("codex-roadmap", sync.call_args.args[0]["name"])
 
+    def test_reconcile_all_includes_non_allowlisted_repo_already_present_locally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            local = projects / "workflowy-importer"
+            local.mkdir(parents=True)
+            remote = "https://github.com/gernalix/workflowy-importer"
+            repo = {
+                "name": "workflowy-importer",
+                "url": remote,
+                "default_branch": "main",
+                "pushed_at": "A",
+                "archived": "0",
+            }
+            args = autosync.build_parser().parse_args(
+                [
+                    "--projects-dir",
+                    str(projects),
+                    "--state-dir",
+                    str(root / "state"),
+                    "--megavault",
+                    str(root / "mv"),
+                    "--no-telegram",
+                    "--no-data-mirror",
+                    "reconcile-all",
+                ]
+            )
+            with (
+                mock.patch.object(autosync, "megavault_inventory", return_value=[]),
+                mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
+                mock.patch.object(autosync, "github_repos", return_value=[repo]),
+                mock.patch.object(autosync, "sync_changed_repo", return_value=("up_to_date", None)) as sync,
+                mock.patch.object(autosync, "megavault_registered_remotes", return_value={autosync.normalize_remote(remote)}),
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}),
+            ):
+                self.assertEqual(0, autosync.command_run(args))
+            sync.assert_called_once()
+            self.assertTrue(sync.call_args.kwargs["auto_commit_dirty"])
+
     def test_new_repo_is_cloned_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -12,7 +12,10 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import urlopen
 from uuid import uuid4
 
 DEFAULT_OWNER = "gernalix"
@@ -499,10 +502,19 @@ def normalize_remote(url: str) -> str:
 def git_repo_matches_remote(worktree: Path, expected_remote: str) -> bool:
     if not (worktree / ".git").exists():
         return False
-    result = run(["git", "config", "--get", "remote.origin.url"], worktree, timeout=30)
-    if result.returncode != 0:
-        return False
-    return normalize_remote(result.stdout) == normalize_remote(expected_remote)
+    return _matching_remote(worktree, expected_remote) is not None
+
+
+def _matching_remote(worktree: Path, expected_remote: str) -> str | None:
+    names = run(["git", "remote"], worktree, timeout=30)
+    if names.returncode != 0:
+        return None
+    matches = []
+    for name in names.stdout.splitlines():
+        url = run(["git", "remote", "get-url", name], worktree, timeout=30)
+        if url.returncode == 0 and normalize_remote(url.stdout) == normalize_remote(expected_remote):
+            matches.append(name)
+    return "origin" if "origin" in matches else matches[0] if len(matches) == 1 else None
 
 
 def megavault_inventory(megavault: Path) -> list[dict[str, Any]]:
@@ -588,9 +600,91 @@ def git_counts(worktree: Path, upstream_ref: str = "@{u}") -> tuple[int, int] | 
         return None
 
 
+def classify_relation(ahead: int, behind: int) -> str:
+    if ahead and behind:
+        return "diverged"
+    if ahead:
+        return "ahead"
+    if behind:
+        return "behind"
+    return "synced"
+
+
 def _tracking_ref_exists(worktree: Path, remote_name: str, branch: str) -> bool:
     ref = f"refs/remotes/{remote_name}/{branch}"
     return run(["git", "show-ref", "--verify", "--quiet", ref], worktree, timeout=30).returncode == 0
+
+
+def _git_operation(worktree: Path) -> str | None:
+    unresolved = run(["git", "ls-files", "-u"], worktree, timeout=30)
+    if unresolved.returncode != 0:
+        return "index_check_failed"
+    if unresolved.stdout:
+        return "unresolved_conflicts"
+    for name, label in (("MERGE_HEAD", "merge_in_progress"), ("rebase-merge", "rebase_in_progress"),
+                        ("rebase-apply", "rebase_in_progress"), ("CHERRY_PICK_HEAD", "cherry_pick_in_progress"),
+                        ("REVERT_HEAD", "revert_in_progress"), ("sequencer", "sequencer_in_progress")):
+        path = run(["git", "rev-parse", "--git-path", name], worktree, timeout=30)
+        if path.returncode == 0 and (worktree / path.stdout.strip()).exists():
+            return label
+    lock = run(["git", "rev-parse", "--git-path", "index.lock"], worktree, timeout=30)
+    if lock.returncode == 0 and (worktree / lock.stdout.strip()).exists():
+        return "git_lock_present"
+    return None
+
+
+def _remote_tracking(
+    worktree: Path, *, remote_name: str, local_branch: str, default_branch: str,
+    dry_run: bool,
+) -> tuple[str | None, str | None]:
+    """Select an unambiguous remote branch and fetch its exact ref, bypassing narrow refspecs."""
+    choices = [local_branch]
+    if default_branch not in {"", "UNKNOWN", local_branch}:
+        choices.append(default_branch)
+    upstream = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], worktree, timeout=30)
+    if upstream.returncode == 0 and upstream.stdout.strip().startswith(remote_name + "/"):
+        candidate = upstream.stdout.strip().split("/", 1)[1]
+        if candidate not in choices:
+            choices.append(candidate)
+    chosen = None
+    for branch in choices:
+        probe = run(["git", "ls-remote", "--exit-code", "--heads", remote_name, f"refs/heads/{branch}"], worktree, timeout=120)
+        if probe.returncode == 0 and len(probe.stdout.split()) >= 2:
+            chosen = branch
+            break
+        if probe.returncode not in (0, 2):
+            return None, "remote_probe_failed"
+    if chosen is None:
+        return None, "remote_branch_missing"
+    ref = f"{remote_name}/{chosen}"
+    if dry_run:
+        return ref, None
+    fetch = run(["git", "fetch", "--no-tags", remote_name,
+                 f"+refs/heads/{chosen}:refs/remotes/{remote_name}/{chosen}"], worktree, timeout=120)
+    if fetch.returncode != 0:
+        return None, "fetch_failed"
+    if not _tracking_ref_exists(worktree, remote_name, chosen):
+        return None, "tracking_ref_missing_after_fetch"
+    if chosen != local_branch:
+        safe_fallback = run(["git", "merge-base", "--is-ancestor", "HEAD",
+                             f"refs/remotes/{ref}"], worktree, timeout=30)
+        if safe_fallback.returncode != 0:
+            return None, "remote_branch_ambiguous"
+    configured = run(["git", "config", "--get-all", f"remote.{remote_name}.fetch"], worktree, timeout=30)
+    specs = configured.stdout.splitlines() if configured.returncode == 0 else []
+    broad = f"+refs/heads/*:refs/remotes/{remote_name}/*"
+    narrow = f"+refs/heads/{chosen}:refs/remotes/{remote_name}/{chosen}"
+    if broad not in specs and narrow not in specs:
+        added = run(["git", "config", "--add", f"remote.{remote_name}.fetch", narrow], worktree, timeout=30)
+        if added.returncode != 0:
+            return None, "refspec_repair_failed"
+    if upstream.returncode != 0 or upstream.stdout.strip() != ref:
+        tracking = run(["git", "branch", f"--set-upstream-to={ref}", local_branch], worktree, timeout=30)
+        if tracking.returncode != 0:
+            return None, "upstream_repair_failed"
+    if git_counts(worktree, f"refs/remotes/{ref}") is None:
+        return None, "relation_check_failed"
+    return ref, None
 
 
 def _repair_tracking_branch(
@@ -907,12 +1001,13 @@ def audit_inventory(
     issues: list[dict[str, Any]] = []
     pushed = 0
     for entry in inventory:
-        repo_issues, did_push = audit_worktree(
-            entry,
-            auto_push=auto_push,
-            report_behind=report_behind,
-            fetch_remote=fetch_remote,
-        )
+        try:
+            repo_issues, did_push = audit_worktree(
+                entry, auto_push=auto_push, report_behind=report_behind,
+                fetch_remote=fetch_remote,
+            )
+        except Exception as exc:
+            repo_issues, did_push = [issue(entry, "reconcile_error", type(exc).__name__)], False
         issues.extend(repo_issues)
         pushed += int(did_push)
     return issues, pushed
@@ -944,21 +1039,69 @@ def _commit_dirty_for_reconcile(
     entry: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Turn a generic dirty worktree into one explicit sync checkpoint commit."""
-    unresolved = run(["git", "diff", "--name-only", "--diff-filter=U"], worktree, timeout=30)
-    if unresolved.returncode != 0:
-        return issue(entry, "conflict_check_failed")
-    if unresolved.stdout.strip():
-        paths = ",".join(unresolved.stdout.splitlines()[:20])
-        return issue(entry, "unresolved_conflicts", f"paths={paths}")
-
+    operation = _git_operation(worktree)
+    if operation:
+        return issue(entry, operation)
+    def snapshot(*, include_status: bool = True) -> str | None:
+        status = run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], worktree, timeout=30)
+        if status.returncode != 0:
+            return None
+        digest = hashlib.sha256()
+        if include_status:
+            digest.update(status.stdout.encode("utf-8", "surrogateescape"))
+        records = status.stdout.split("\0")
+        paths = sorted({record[3:] for record in records if len(record) >= 4 and record[2] == " "})
+        for relative in paths:
+            path = worktree / relative
+            digest.update(relative.encode("utf-8", "surrogateescape"))
+            try:
+                if path.is_symlink():
+                    digest.update(os.readlink(path).encode("utf-8", "surrogateescape"))
+                elif path.is_file():
+                    with path.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            digest.update(chunk)
+            except OSError:
+                return None
+        return digest.hexdigest()
+    before = snapshot()
+    if before is None:
+        return issue(entry, "worktree_snapshot_failed")
+    time.sleep(0.2)
+    if snapshot() != before:
+        return issue(entry, "worktree_changing")
+    content_before = snapshot(include_status=False)
+    index_result = run(["git", "rev-parse", "--git-path", "index"], worktree, timeout=30)
+    if index_result.returncode != 0:
+        return issue(entry, "index_path_failed")
+    index_path = worktree / index_result.stdout.strip()
+    original_index = index_path.read_bytes() if index_path.exists() else None
+    def restore_index() -> None:
+        if original_index is None:
+            index_path.unlink(missing_ok=True)
+        else:
+            index_path.write_bytes(original_index)
     add = run(["git", "add", "-A"], worktree, timeout=120)
     if add.returncode != 0:
+        restore_index()
         return issue(entry, "git_add_failed")
+
+    # Status changes after staging by design; compare file content through a
+    # second pre-add snapshot of the same paths before allowing the commit.
+    after = snapshot(include_status=False)
+    if after is None:
+        restore_index()
+        return issue(entry, "worktree_snapshot_failed")
+    # A concurrent edit can change content without changing file names.
+    if after != content_before:
+        restore_index()
+        return issue(entry, "worktree_changing")
 
     staged = run(["git", "diff", "--cached", "--quiet"], worktree, timeout=30)
     if staged.returncode == 0:
         return None
     if staged.returncode != 1:
+        restore_index()
         return issue(entry, "staged_diff_check_failed")
 
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -969,6 +1112,7 @@ def _commit_dirty_for_reconcile(
         timeout=300,
     )
     if commit.returncode != 0:
+        restore_index()
         return issue(entry, "auto_commit_failed")
     return None
 
@@ -993,6 +1137,12 @@ def sync_changed_repo(
         return "deferred", issue(entry, "origin_mismatch")
     if github_remote_key(repo["url"]) == ROADMAP_REPOSITORY:
         return sync_roadmap_repo(repo, worktree, entry, dry_run=dry_run)
+    operation = _git_operation(worktree)
+    if operation:
+        return "deferred", issue(entry, operation)
+    head = run(["git", "rev-parse", "--verify", "HEAD"], worktree, timeout=30)
+    if head.returncode != 0:
+        return "deferred", issue(entry, "unborn_branch")
     status = run(["git", "status", "--porcelain"], worktree, timeout=30)
     if status.returncode != 0:
         return "deferred", issue(entry, "status_failed")
@@ -1010,81 +1160,36 @@ def sync_changed_repo(
     if branch.returncode != 0 or not branch.stdout.strip():
         return "deferred", issue(entry, "detached_or_unknown_branch")
     branch_name = branch.stdout.strip()
-    upstream = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], worktree, timeout=30)
-    if upstream.returncode != 0 or "/" not in upstream.stdout.strip():
-        remote_branch_ref = f"refs/remotes/origin/{branch_name}"
-        if dry_run:
-            exists = run(["git", "show-ref", "--verify", "--quiet", remote_branch_ref], worktree, timeout=30)
-            if exists.returncode != 0:
-                remote_probe = run(
-                    ["git", "ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch_name}"],
-                    worktree,
-                    timeout=120,
-                )
-                if remote_probe.returncode != 0:
-                    return "deferred", issue(entry, "no_upstream")
-            return "would_update", None
-        fetch = run(["git", "fetch", "--prune", "origin"], worktree, timeout=120)
-        if fetch.returncode != 0:
-            return "deferred", issue(entry, "fetch_failed")
-        fetched_remote = "origin"
-        exists = run(["git", "show-ref", "--verify", "--quiet", remote_branch_ref], worktree, timeout=30)
-        if exists.returncode == 0:
-            tracking = run(
-                ["git", "branch", f"--set-upstream-to=origin/{branch_name}", branch_name],
-                worktree,
-                timeout=30,
-            )
-            if tracking.returncode != 0:
-                return "deferred", issue(entry, "no_upstream")
-            upstream_name = f"origin/{branch_name}"
-        elif auto_commit_dirty:
-            repaired = _repair_tracking_branch(
-                worktree,
-                local_branch=branch_name,
-                remote_name="origin",
-                default_branch=repo.get("default_branch") or "UNKNOWN",
-            )
-            if repaired is None:
-                return "deferred", issue(entry, "no_upstream")
-            upstream_name = repaired
-        else:
-            return "deferred", issue(entry, "no_upstream")
-    else:
-        upstream_name = upstream.stdout.strip()
-        fetched_remote = None
+    remote_name = _matching_remote(worktree, repo["url"])
+    if remote_name is None:
+        return "deferred", issue(entry, "remote_ambiguous_or_missing")
+    upstream_name, tracking_error = _remote_tracking(
+        worktree, remote_name=remote_name, local_branch=branch_name,
+        default_branch=repo.get("default_branch") or "UNKNOWN", dry_run=dry_run,
+    )
+    if tracking_error:
+        return "deferred", issue(entry, tracking_error)
+    assert upstream_name is not None
     if dry_run:
         return "would_update", None
-    remote_name, remote_branch = upstream_name.split("/", 1)
-    if fetched_remote != remote_name:
-        fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)
-        if fetch.returncode != 0:
-            return "deferred", issue(entry, "fetch_failed")
-    counts = git_counts(worktree, upstream_name)
-    if counts is None and auto_commit_dirty:
-        repaired = _repair_tracking_branch(
-            worktree,
-            local_branch=branch_name,
-            remote_name=remote_name,
-            default_branch=repo.get("default_branch") or "UNKNOWN",
-        )
-        if repaired is not None:
-            upstream_name = repaired
-            remote_name, remote_branch = upstream_name.split("/", 1)
-            counts = git_counts(worktree, upstream_name)
+    remote_branch = upstream_name.split("/", 1)[1]
+    counts = git_counts(worktree, f"refs/remotes/{upstream_name}")
     if counts is None:
         return "deferred", issue(entry, "relation_check_failed", f"upstream={upstream_name}")
     ahead, behind = counts
-    if ahead and behind:
+    relation = classify_relation(ahead, behind)
+    if relation == "diverged":
         if not auto_commit_dirty:
             return "deferred", issue(entry, "diverged", f"ahead={ahead},behind={behind}")
         rebase = run(
-            ["git", "-c", "rerere.enabled=true", "rebase", upstream_name],
+            ["git", "-c", "rerere.enabled=false", "rebase", upstream_name],
             worktree,
             timeout=600,
         )
         if rebase.returncode != 0:
-            run(["git", "rebase", "--abort"], worktree, timeout=120)
+            abort = run(["git", "rebase", "--abort"], worktree, timeout=120)
+            if abort.returncode != 0 or _git_operation(worktree):
+                return "deferred", issue(entry, "rebase_abort_failed")
             return "deferred", issue(
                 entry,
                 "rebase_conflict",
@@ -1106,7 +1211,7 @@ def sync_changed_repo(
             if merge.returncode == 0:
                 return "updated", None
         return "deferred", issue(entry, "push_failed", detail or "after_rebase")
-    if ahead:
+    if relation == "ahead":
         action, detail = _push_with_race_recovery(
             worktree,
             remote_name,
@@ -1124,7 +1229,7 @@ def sync_changed_repo(
                 return "deferred", issue(entry, "fast_forward_failed", detail)
             return "updated", None
         return "deferred", issue(entry, "push_failed", detail or f"ahead={ahead}")
-    if behind:
+    if relation == "behind":
         merge = run(["git", "merge", "--ff-only", upstream_name], worktree, timeout=120)
         if merge.returncode != 0:
             return "deferred", issue(entry, "fast_forward_failed", f"behind={behind}")
@@ -1376,7 +1481,18 @@ def command_run(args: argparse.Namespace) -> int:
         with ExclusiveLock(state_dir / "autosync.lock"):
             raw_inventory = megavault_inventory(megavault)
             inventory = raw_inventory if full_reconcile else filter_allowed_inventory(raw_inventory)
-            discovered_repos = github_repos(args.owner)
+            try:
+                discovered_repos = github_repos(args.owner)
+            except AutosyncError:
+                if not full_reconcile:
+                    raise
+                issues.append(issue(None, "github_discovery_failed"))
+                discovered_repos = [
+                    {"name": str(entry["slug"]), "url": str(entry["remote_url"]),
+                     "default_branch": str(entry.get("branch") or "UNKNOWN"),
+                     "pushed_at": "", "archived": "0"}
+                    for entry in inventory
+                ]
             if full_reconcile:
                 inventory_remotes = {
                     normalize_remote(str(entry["remote_url"]))
@@ -1470,7 +1586,7 @@ def command_run(args: argparse.Namespace) -> int:
                         inventory_entry=inventory_entry,
                         auto_commit_dirty=auto_commit_dirty,
                     )
-                except (AutosyncError, subprocess.TimeoutExpired) as exc:
+                except Exception as exc:
                     if not full_reconcile:
                         raise
                     error_entry = inventory_entry or {
@@ -1606,8 +1722,53 @@ def command_run(args: argparse.Namespace) -> int:
         **counts,
         "megavault": registration,
     }
-    print(json.dumps(payload, sort_keys=True))
-    return 0
+    if full_reconcile and not args.dry_run:
+        if not _push_kuma_heartbeat(not issues, len(repos), issues):
+            issues.append(issue(None, "heartbeat_failed"))
+            payload["issues"] = len(issues)
+            payload["status"] = _status_for(issues, work_done)
+            payload["reconcile_issues"].append({"repo": "autosync", "kind": "heartbeat_failed", "detail": ""})
+    if getattr(args, "human_output", False):
+        _print_human_summary(payload)
+    else:
+        print(json.dumps(payload, sort_keys=True))
+    return 2 if full_reconcile and issues else 0
+
+
+def _push_kuma_heartbeat(healthy: bool, total: int, issues: list[dict[str, Any]]) -> bool:
+    url = os.environ.get("GITHUB_RECONCILE_PUSH_URL", "").strip()
+    if not url:
+        return True
+    message = f"{total} repository sincronizzati" if healthy else f"{len(issues)} repository richiedono attenzione"
+    separator = "&" if "?" in url else "?"
+    target = url + separator + urlencode({"status": "up" if healthy else "down", "msg": message})
+    try:
+        with urlopen(target, timeout=10) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+
+def _print_human_summary(payload: dict[str, Any]) -> None:
+    total = len(payload["managed_repos"])
+    trouble = payload["issues"]
+    print(f"GitHub reconcile: {total} repo — {max(0, total - trouble)} sincronizzati, {trouble} richiedono attenzione.")
+    if payload["updated"]:
+        print(f"Aggiornati dal remoto: {payload['updated']}")
+    if payload["pushed"] + payload["auto_pushed"]:
+        print(f"Inviati a GitHub: {payload['pushed'] + payload['auto_pushed']}")
+    for item in payload["reconcile_issues"][:3]:
+        print(f"Problema: {item['repo']} — {_human_issue(item['kind'])}.")
+
+
+def _human_issue(kind: str) -> str:
+    if kind in {"remote_branch_missing", "remote_probe_failed", "upstream_repair_failed", "tracking_ref_missing_after_fetch", "refspec_repair_failed", "relation_check_failed"}:
+        return "collegamento al branch remoto da riparare"
+    if kind in {"unresolved_conflicts", "rebase_conflict", "rebase_abort_failed"}:
+        return "conflitto Git da risolvere"
+    if kind in {"worktree_changing", "git_lock_present", "merge_in_progress", "rebase_in_progress", "cherry_pick_in_progress", "revert_in_progress", "sequencer_in_progress"}:
+        return "modifiche locali o operazione Git in corso"
+    return "sincronizzazione da verificare"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1619,6 +1780,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-telegram", action="store_true", help="Disable Telegram issue/resolution notifications")
     parser.add_argument("--no-data-mirror", action="store_true", help="Disable the private github-autosync-data mirror")
+    parser.add_argument("--json", action="store_true", help="Emit full machine-readable result")
     sub = parser.add_subparsers(dest="command", required=True)
     run_p = sub.add_parser("run")
     run_p.set_defaults(func=command_run, full_reconcile=False, auto_commit_dirty=False)
@@ -1632,11 +1794,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.human_output = args.full_reconcile and not args.json
     try:
         return int(args.func(args))
     except BlockingIOError:
-        print(json.dumps({"status": "locked"}, sort_keys=True))
+        print(json.dumps({"status": "locked"}, sort_keys=True) if args.json else "GitHub reconcile: un'altra esecuzione è già in corso.")
         return 0
     except AutosyncError as exc:
-        print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True), file=sys.stderr)
+        print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True) if args.json else "GitHub reconcile: controllo non completato.", file=sys.stderr)
         return 75

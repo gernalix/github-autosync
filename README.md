@@ -50,7 +50,7 @@ github-reconcile --dry-run
 github-reconcile --no-telegram
 ```
 
-The periodic timer keeps its conservative behavior. Automatic dirty-worktree checkpoint commits happen only when `github-reconcile` / `reconcile-all` is invoked explicitly.
+The periodic timer runs `github-reconcile` and uses the same guarded behavior as a manual reconcile.
 
 ## Responsibilities
 
@@ -69,7 +69,7 @@ The periodic timer keeps its conservative behavior. Automatic dirty-worktree che
 - register genuinely new managed repositories in MegaVault when its worktree is clean and synchronized;
 - expose truthful machine-readable states: `ok`, `partial`, `deferred`, `error`, or `locked`;
 - notify through the shared `telegram_notify` package when unresolved sync problems change;
-- run from a `systemd --user` timer every 5 minutes.
+- run from a `systemd --user` calendar timer every minute.
 
 The periodic path no longer uses `ghorg --fetch-all`. `ghorg` can still be used manually for bootstrap/recovery, but it is not part of the steady-state timer.
 
@@ -196,7 +196,22 @@ github-autosync.service
 github-autosync.timer
 ```
 
-The timer cadence stays at 5 minutes; efficiency comes from avoiding unnecessary network work while retaining a cheap local safety audit on all managed repositories.
+Install or update the global command and user timer with `python3 install_systemd.py`.
+The one-minute calendar timer has `Persistent=true`; systemd coalesces ticks while
+the oneshot service is already running. A process lock also excludes manual runs.
+The service reads its private Kuma Push URL from
+`~/.config/github-autosync/reconcile.env`, installed by `python3 configure_kuma.py`.
+
+`github-reconcile` prints a short Italian summary. `--json` emits the full
+machine-readable result; an unresolved repository returns exit code 2 after
+the other repositories have been processed.
+
+The generic repository policy is: clean synced => no-op; ahead => normal push;
+behind => fast-forward; diverged => rebase and normal push. Stable local
+changes become one checkpoint commit. An operation already in progress, an
+unstable worktree, an ambiguous branch mapping, or a true content conflict
+stays untouched and is reported. After a failed rebase, the reconciler aborts
+and checks for unresolved state. The roadmap always uses its guarded pull.
 
 ## Verification
 

@@ -243,7 +243,7 @@ class AutosyncTests(unittest.TestCase):
                 ),
                 mock.patch("builtins.print") as printer,
             ):
-                self.assertEqual(0, autosync.command_run(args))
+                self.assertEqual(2, autosync.command_run(args))
 
             self.assertEqual(2, sync.call_count)
             payload = json.loads(printer.call_args.args[0])

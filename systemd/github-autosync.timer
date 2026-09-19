@@ -2,9 +2,9 @@
 Description=Run safe gernalix GitHub autosync
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-AccuracySec=30s
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+RandomizedDelaySec=0
 Persistent=true
 Unit=github-autosync.service
 

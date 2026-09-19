@@ -52,7 +52,11 @@ class ReconcileRuntimeTests(unittest.TestCase):
     def test_units_run_single_calendar_scheduler(self) -> None:
         service = (ROOT / "systemd/github-autosync.service").read_text()
         timer = (ROOT / "systemd/github-autosync.timer").read_text()
-        self.assertIn("ExecStart=/home/daniele/.local/bin/github-reconcile", service)
+        self.assertIn(
+            "ExecStart=/usr/bin/python3 /home/daniele/projects/github-autosync/github_autosync.py run",
+            service,
+        )
+        self.assertNotIn("ExecStart=/home/daniele/.local/bin/github-reconcile", service)
         self.assertIn("TimeoutStartSec=10min", service)
         self.assertIn("OnCalendar=*-*-* *:*:00", timer)
         self.assertIn("Persistent=true", timer)

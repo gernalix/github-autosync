@@ -38,6 +38,7 @@ INDEPENDENT_CANONICAL_WRITER_REPOSITORIES = frozenset(
     }
 )
 ROADMAP_PULL_SCRIPT = Path("tools/roadmap_pull.py")
+ROADMAP_RESULT_SCRIPT = Path.home() / "projects" / "codex-roadmap" / "tools" / "roadmap_result.py"
 ROADMAP_CANONICAL_FILES = frozenset(
     {
         "roadmap.sqlite",
@@ -1430,6 +1431,40 @@ def _status_for(issues: list[dict[str, Any]], work_done: int) -> str:
     return "partial" if work_done else "deferred"
 
 
+def queue_merged_roadmap_completions() -> dict[str, Any]:
+    """Queue terminal PASS only after the repository single writer has merged the task."""
+    pending = repo_single_writer.pending_roadmap_completions()
+    result: dict[str, Any] = {"queued": 0, "deferred": 0, "prompt_ids": [], "failed": []}
+    for task in pending:
+        prompt_id = str(task.get("task_id") or "")
+        if not ROADMAP_RESULT_SCRIPT.is_file():
+            result["deferred"] += 1
+            result["failed"].append(prompt_id)
+            continue
+        proc = run(
+            [
+                "python3",
+                str(ROADMAP_RESULT_SCRIPT),
+                "--repo",
+                str(ROADMAP_RESULT_SCRIPT.parents[1]),
+                "--prompt-id",
+                prompt_id,
+                "--result",
+                "PASS",
+                "--confirm-executed",
+            ],
+            timeout=120,
+        )
+        if proc.returncode:
+            result["deferred"] += 1
+            result["failed"].append(prompt_id)
+            continue
+        repo_single_writer.mark_roadmap_completion_queued(prompt_id)
+        result["queued"] += 1
+        result["prompt_ids"].append(prompt_id)
+    return result
+
+
 def command_run(args: argparse.Namespace) -> int:
     projects_dir = Path(args.projects_dir).expanduser()
     full_reconcile = bool(getattr(args, "full_reconcile", False))
@@ -1449,6 +1484,7 @@ def command_run(args: argparse.Namespace) -> int:
     }
     auto_pushed = 0
     activity_events = 0
+    roadmap_finalization: dict[str, Any] = {"queued": 0, "deferred": 0, "prompt_ids": [], "failed": []}
     try:
         with ExclusiveLock(state_dir / "autosync.lock"):
             writer = repo_single_writer.process_ready_prs(args.owner) if full_reconcile and not args.dry_run else {"found": 0, "merged": 0, "deferred": 0, "results": []}
@@ -1470,6 +1506,10 @@ def command_run(args: argparse.Namespace) -> int:
                             "single_writer_" + str(item.get("reason") or "deferred").replace("-", "_"),
                         )
                     )
+            if full_reconcile and not args.dry_run:
+                roadmap_finalization = queue_merged_roadmap_completions()
+                for prompt_id in roadmap_finalization.get("failed", []):
+                    issues.append(issue(None, "roadmap_terminal_queue_failed", f"prompt_id={prompt_id}"))
             raw_inventory = megavault_inventory(megavault)
             inventory = raw_inventory if full_reconcile else filter_allowed_inventory(raw_inventory)
             try:
@@ -1740,6 +1780,7 @@ def command_run(args: argparse.Namespace) -> int:
         "activity_log": str(state_dir / ACTIVITY_LOG_FILE),
         "activity_data": activity_data,
         "single_writer": writer,
+        "roadmap_finalization": roadmap_finalization,
         **counts,
         "megavault": registration,
     }

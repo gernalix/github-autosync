@@ -227,7 +227,13 @@ explicit DOWN heartbeat instead of silently aging into "No heartbeat in the time
 A missing/unusable Push URL is treated as a heartbeat failure rather than success.
 The Fedora bootstrap also compares the installed user units with the repository copies;
 after a canonical checkout advances, the next reconcile repairs stale unit files and
-reloads systemd automatically, so an ExecStart change does not require a separate manual deploy.
+reloads systemd automatically. An independent `github-autosync-watchdog.timer` runs every
+five minutes outside the primary reconcile service: it can safely fast-forward a clean
+`github-autosync/main` checkout to the fetched `origin/main`, reinstall stale user units,
+re-enable the primary timers, and kick one non-blocking reconcile. It refuses dirty,
+wrong-branch, or non-fast-forward checkouts instead of resetting user work. This separates
+recovery from the component being recovered, so a stopped primary timer cannot indefinitely
+prevent its own fix from being deployed.
 
 `github-reconcile` remains the manual forced `reconcile-all` command. It prints a
 short Italian summary. `--json` emits the full machine-readable result; an unresolved

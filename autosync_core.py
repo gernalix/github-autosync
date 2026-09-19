@@ -1009,9 +1009,9 @@ def sync_changed_repo(
     branch = run(["git", "branch", "--show-current"], worktree, timeout=30)
     if branch.returncode != 0 or not branch.stdout.strip():
         return "deferred", issue(entry, "detached_or_unknown_branch")
+    branch_name = branch.stdout.strip()
     upstream = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], worktree, timeout=30)
     if upstream.returncode != 0 or "/" not in upstream.stdout.strip():
-        branch_name = branch.stdout.strip()
         remote_branch_ref = f"refs/remotes/origin/{branch_name}"
         if dry_run:
             exists = run(["git", "show-ref", "--verify", "--quiet", remote_branch_ref], worktree, timeout=30)
@@ -1112,6 +1112,7 @@ def sync_changed_repo(
             remote_name,
             remote_branch,
             allow_rebase=True,
+            upstream_ref=upstream_name,
         )
         if action == "pushed":
             return "pushed", None
@@ -1124,7 +1125,7 @@ def sync_changed_repo(
             return "updated", None
         return "deferred", issue(entry, "push_failed", detail or f"ahead={ahead}")
     if behind:
-        merge = run(["git", "merge", "--ff-only", "@{u}"], worktree, timeout=120)
+        merge = run(["git", "merge", "--ff-only", upstream_name], worktree, timeout=120)
         if merge.returncode != 0:
             return "deferred", issue(entry, "fast_forward_failed", f"behind={behind}")
         return "updated", None

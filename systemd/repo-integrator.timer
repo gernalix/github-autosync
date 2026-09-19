@@ -1,0 +1,12 @@
+[Unit]
+Description=Run asynchronous repository integration queue
+
+[Timer]
+OnCalendar=*-*-* *:*:30
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=repo-integrator.service
+
+[Install]
+WantedBy=timers.target

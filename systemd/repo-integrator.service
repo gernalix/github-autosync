@@ -1,0 +1,17 @@
+[Unit]
+Description=Integrate queued repository task pull requests
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/daniele/projects/github-autosync
+ExecStart=/usr/bin/python3 /home/daniele/projects/github-autosync/repo_integrator.py --owner gernalix --json
+TimeoutStartSec=10min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/daniele/.local/state/codex-github-autosync /home/daniele/.local/share/codex-github-autosync /home/daniele/projects /home/daniele/MegaVault
+StandardOutput=journal
+StandardError=journal

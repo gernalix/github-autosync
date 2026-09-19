@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Generic per-repository single-writer workflow for agent work.
+"""Parallel worker branches with one asynchronous per-repository integrator.
 
 Workers never update the canonical branch directly. They work on task/* branches
-in dedicated worktrees and submit a [single-writer] pull request. The periodic
-github-reconcile process is the only automated component allowed to merge those
-requests into each repository's canonical branch.
+in dedicated worktrees, push a queued pull request, and finish without waiting
+for CI or merge. A separate repo-integrator service serializes only the final
+canonical integration step for each repository.
 """
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -27,7 +27,6 @@ STATE_ROOT = Path.home() / ".local/state/codex-github-autosync/single-writer"
 WORKTREE_ROOT = Path.home() / ".local/share/codex-github-autosync/worktrees"
 ROADMAP_REPOSITORY = "gernalix/codex-roadmap"
 HOOK_MARKER = "github-autosync-single-writer-v1"
-LEASE_SECONDS = int(os.environ.get("REPO_TASK_LEASE_SECONDS", "86400"))
 
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
@@ -67,10 +66,6 @@ def _utc_now() -> datetime:
 
 def _iso_now() -> str:
     return _utc_now().isoformat(timespec="seconds")
-
-
-def _lease_expires_at() -> str:
-    return (_utc_now() + timedelta(seconds=LEASE_SECONDS)).isoformat(timespec="seconds")
 
 
 def _remote_url(repo: Path) -> str:
@@ -323,20 +318,15 @@ def start_task(repo: Path, task_id: str, actor: str = "agent") -> dict[str, Any]
         raise RuntimeError("codex-roadmap keeps its dedicated single-writer workflow")
     canonical = _canonical_branch(repo)
     ensure_guard(repo, canonical)
-    status = _ok(repo, "status", "--porcelain")
-    current = _ok(repo, "branch", "--show-current")
-    if current != canonical:
-        raise RuntimeError(f"canonical checkout must stay on {canonical}; current branch is {current or 'detached'}")
-    if status:
-        raise RuntimeError("canonical checkout is dirty; preserve/reconcile it before starting parallel work")
-
+    # Worker isolation must not depend on the state of the canonical checkout.
+    # The task worktree starts from the freshly fetched remote canonical tip.
     record_path = _task_record(repo, task_id)
     if record_path.exists():
         existing = json.loads(record_path.read_text(encoding="utf-8"))
-        if existing.get("status") in {"active", "ready"} and Path(existing["worktree"]).exists():
+        if existing.get("status") in {"active", "queued", "ready"} and Path(existing["worktree"]).exists():
             if existing.get("status") == "active":
                 existing["heartbeat_at"] = _iso_now()
-                existing["lease_expires_at"] = _lease_expires_at()
+                existing["lease_expires_at"] = None
                 _atomic_json(record_path, existing)
             return existing
 
@@ -365,9 +355,10 @@ def start_task(repo: Path, task_id: str, actor: str = "agent") -> dict[str, Any]
         "branch": branch,
         "worktree": str(worktree),
         "status": "active",
+        "coordination": "isolated-branch",
         "created_at": _iso_now(),
         "heartbeat_at": _iso_now(),
-        "lease_expires_at": _lease_expires_at(),
+        "lease_expires_at": None,
     }
     _atomic_json(record_path, payload)
     return payload
@@ -389,7 +380,7 @@ def heartbeat_task(repo: Path, task_id: str) -> dict[str, Any]:
         _atomic_json(record_path, payload)
         raise RuntimeError("task worktree is missing")
     payload["heartbeat_at"] = _iso_now()
-    payload["lease_expires_at"] = _lease_expires_at()
+    payload["lease_expires_at"] = None
     _atomic_json(record_path, payload)
     return payload
 
@@ -513,7 +504,7 @@ def finish_task(repo: Path, task_id: str) -> dict[str, Any]:
     if not record_path.exists():
         raise RuntimeError(f"unknown task: {task_id}")
     payload = json.loads(record_path.read_text(encoding="utf-8"))
-    if payload.get("status") in {"ready", "merged"}:
+    if payload.get("status") in {"queued", "ready", "merged"}:
         return payload
     if payload.get("status") not in {"active", "blocked"}:
         raise RuntimeError(f"task is not finishable: {payload.get('status')}")
@@ -571,7 +562,7 @@ def finish_task(repo: Path, task_id: str) -> dict[str, Any]:
                 "--base", str(payload["canonical_branch"]),
                 "--head", branch,
                 "--title", title,
-                "--body", "Ready for the per-repository single writer. Do not merge manually.",
+                "--body", "Queued for the asynchronous per-repository integrator. Worker work is complete; no user action is required while checks are pending.",
             ],
             timeout=180,
         )
@@ -588,9 +579,12 @@ def finish_task(repo: Path, task_id: str) -> dict[str, Any]:
                 pr_number = int(rows[0]["number"])
                 pr_url = str(rows[0].get("url") or pr_url)
     payload.update({
-        "status": "ready",
+        "status": "queued",
+        "queued_at": _iso_now(),
         "ready_at": _iso_now(),
         "lease_expires_at": None,
+        "base_sha": canonical_head,
+        "head_sha": head,
         "pr_number": pr_number,
         "pr_url": pr_url,
     })
@@ -661,6 +655,63 @@ class RepoLock:
             self.handle.close()
 
 
+def _refresh_task_branch_to_latest_base(
+    repo_slug: str,
+    branch: str,
+    canonical: str,
+    expected_head: str,
+) -> dict[str, Any]:
+    """Rebase a queued task branch when canonical advanced after queueing."""
+    found = _task_by_branch(repo_slug, branch)
+    if found is None:
+        return {"status": "untracked"}
+    record_path, payload = found
+    worktree = Path(str(payload.get("worktree") or "")).expanduser()
+    if not worktree.exists():
+        return {"status": "deferred", "reason": "task-worktree-missing"}
+    if _operation_in_progress(worktree):
+        return {"status": "deferred", "reason": "task-git-operation-in-progress"}
+    dirty = _git(worktree, "status", "--porcelain")
+    if dirty.returncode or dirty.stdout.strip():
+        return {"status": "deferred", "reason": "task-worktree-dirty"}
+    fetched = _git(
+        worktree, "fetch", "--no-tags", "origin",
+        f"+refs/heads/{canonical}:refs/remotes/origin/{canonical}", timeout=180,
+    )
+    if fetched.returncode:
+        return {"status": "deferred", "reason": "base-fetch-failed"}
+    local_head = _ok(worktree, "rev-parse", "HEAD")
+    if local_head != expected_head:
+        return {"status": "deferred", "reason": "task-head-drift"}
+    remote_base = _ok(worktree, "rev-parse", f"refs/remotes/origin/{canonical}")
+    contains = _git(worktree, "merge-base", "--is-ancestor", remote_base, local_head)
+    if contains.returncode == 0:
+        payload["base_sha"] = remote_base
+        payload["head_sha"] = local_head
+        _atomic_json(record_path, payload)
+        return {"status": "current"}
+    if contains.returncode != 1:
+        return {"status": "deferred", "reason": "base-relation-failed"}
+    rebased = _git(worktree, "rebase", f"refs/remotes/origin/{canonical}", timeout=300)
+    if rebased.returncode:
+        _git(worktree, "rebase", "--abort", timeout=120)
+        return {"status": "deferred", "reason": "semantic-conflict"}
+    new_head = _ok(worktree, "rev-parse", "HEAD")
+    pushed = _git(
+        worktree, "push",
+        f"--force-with-lease=refs/heads/{branch}:{expected_head}",
+        "origin", f"HEAD:refs/heads/{branch}", timeout=300,
+    )
+    if pushed.returncode:
+        return {"status": "deferred", "reason": "branch-refresh-race"}
+    payload["status"] = "queued"
+    payload["base_sha"] = remote_base
+    payload["head_sha"] = new_head
+    payload["refreshed_at"] = _iso_now()
+    _atomic_json(record_path, payload)
+    return {"status": "refreshed"}
+
+
 def integrate_pr(repo: str, number: int) -> dict[str, Any]:
     if repo.lower() == ROADMAP_REPOSITORY.lower():
         return {"repo": repo, "number": number, "status": "delegated-roadmap"}
@@ -709,11 +760,16 @@ def integrate_pr(repo: str, number: int) -> dict[str, Any]:
         allowed, check_reason = _check_rollup_allows_merge(info.get("statusCheckRollup"))
         if not allowed:
             return {"repo": repo, "number": number, "status": "deferred", "reason": check_reason}
+        if not head:
+            return {"repo": repo, "number": number, "status": "deferred", "reason": "head-missing"}
+        refreshed = _refresh_task_branch_to_latest_base(repo, head_branch, default_branch, head)
+        if refreshed.get("status") == "refreshed":
+            return {"repo": repo, "number": number, "status": "deferred", "reason": "branch-refreshed"}
+        if refreshed.get("status") == "deferred":
+            return {"repo": repo, "number": number, "status": "deferred", "reason": str(refreshed.get("reason") or "branch-refresh-failed")}
         mergeable = str(info.get("mergeable") or "").upper()
         if mergeable != "MERGEABLE":
             return {"repo": repo, "number": number, "status": "deferred", "reason": f"mergeable-{mergeable.lower() or 'unknown'}"}
-        if not head:
-            return {"repo": repo, "number": number, "status": "deferred", "reason": "head-missing"}
         merged = run(
             ["gh", "api", "--method", "PUT", f"repos/{repo}/pulls/{number}/merge",
              "-f", f"sha={head}", "-f", "merge_method=merge"],
@@ -739,7 +795,12 @@ def integrate_pr(repo: str, number: int) -> dict[str, Any]:
 
 def process_ready_prs(owner: str) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
+    blocked_repos: set[str] = set()
     for item in discover_ready_prs(owner):
+        repo_key = str(item["repo"]).lower()
+        if repo_key in blocked_repos:
+            results.append({"repo": item["repo"], "number": item["number"], "status": "deferred", "reason": "queue-behind-earlier"})
+            continue
         result = integrate_pr(item["repo"], item["number"])
         if result.get("status") == "merged" and result.get("head_branch"):
             result["cleanup"] = cleanup_task_after_merge(
@@ -748,6 +809,8 @@ def process_ready_prs(owner: str) -> dict[str, Any]:
                 expected_head=str(result.get("head_sha") or "") or None,
                 merge_sha=str(result.get("sha") or "") or None,
             )
+        else:
+            blocked_repos.add(repo_key)
         results.append(result)
     return {
         "found": len(results),
@@ -764,39 +827,20 @@ def wait_task_merged(
     timeout: float = 900.0,
     poll_seconds: float = 10.0,
 ) -> dict[str, Any]:
+    """Compatibility observer; workers never perform canonical integration."""
     import time
-
     repo = repo.expanduser().resolve()
     payload = finish_task(repo, task_id)
-    if payload.get("status") == "merged" and not payload.get("pr_number"):
+    if payload.get("status") == "merged":
         return {
-            "repo": payload.get("repo"),
-            "status": "merged",
-            "sha": payload.get("merge_sha"),
-            "head_branch": payload.get("branch"),
-            "head_sha": payload.get("merge_sha"),
-            "no_op": True,
-            "cleanup": {"status": "merged", "cleanup": payload.get("cleanup", [])},
+            **payload,
+            "no_op": payload.get("integration") == "no-op",
         }
-    pr_number = payload.get("pr_number")
-    if not pr_number:
-        raise RuntimeError("task PR number is unavailable")
     deadline = time.monotonic() + timeout
-    transient = {"checks-pending", "mergeable-unknown", "pr-read-failed"}
     while True:
-        result = integrate_pr(str(payload["repo"]), int(pr_number))
-        if result.get("status") == "merged":
-            cleanup = cleanup_task_after_merge(
-                str(payload["repo"]),
-                str(result.get("head_branch") or payload["branch"]),
-                expected_head=str(result.get("head_sha") or "") or None,
-                merge_sha=str(result.get("sha") or "") or None,
-            )
-            return {**result, "cleanup": cleanup}
-        if result.get("status") != "deferred" or str(result.get("reason") or "") not in transient:
-            raise RuntimeError(
-                f"single-writer integration blocked: {result.get('reason') or result.get('status')}"
-            )
+        current = json.loads(_task_record(repo, task_id).read_text(encoding="utf-8"))
+        if current.get("status") == "merged":
+            return current
         if time.monotonic() >= deadline:
             raise RuntimeError("single-writer integration timeout")
         time.sleep(max(1.0, poll_seconds))
@@ -851,6 +895,14 @@ def mark_roadmap_completion_queued(task_id: str) -> dict[str, Any]:
     return payload
 
 
+def finish_task_any(task_id: str) -> dict[str, Any]:
+    found = _find_task_record_any(task_id)
+    if found is None:
+        return {"status": "no-task-record", "task_id": _safe_task_id(task_id)}
+    _, payload = found
+    return finish_task(Path(str(payload["repo_path"])), task_id)
+
+
 def wait_task_any(task_id: str, *, timeout: float = 900.0) -> dict[str, Any]:
     found = _find_task_record_any(task_id)
     if found is None:
@@ -878,6 +930,8 @@ def build_parser() -> argparse.ArgumentParser:
     finish = sub.add_parser("finish")
     finish.add_argument("--repo", type=Path, required=True)
     finish.add_argument("--task-id", required=True)
+    finish_any = sub.add_parser("finish-any")
+    finish_any.add_argument("--task-id", required=True)
     heartbeat = sub.add_parser("heartbeat")
     heartbeat.add_argument("--repo", type=Path, required=True)
     heartbeat.add_argument("--task-id", required=True)
@@ -913,6 +967,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "finish":
             payload = finish_task(args.repo, args.task_id)
             print(payload.get("pr_url") or f"PR #{payload.get('pr_number')}")
+        elif args.command == "finish-any":
+            payload = finish_task_any(args.task_id)
+            print(json.dumps(payload, sort_keys=True))
         elif args.command == "heartbeat":
             payload = heartbeat_task(args.repo, args.task_id)
             print(payload["lease_expires_at"])

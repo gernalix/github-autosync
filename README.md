@@ -37,7 +37,7 @@ github-reconcile
 
 This forces a fresh network reconciliation instead of relying on the normal fingerprint fast path. It covers every non-archived GitHub repository already represented by an active MegaVault worktree, already present under `~/projects/<repo>`, or included in the normal autosync allowlist.
 
-Canonical branches are now single-writer protected. Agent work must happen in dedicated `task/*` branches/worktrees and is integrated through a `[single-writer]` pull request. `github-reconcile` is the only automated writer of each canonical branch; it also fast-forwards the local canonical checkout to the exact remote canonical tip. Stale/deleted tracking branches are still repaired mechanically when unambiguous.
+Canonical branches remain protected, but work is split into two phases. Agents run concurrently in dedicated `task/*` branches/worktrees and finish as soon as their queued pull request exists. The separate `repo-integrator` service serializes only final canonical integration per repository; `github-reconcile` is limited to synchronization/audit. Stale/deleted tracking branches are still repaired mechanically when unambiguous.
 
 A failure in one repository does not abort the global pass: the remaining repositories are still reconciled, and the final JSON exposes any unresolved entries in `reconcile_issues`.
 
@@ -52,7 +52,7 @@ For every repository except `codex-roadmap`, use one isolated worktree per task:
 repo-task start --repo ~/projects/PersonalHub --task-id 123456 --actor codex
 ```
 
-The command prints the worktree path. Work only there. Each active task has a renewable lease in the autosync state directory; `repo-task heartbeat` can extend it for long-running/manual sessions. Roadmap-launched Codex tasks use `repo-task start-roadmap` automatically and receive the worktree path directly from `roadmap_start.py`.
+The command prints the worktree path. Work only there. Worker coordination is branch/worktree isolation, not a repository lease: a dirty canonical checkout cannot block a fresh task worktree created from the fetched remote canonical tip. `repo-task heartbeat` is retained only as a compatibility activity marker. Roadmap-launched Codex tasks use `repo-task start-roadmap` automatically and receive the worktree path directly from `roadmap_start.py`.
 
 When the task is complete:
 
@@ -60,7 +60,7 @@ When the task is complete:
 repo-task finish --repo ~/projects/PersonalHub --task-id 123456
 ```
 
-This checkpoints the completed task, pushes its `task/123456` branch and creates a `[single-writer]` PR. The minute-by-minute `github-reconcile` service serializes eligible PRs into the repository's canonical branch after checks pass. `repo-task wait`/the roadmap finish bridge can wait for that merge. After integration, clean task worktrees and unchanged task branches are cleaned up safely; dirty or changed post-merge work is preserved rather than force-deleted.
+This checkpoints the completed task, pushes its `task/123456` branch and creates a queued PR. The worker is then finished: it does not wait for CI or merge. The minute-by-minute `repo-integrator` service processes PRs FIFO per repository, waits asynchronously for checks, automatically rebases a clean queued task branch when canonical has advanced, and merges only after refreshed checks pass. Real rebase conflicts are surfaced as semantic conflicts rather than guessed. After integration, clean task worktrees and unchanged task branches are cleaned up safely; dirty or changed post-merge work is preserved rather than force-deleted.
 
 Multiple ChatGPT/Codex sessions can therefore work on the same repository concurrently without sharing a checkout. The canonical checkout is never a worker workspace.
 
@@ -74,7 +74,7 @@ Optional forms:
 github-reconcile --dry-run
 ```
 
-The periodic timer runs `github-reconcile` and uses the same guarded behavior as a manual reconcile.
+Two periodic timers have separate responsibilities: `github-autosync.timer` synchronizes/audits repositories, while `repo-integrator.timer` owns the queued PR integration path.
 
 ## Responsibilities
 
@@ -83,7 +83,7 @@ The periodic timer runs `github-reconcile` and uses the same guarded behavior as
 - clone a missing managed repository into its MegaVault canonical worktree when one is registered, otherwise under `/home/daniele/projects/<repo>`;
 - fetch/update a managed repository when its GitHub metadata fingerprint changes;
 - perform a lightweight **local-only audit** even when the remote fingerprint is unchanged, so dirty worktrees and local commits are not hidden by the remote fast path;
-- protect canonical branches with a per-repository single-writer guard and integrate completed `task/*` work through `[single-writer]` PRs;
+- protect canonical branches with a local reference guard while workers remain branch-isolated and integration is asynchronous;
 - recover a rejected clean push with one evidence-producing fetch, then retry or rebase-and-push only when the new relation makes that safe;
 - always reconcile `codex-roadmap` through its canonical `tools/roadmap_pull.py` path, even when the GitHub fingerprint is unchanged, so generated-view dirt, interrupted guarded fast-forwards, and stale/missing pull guards heal automatically;
 - append every successful automatic repository mutation (`clone`, fast-forward `pull`, `push`) to a durable JSONL activity ledger;
@@ -206,7 +206,7 @@ The service reads its private Kuma Push URL from
 machine-readable result; an unresolved repository returns exit code 2 after
 the other repositories have been processed.
 
-The canonical checkout is no longer a worker workspace. Agent changes belong in `repo-task` worktrees. The canonical checkout is synchronized with the remote canonical branch and protected against direct local writes. Completed task PRs are serialized by the per-repository single writer; pending/failed checks or real merge conflicts remain unmerged and do not corrupt other work. The roadmap always uses its own guarded writer.
+The canonical checkout is never a worker workspace. Agent changes belong in `repo-task` worktrees. Completed task PRs are serialized asynchronously by `repo-integrator`; pending checks remain queued, canonical advances are rebased automatically on clean task branches, and only real semantic conflicts require repair. The roadmap keeps its own guarded mutation writer.
 
 ## Verification
 

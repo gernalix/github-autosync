@@ -1465,7 +1465,21 @@ def queue_merged_roadmap_completions() -> dict[str, Any]:
     return result
 
 
+def bootstrap_repo_integrator_runtime() -> None:
+    """One-time Fedora bootstrap after this architecture lands on the canonical checkout."""
+    if Path.home() != Path("/home/daniele"):
+        return
+    probe = run(["systemctl", "--user", "is-enabled", "repo-integrator.timer"], timeout=30)
+    if probe.returncode == 0:
+        return
+    installer = Path(__file__).resolve().with_name("install_systemd.py")
+    if installer.is_file():
+        run(["python3", str(installer)], timeout=120)
+
+
 def command_run(args: argparse.Namespace) -> int:
+    if not args.dry_run:
+        bootstrap_repo_integrator_runtime()
     projects_dir = Path(args.projects_dir).expanduser()
     full_reconcile = bool(getattr(args, "full_reconcile", False))
     auto_commit_dirty = bool(getattr(args, "auto_commit_dirty", False))
@@ -1487,29 +1501,8 @@ def command_run(args: argparse.Namespace) -> int:
     roadmap_finalization: dict[str, Any] = {"queued": 0, "deferred": 0, "prompt_ids": [], "failed": []}
     try:
         with ExclusiveLock(state_dir / "autosync.lock"):
-            writer = repo_single_writer.process_ready_prs(args.owner) if full_reconcile and not args.dry_run else {"found": 0, "merged": 0, "deferred": 0, "results": []}
-            for item in writer.get("results", []):
-                if item.get("status") == "merged":
-                    append_activity(
-                        state_dir,
-                        action="merge",
-                        repo=str(item.get("repo") or "UNKNOWN"),
-                        detail=f"single-writer PR #{item.get('number')}",
-                    )
-                    activity_events += 1
-                elif item.get("status") == "deferred" and str(item.get("reason") or "") not in {
-                    "draft", "checks-pending", "mergeable-unknown"
-                }:
-                    issues.append(
-                        issue(
-                            {"project_id": None, "slug": str(item.get("repo") or "single-writer"), "worktree": None},
-                            "single_writer_" + str(item.get("reason") or "deferred").replace("-", "_"),
-                        )
-                    )
-            if full_reconcile and not args.dry_run:
-                roadmap_finalization = queue_merged_roadmap_completions()
-                for prompt_id in roadmap_finalization.get("failed", []):
-                    issues.append(issue(None, "roadmap_terminal_queue_failed", f"prompt_id={prompt_id}"))
+            # Repository integration is owned by repo-integrator.service.
+            writer = {"found": 0, "merged": 0, "deferred": 0, "results": []}
             raw_inventory = megavault_inventory(megavault)
             inventory = raw_inventory if full_reconcile else filter_allowed_inventory(raw_inventory)
             try:

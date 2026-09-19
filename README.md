@@ -76,6 +76,25 @@ github-reconcile --dry-run
 
 Two periodic timers have separate responsibilities: `github-autosync.timer` synchronizes/audits repositories, while `repo-integrator.timer` owns the queued PR integration path.
 
+### Roadmap cockpit contract
+
+`github-autosync` is also the authoritative local source for **repository integration state** shown by the Workflowy roadmap cockpit. It does not decide the canonical roadmap status; it reports the real Git pipeline for each roadmap `PROMPT_ID`.
+
+Use one bulk call:
+
+```bash
+repo-task status-all --roadmap-only
+```
+
+Each task exposes `pipeline_state` plus the concrete integration observation, PR URL/number and FIFO queue position. Typical values are:
+
+- `running`: worker worktree active;
+- `integration`: PR queued, checks pending, refreshed after rebase, or integrating;
+- `needs-fix`: a real integration blocker such as semantic conflict or failed checks;
+- `done`: merge completed.
+
+The integrator persists observations such as `queued`, `checks-pending`, `rebasing`, `integrating`, `semantic-conflict` and `merged` in the task record. Workflowy consumes this contract instead of inferring state from Markdown, branch names or PR titles.
+
 ## Responsibilities
 
 - execute one GitHub metadata discovery query per timer run, then immediately filter it to the managed allowlist;

@@ -29,6 +29,12 @@ class ReconcileRuntimeTests(unittest.TestCase):
         self.assertIn("2 repo", lines[0])
         self.assertNotIn("rebase_conflict", output.getvalue())
         self.assertTrue(autosync.build_parser().parse_args(["--json", "reconcile-all"]).json)
+        payload["dry_run"] = True
+        output = StringIO()
+        with redirect_stdout(output):
+            autosync._print_human_summary(payload)
+        self.assertIn("verifica di 2 repo", output.getvalue())
+        self.assertNotIn("Aggiornati", output.getvalue())
 
     def test_kuma_push_uses_result_without_exposing_token(self) -> None:
         class Response:

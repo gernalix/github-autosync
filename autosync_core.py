@@ -1734,6 +1734,7 @@ def command_run(args: argparse.Namespace) -> int:
     work_done = counts["cloned"] + counts["updated"] + counts["pushed"] + auto_pushed
     payload = {
         "status": _status_for(issues, work_done),
+        "dry_run": bool(args.dry_run),
         "owner": args.owner,
         "discovered": len(repos),
         "managed_repos": [repo["name"] for repo in repos],
@@ -1785,6 +1786,11 @@ def _push_kuma_heartbeat(healthy: bool, total: int, issues: list[dict[str, Any]]
 def _print_human_summary(payload: dict[str, Any]) -> None:
     total = len(payload["managed_repos"])
     trouble = payload["issues"]
+    if payload.get("dry_run"):
+        print(f"GitHub reconcile: verifica di {total} repo completata, {trouble} problemi rilevati.")
+        for item in payload["reconcile_issues"][:3]:
+            print(f"Problema: {item['repo']} — {_human_issue(item['kind'])}.")
+        return
     print(f"GitHub reconcile: {total} repo — {max(0, total - trouble)} sincronizzati, {trouble} richiedono attenzione.")
     if payload["updated"]:
         print(f"Aggiornati dal remoto: {payload['updated']}")

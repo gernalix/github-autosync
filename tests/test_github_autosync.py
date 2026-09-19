@@ -408,7 +408,6 @@ class AutosyncTests(unittest.TestCase):
                 mock.patch.object(autosync, "github_repos", return_value=[]),
                 mock.patch.object(autosync, "megavault_registered_remotes", return_value=set()),
                 mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "deferred_dirty", "deferred": 1}),
-                mock.patch.object(autosync, "update_telegram_alert_state", return_value="disabled"),
                 mock.patch("builtins.print") as printer,
             ):
                 self.assertEqual(0, autosync.command_run(args))
@@ -474,13 +473,11 @@ class AutosyncTests(unittest.TestCase):
                 mock.patch.object(autosync, "github_repos", return_value=[unmanaged]),
                 mock.patch.object(autosync, "sync_changed_repo") as sync,
                 mock.patch.object(autosync, "megavault_registered_remotes", return_value=set()),
-                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}) as register,
-                mock.patch.object(autosync, "update_telegram_alert_state", return_value="disabled") as alerts,
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}) as register as alerts,
             ):
                 self.assertEqual(0, autosync.command_run(args))
             sync.assert_not_called()
             register.assert_called_once_with(root / "mv", root / "projects", [], dry_run=False)
-            alerts.assert_called_once()
             self.assertEqual({}, autosync.load_repo_state(state))
 
     def test_megavault_worktree_outside_allowlist_is_ignored(self) -> None:
@@ -493,12 +490,10 @@ class AutosyncTests(unittest.TestCase):
                 mock.patch.object(autosync, "audit_inventory", return_value=([], 0)) as audit,
                 mock.patch.object(autosync, "github_repos", return_value=[]),
                 mock.patch.object(autosync, "megavault_registered_remotes", return_value=set()),
-                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}),
-                mock.patch.object(autosync, "update_telegram_alert_state", return_value="disabled") as alerts,
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}) as alerts,
             ):
                 self.assertEqual(0, autosync.command_run(args))
             audit.assert_called_once_with([], auto_push=True, report_behind=False, fetch_remote=False)
-            alerts.assert_called_once()
 
     def test_allowed_repo_is_still_synced_normally(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -516,18 +511,6 @@ class AutosyncTests(unittest.TestCase):
                 self.assertEqual(0, autosync.command_run(args))
             sync.assert_called_once()
 
-    def test_telegram_alert_fingerprint_suppresses_identical_state(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp)
-            first = [autosync.issue({"project_id": 1, "slug": "one", "worktree": "/one"}, "dirty_worktree")]
-            changed = [autosync.issue({"project_id": 1, "slug": "one", "worktree": "/one"}, "diverged")]
-            with mock.patch.object(autosync, "send_telegram", return_value=True) as sender:
-                self.assertEqual("alert_sent", autosync.update_telegram_alert_state(state, first, enabled=True))
-                self.assertEqual("unchanged", autosync.update_telegram_alert_state(state, first, enabled=True))
-                self.assertEqual("alert_sent", autosync.update_telegram_alert_state(state, changed, enabled=True))
-            self.assertEqual(2, sender.call_count)
-            saved = json.loads((state / autosync.ALERT_STATE_FILE).read_text(encoding="utf-8"))
-            self.assertIn("fingerprint", saved)
 
     def test_real_github_failure_is_nonzero(self) -> None:
         with mock.patch.object(autosync, "megavault_inventory", return_value=[]), mock.patch.object(autosync, "audit_inventory", return_value=([], 0)), mock.patch.object(autosync, "github_repos", side_effect=autosync.AutosyncError("github_repo_list_failed")):

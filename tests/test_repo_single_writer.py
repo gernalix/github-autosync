@@ -56,6 +56,33 @@ class SingleWriterTests(unittest.TestCase):
             self.assertNotEqual(0, commit.returncode)
             self.assertIn("single-writer protected", commit.stderr)
 
+    def test_remove_guard_restores_direct_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = self.make_repo(Path(tmp))
+            writer.ensure_guard(repo, "main")
+            removed = writer.remove_guard(repo)
+            self.assertEqual("removed", removed["status"])
+            (repo / "direct.txt").write_text("allowed\n", encoding="utf-8")
+            self.assertEqual(0, git(["add", "direct.txt"], repo).returncode)
+            commit = git(["commit", "-m", "direct writer"], repo)
+            self.assertEqual(0, commit.returncode, commit.stderr)
+
+    def test_remove_guard_restores_preexisting_reference_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = self.make_repo(Path(tmp))
+            hooks = Path(git(["rev-parse", "--git-common-dir"], repo).stdout.strip()) / "hooks"
+            if not hooks.is_absolute():
+                hooks = repo / hooks
+            hooks.mkdir(parents=True, exist_ok=True)
+            target = hooks / "reference-transaction"
+            original = "#!/bin/sh\nexit 0\n"
+            target.write_text(original, encoding="utf-8")
+            target.chmod(0o755)
+            writer.ensure_guard(repo, "main")
+            removed = writer.remove_guard(repo)
+            self.assertEqual("restored-prior", removed["status"])
+            self.assertEqual(original, target.read_text(encoding="utf-8"))
+
     def test_authorized_writer_can_fast_forward_main(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, _ = self.make_repo(Path(tmp))

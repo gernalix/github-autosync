@@ -178,6 +178,26 @@ class SingleWriterTests(unittest.TestCase):
                 payload = writer.wait_task_any("654321", timeout=0.1)
                 self.assertEqual("no-task-record", payload["status"])
 
+    def test_validation_only_task_finishes_without_empty_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, _ = self.make_repo(root / "git")
+            state = root / "state"
+            worktrees = root / "worktrees"
+            with (
+                mock.patch.object(writer, "STATE_ROOT", state),
+                mock.patch.object(writer, "WORKTREE_ROOT", worktrees),
+            ):
+                payload = writer.start_task(repo, "noop-demo", "codex")
+                task = Path(payload["worktree"])
+                result = writer.finish_task(repo, "noop-demo")
+                self.assertEqual("merged", result["status"])
+                self.assertEqual("no-op", result["integration"])
+                self.assertFalse(task.exists())
+                waited = writer.wait_task_any("noop-demo", timeout=0.1)
+                self.assertEqual("merged", waited["status"])
+                self.assertTrue(waited["no_op"])
+
     def test_finish_task_pushes_branch_and_queues_pr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

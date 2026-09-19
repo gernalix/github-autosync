@@ -220,7 +220,9 @@ def start_task(repo: Path, task_id: str, actor: str = "agent") -> dict[str, Any]
     ensure_guard(repo, canonical)
     status = _ok(repo, "status", "--porcelain")
     current = _ok(repo, "branch", "--show-current")
-    if current == canonical and status:
+    if current != canonical:
+        raise RuntimeError(f"canonical checkout must stay on {canonical}; current branch is {current or 'detached'}")
+    if status:
         raise RuntimeError("canonical checkout is dirty; preserve/reconcile it before starting parallel work")
 
     record_path = _task_record(repo, task_id)
@@ -368,6 +370,8 @@ def _check_rollup_allows_merge(items: Any) -> tuple[bool, str]:
         conclusion = str(item.get("conclusion") or item.get("state") or "").upper()
         if status and status not in {"COMPLETED", "SUCCESS"}:
             return False, "checks-pending"
+        if conclusion in {"PENDING", "QUEUED", "IN_PROGRESS"}:
+            return False, "checks-pending"
         if conclusion and conclusion not in {"SUCCESS", "NEUTRAL", "SKIPPED", "EXPECTED", "COMPLETED"}:
             return False, "checks-failed"
     return True, "checks-pass"
@@ -436,6 +440,16 @@ def integrate_pr(repo: str, number: int) -> dict[str, Any]:
             return {"repo": repo, "number": number, "status": "deferred", "reason": "pr-json-invalid"}
         if not str(info.get("title") or "").startswith(PR_PREFIX):
             return {"repo": repo, "number": number, "status": "ignored"}
+        repo_view = run(["gh", "repo", "view", repo, "--json", "defaultBranchRef"], timeout=120)
+        if repo_view.returncode:
+            return {"repo": repo, "number": number, "status": "deferred", "reason": "repo-read-failed"}
+        try:
+            repo_info = json.loads(repo_view.stdout)
+            default_branch = str((repo_info.get("defaultBranchRef") or {}).get("name") or "")
+        except Exception:
+            default_branch = ""
+        if not default_branch or str(info.get("baseRefName") or "") != default_branch:
+            return {"repo": repo, "number": number, "status": "deferred", "reason": "wrong-base-branch"}
         if info.get("isDraft"):
             return {"repo": repo, "number": number, "status": "deferred", "reason": "draft"}
         if not str(info.get("headRefName") or "").startswith(TASK_PREFIX):

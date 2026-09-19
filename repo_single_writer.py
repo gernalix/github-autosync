@@ -217,7 +217,7 @@ try:
         auth = json.load(handle)
 except Exception:
     print(f"BLOCKED: {{CANONICAL_REF}} is single-writer protected.", file=sys.stderr)
-    print("Use repo-task start/finish; github-reconcile integrates completed tasks.", file=sys.stderr)
+    print("Use repo-task start/finish; repo-integrator integrates queued tasks.", file=sys.stderr)
     raise SystemExit(1)
 
 allowed = (str(auth.get("old")), str(auth.get("new")), str(auth.get("ref")))

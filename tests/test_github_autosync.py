@@ -193,6 +193,31 @@ class AutosyncTests(unittest.TestCase):
             self.assertIsNone(problem)
             self.assertFalse((root / "activity-watch-data").exists())
 
+    def test_queue_merged_roadmap_completions_marks_only_successful_submission(self) -> None:
+        pending = [{"task_id": "123456"}, {"task_id": "654321"}]
+        calls: list[str] = []
+
+        def fake_run(cmd: list[str], cwd: Path | None = None, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            prompt_id = cmd[cmd.index("--prompt-id") + 1]
+            calls.append(prompt_id)
+            return ok("{}\n") if prompt_id == "123456" else subprocess.CompletedProcess(cmd, 2, "", "failed")
+
+        with (
+            mock.patch.object(repo_single_writer, "pending_roadmap_completions", return_value=pending),
+            mock.patch.object(repo_single_writer, "mark_roadmap_completion_queued") as mark,
+            mock.patch.object(autosync, "ROADMAP_RESULT_SCRIPT", Path("/tmp/roadmap_result.py")),
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(autosync, "run", side_effect=fake_run),
+        ):
+            result = autosync.queue_merged_roadmap_completions()
+
+        self.assertEqual(["123456", "654321"], calls)
+        self.assertEqual(1, result["queued"])
+        self.assertEqual(1, result["deferred"])
+        self.assertEqual(["123456"], result["prompt_ids"])
+        self.assertEqual(["654321"], result["failed"])
+        mark.assert_called_once_with("123456")
+
     def test_reconcile_all_parser_enables_full_reconcile_and_dirty_checkpointing(self) -> None:
         args = autosync.build_parser().parse_args(["reconcile-all"])
         self.assertTrue(args.full_reconcile)

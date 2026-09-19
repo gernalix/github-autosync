@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 from typing import Any
@@ -74,6 +75,63 @@ def _lease_expires_at() -> str:
 
 def _remote_url(repo: Path) -> str:
     return _ok(repo, "remote", "get-url", "origin")
+
+
+def _normalize_repo_url(value: str) -> str:
+    text = value.strip().removesuffix(".git").rstrip("/")
+    if text.startswith("git@github.com:"):
+        text = "https://github.com/" + text.removeprefix("git@github.com:")
+    return text.lower()
+
+
+def resolve_repo_path(
+    repo_slug: str,
+    project_id: str | int | None = None,
+    *,
+    megavault: Path | None = None,
+) -> Path | None:
+    repo_slug = repo_slug.strip()
+    if not repo_slug or repo_slug.lower() == ROADMAP_REPOSITORY.lower():
+        return None
+    target_url = _normalize_repo_url("https://github.com/" + repo_slug)
+    mv = (megavault or (Path.home() / "MegaVault")).expanduser()
+    db = mv / "megavault.sqlite"
+    if db.is_file():
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+            conn.row_factory = sqlite3.Row
+            if project_id is not None and str(project_id).strip():
+                rows = conn.execute(
+                    """SELECT worktree_path,remote_url,canonical,repository_kind
+                       FROM repositories
+                       WHERE project_id=? AND worktree_path IS NOT NULL AND remote_url IS NOT NULL
+                       ORDER BY coalesce(canonical,0) DESC, repository_id""",
+                    (int(project_id),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT worktree_path,remote_url,canonical,repository_kind
+                       FROM repositories
+                       WHERE worktree_path IS NOT NULL AND remote_url IS NOT NULL
+                       ORDER BY coalesce(canonical,0) DESC, repository_id"""
+                ).fetchall()
+            conn.close()
+            for row in rows:
+                if _normalize_repo_url(str(row["remote_url"])) != target_url:
+                    continue
+                path = Path(str(row["worktree_path"])).expanduser()
+                if path.exists():
+                    return path.resolve()
+        except (sqlite3.Error, OSError, ValueError):
+            pass
+    name = repo_slug.rsplit("/", 1)[-1]
+    fallbacks = [Path.home() / "projects" / name]
+    if name.lower() == "megavault":
+        fallbacks.insert(0, Path.home() / "MegaVault")
+    for path in fallbacks:
+        if path.exists():
+            return path.resolve()
+    return None
 
 
 def _repo_slug(repo: Path) -> str:
@@ -305,6 +363,21 @@ def heartbeat_task(repo: Path, task_id: str) -> dict[str, Any]:
 def _task_dir_for_slug(slug: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", slug)
     return STATE_ROOT / safe / "tasks"
+
+
+def _find_task_record_any(task_id: str) -> tuple[Path, dict[str, Any]] | None:
+    safe_id = _safe_task_id(task_id)
+    if not STATE_ROOT.is_dir():
+        return None
+    matches = sorted(STATE_ROOT.glob(f"*/tasks/{safe_id}.json"))
+    for path in matches:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(payload.get("task_id") or "") == safe_id:
+            return path, payload
+    return None
 
 
 def _task_by_branch(repo_slug: str, branch: str) -> tuple[Path, dict[str, Any]] | None:
@@ -660,6 +733,27 @@ def wait_task_merged(
         time.sleep(max(1.0, poll_seconds))
 
 
+def start_roadmap_task(
+    repo_slug: str,
+    project_id: str | int | None,
+    task_id: str,
+    *,
+    actor: str = "codex",
+) -> dict[str, Any]:
+    repo = resolve_repo_path(repo_slug, project_id)
+    if repo is None:
+        raise RuntimeError(f"canonical worktree not found for {repo_slug}")
+    return start_task(repo, task_id, actor)
+
+
+def wait_task_any(task_id: str, *, timeout: float = 900.0) -> dict[str, Any]:
+    found = _find_task_record_any(task_id)
+    if found is None:
+        return {"status": "no-task-record", "task_id": _safe_task_id(task_id)}
+    _, payload = found
+    return wait_task_merged(Path(str(payload["repo_path"])), task_id, timeout=timeout)
+
+
 def _print_start(payload: dict[str, Any]) -> None:
     print(payload["worktree"])
 
@@ -671,6 +765,11 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--repo", type=Path, required=True)
     start.add_argument("--task-id", required=True)
     start.add_argument("--actor", default="agent")
+    roadmap_start = sub.add_parser("start-roadmap")
+    roadmap_start.add_argument("--repo-slug", required=True)
+    roadmap_start.add_argument("--project-id")
+    roadmap_start.add_argument("--task-id", required=True)
+    roadmap_start.add_argument("--actor", default="codex")
     finish = sub.add_parser("finish")
     finish.add_argument("--repo", type=Path, required=True)
     finish.add_argument("--task-id", required=True)
@@ -681,6 +780,9 @@ def build_parser() -> argparse.ArgumentParser:
     wait.add_argument("--repo", type=Path, required=True)
     wait.add_argument("--task-id", required=True)
     wait.add_argument("--timeout", type=float, default=900.0)
+    wait_any = sub.add_parser("wait-any")
+    wait_any.add_argument("--task-id", required=True)
+    wait_any.add_argument("--timeout", type=float, default=900.0)
     guard = sub.add_parser("guard")
     guard.add_argument("--repo", type=Path, required=True)
     guard.add_argument("--branch")
@@ -695,6 +797,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "start":
             payload = start_task(args.repo, args.task_id, args.actor)
             _print_start(payload)
+        elif args.command == "start-roadmap":
+            payload = start_roadmap_task(
+                args.repo_slug,
+                args.project_id,
+                args.task_id,
+                actor=args.actor,
+            )
+            _print_start(payload)
         elif args.command == "finish":
             payload = finish_task(args.repo, args.task_id)
             print(payload.get("pr_url") or f"PR #{payload.get('pr_number')}")
@@ -704,6 +814,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "wait":
             payload = wait_task_merged(args.repo, args.task_id, timeout=args.timeout)
             print(payload.get("sha") or "merged")
+        elif args.command == "wait-any":
+            payload = wait_task_any(args.task_id, timeout=args.timeout)
+            print(payload.get("sha") or payload.get("status") or "merged")
         elif args.command == "guard":
             print(json.dumps(ensure_guard(args.repo, args.branch), sort_keys=True))
         elif args.command == "process":

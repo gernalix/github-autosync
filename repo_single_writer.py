@@ -566,6 +566,9 @@ def cleanup_task_after_merge(
     payload["merged_at"] = _iso_now()
     payload["merge_sha"] = merge_sha
     payload["lease_expires_at"] = None
+    payload["integration_state"] = "merged"
+    payload["integration_reason"] = None
+    payload["integration_observed_at"] = _iso_now()
 
     cleanup: list[str] = []
     if worktree.exists():

@@ -917,10 +917,10 @@ def sync_changed_repo(
         entry.update(inventory_entry)
     if not worktree.exists():
         return clone_repo(repo, projects_dir, dry_run=dry_run, target_worktree=worktree), None
-    if github_remote_key(repo["url"]) == ROADMAP_REPOSITORY:
-        return sync_roadmap_repo(repo, worktree, entry, dry_run=dry_run)
     if not git_repo_matches_remote(worktree, repo["url"]):
         return "deferred", issue(entry, "origin_mismatch")
+    if github_remote_key(repo["url"]) == ROADMAP_REPOSITORY:
+        return sync_roadmap_repo(repo, worktree, entry, dry_run=dry_run)
     status = run(["git", "status", "--porcelain"], worktree, timeout=30)
     if status.returncode != 0:
         return "deferred", issue(entry, "status_failed")

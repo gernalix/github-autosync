@@ -473,7 +473,7 @@ class AutosyncTests(unittest.TestCase):
                 mock.patch.object(autosync, "github_repos", return_value=[unmanaged]),
                 mock.patch.object(autosync, "sync_changed_repo") as sync,
                 mock.patch.object(autosync, "megavault_registered_remotes", return_value=set()),
-                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}) as register as alerts,
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}) as register,
             ):
                 self.assertEqual(0, autosync.command_run(args))
             sync.assert_not_called()
@@ -490,7 +490,7 @@ class AutosyncTests(unittest.TestCase):
                 mock.patch.object(autosync, "audit_inventory", return_value=([], 0)) as audit,
                 mock.patch.object(autosync, "github_repos", return_value=[]),
                 mock.patch.object(autosync, "megavault_registered_remotes", return_value=set()),
-                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}) as alerts,
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}),
             ):
                 self.assertEqual(0, autosync.command_run(args))
             audit.assert_called_once_with([], auto_push=True, report_behind=False, fetch_remote=False)

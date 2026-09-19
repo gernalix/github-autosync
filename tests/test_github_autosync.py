@@ -48,6 +48,57 @@ class AutosyncTests(unittest.TestCase):
             self.assertTrue(pushed)
             self.assertEqual((0, 0), autosync.git_counts(repo))
 
+    def test_push_failure_is_retried_only_after_fresh_fetch(self) -> None:
+        calls = {"push": 0, "fetch": 0}
+
+        def fake_run(cmd: list[str], cwd: Path | None = None, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if cmd[:2] == ["git", "push"]:
+                calls["push"] += 1
+                if calls["push"] == 1:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="rejected")
+                return ok()
+            if cmd[:3] == ["git", "fetch", "--prune"]:
+                calls["fetch"] += 1
+                return ok()
+            raise AssertionError(cmd)
+
+        with (
+            mock.patch.object(autosync, "run", side_effect=fake_run),
+            mock.patch.object(autosync, "git_counts", side_effect=[(1, 0), (0, 0)]),
+        ):
+            action, detail = autosync._push_with_race_recovery(
+                Path("/tmp/repo"),
+                "origin",
+                "main",
+                allow_rebase=True,
+            )
+        self.assertEqual("pushed", action)
+        self.assertEqual("", detail)
+        self.assertEqual(2, calls["push"])
+        self.assertEqual(2, calls["fetch"])
+
+    def test_sync_changed_roadmap_dispatches_to_canonical_reconciler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            projects = Path(tmp)
+            worktree = projects / "codex-roadmap"
+            worktree.mkdir()
+            repo = {
+                "name": "codex-roadmap",
+                "url": "https://github.com/gernalix/codex-roadmap",
+                "default_branch": "main",
+                "pushed_at": "A",
+                "archived": "0",
+            }
+            with mock.patch.object(
+                autosync,
+                "sync_roadmap_repo",
+                return_value=("up_to_date", None),
+            ) as reconcile:
+                result = autosync.sync_changed_repo(repo, projects, dry_run=False)
+            self.assertEqual(("up_to_date", None), result)
+            reconcile.assert_called_once()
+            self.assertEqual(worktree, reconcile.call_args.args[1])
+
     def test_dirty_repo_is_never_pushed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, bare = self.make_repo_pair(Path(tmp) / "pair")
@@ -97,7 +148,7 @@ class AutosyncTests(unittest.TestCase):
             issues, _ = autosync.audit_worktree(entry, auto_push=False, report_behind=True)
             self.assertEqual("no_upstream", issues[0]["kind"])
 
-    def test_second_unchanged_run_does_not_sync_repo(self) -> None:
+    def test_roadmap_is_reconciled_even_when_remote_fingerprint_is_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             projects = root / "projects"
@@ -111,12 +162,13 @@ class AutosyncTests(unittest.TestCase):
                 mock.patch.object(autosync, "megavault_inventory", return_value=[]),
                 mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
                 mock.patch.object(autosync, "github_repos", return_value=[{k: v for k, v in repo.items() if k != "owner"}]),
-                mock.patch.object(autosync, "sync_changed_repo") as sync,
+                mock.patch.object(autosync, "sync_changed_repo", return_value=("up_to_date", None)) as sync,
                 mock.patch.object(autosync, "megavault_registered_remotes", return_value={autosync.normalize_remote(repo["url"])}),
                 mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}),
             ):
                 self.assertEqual(0, autosync.command_run(args))
-                sync.assert_not_called()
+            sync.assert_called_once()
+            self.assertEqual("codex-roadmap", sync.call_args.args[0]["name"])
 
     def test_only_changed_repo_is_updated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

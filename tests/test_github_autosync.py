@@ -102,6 +102,71 @@ class AutosyncTests(unittest.TestCase):
             reconcile.assert_called_once()
             self.assertEqual(worktree, reconcile.call_args.args[1])
 
+    def test_reconcile_all_checkpoints_dirty_generic_repo_and_pushes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path, bare = self.make_repo_pair(root / "pair")
+            (repo_path / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+            repo = {
+                "name": "repo",
+                "url": str(bare),
+                "default_branch": "main",
+                "pushed_at": "A",
+                "archived": "0",
+            }
+            result, problem = autosync.sync_changed_repo(
+                repo,
+                root,
+                dry_run=False,
+                inventory_entry=self.entry(repo_path, bare),
+                auto_commit_dirty=True,
+            )
+            self.assertEqual("pushed", result)
+            self.assertIsNone(problem)
+            self.assertEqual("", git(["status", "--porcelain"], repo_path).stdout.strip())
+            self.assertEqual((0, 0), autosync.git_counts(repo_path))
+            self.assertTrue((repo_path / "dirty.txt").is_file())
+
+    def test_reconcile_all_rebases_generic_divergence_then_pushes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path, bare = self.make_repo_pair(root / "pair")
+            other = root / "other"
+            self.assertEqual(0, git(["clone", str(bare), str(other)]).returncode)
+            self.assertEqual(0, git(["config", "user.email", "test@example.invalid"], other).returncode)
+            self.assertEqual(0, git(["config", "user.name", "Test"], other).returncode)
+            self.assertEqual(0, git(["checkout", "main"], other).returncode)
+            (other / "remote.txt").write_text("remote\n", encoding="utf-8")
+            self.assertEqual(0, git(["add", "remote.txt"], other).returncode)
+            self.assertEqual(0, git(["commit", "-m", "remote"], other).returncode)
+            self.assertEqual(0, git(["push", "origin", "main"], other).returncode)
+
+            (repo_path / "local.txt").write_text("local\n", encoding="utf-8")
+            repo = {
+                "name": "repo",
+                "url": str(bare),
+                "default_branch": "main",
+                "pushed_at": "B",
+                "archived": "0",
+            }
+            result, problem = autosync.sync_changed_repo(
+                repo,
+                root,
+                dry_run=False,
+                inventory_entry=self.entry(repo_path, bare),
+                auto_commit_dirty=True,
+            )
+            self.assertEqual("pushed", result)
+            self.assertIsNone(problem)
+            self.assertEqual((0, 0), autosync.git_counts(repo_path))
+            self.assertTrue((repo_path / "local.txt").is_file())
+            self.assertTrue((repo_path / "remote.txt").is_file())
+
+    def test_reconcile_all_parser_enables_full_reconcile_and_dirty_checkpointing(self) -> None:
+        args = autosync.build_parser().parse_args(["reconcile-all"])
+        self.assertTrue(args.full_reconcile)
+        self.assertTrue(args.auto_commit_dirty)
+
     def test_dirty_repo_is_never_pushed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, bare = self.make_repo_pair(Path(tmp) / "pair")

@@ -137,7 +137,7 @@ class SingleWriterTests(unittest.TestCase):
                 again = writer.start_task(repo, "123456", "codex")
                 self.assertEqual(payload["worktree"], again["worktree"])
 
-    def test_task_lease_is_created_and_heartbeat_is_renewable(self) -> None:
+    def test_task_coordination_does_not_use_a_repository_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, _ = self.make_repo(root / "git")
@@ -149,10 +149,12 @@ class SingleWriterTests(unittest.TestCase):
             ):
                 payload = writer.start_task(repo, "lease-demo", "codex")
                 self.assertEqual("active", payload["status"])
+                self.assertEqual("isolated-branch", payload["coordination"])
                 self.assertTrue(payload["heartbeat_at"])
-                self.assertTrue(payload["lease_expires_at"])
+                self.assertIsNone(payload["lease_expires_at"])
                 renewed = writer.heartbeat_task(repo, "lease-demo")
                 self.assertEqual("active", renewed["status"])
+                self.assertIsNone(renewed["lease_expires_at"])
                 self.assertTrue(Path(renewed["worktree"]).exists())
 
     def test_cleanup_after_merge_preserves_safety_and_removes_clean_worktree(self) -> None:
@@ -266,9 +268,43 @@ class SingleWriterTests(unittest.TestCase):
                 task = Path(payload["worktree"])
                 (task / "feature.txt").write_text("feature\n", encoding="utf-8")
                 ready = writer.finish_task(repo, "alpha")
-                self.assertEqual("ready", ready["status"])
+                self.assertEqual("queued", ready["status"])
                 self.assertEqual(7, ready["pr_number"])
                 self.assertEqual(0, git(["show-ref", "--verify", "--quiet", "refs/remotes/origin/task/alpha"], task).returncode)
+
+    def test_start_task_ignores_dirty_canonical_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, _ = self.make_repo(root / "git")
+            state = root / "state"
+            worktrees = root / "worktrees"
+            (repo / "unrelated-local.txt").write_text("dirty\n", encoding="utf-8")
+            with (
+                mock.patch.object(writer, "STATE_ROOT", state),
+                mock.patch.object(writer, "WORKTREE_ROOT", worktrees),
+            ):
+                payload = writer.start_task(repo, "dirty-canonical", "codex")
+                self.assertTrue(Path(payload["worktree"]).exists())
+
+    def test_process_ready_prs_is_fifo_per_repository(self) -> None:
+        discovered = [
+            {"repo": "gernalix/example", "number": 1, "url": "one"},
+            {"repo": "gernalix/example", "number": 2, "url": "two"},
+            {"repo": "gernalix/other", "number": 3, "url": "three"},
+        ]
+        def fake_integrate(repo: str, number: int):
+            if number == 1:
+                return {"repo": repo, "number": number, "status": "deferred", "reason": "checks-pending"}
+            return {"repo": repo, "number": number, "status": "merged"}
+        with (
+            mock.patch.object(writer, "discover_ready_prs", return_value=discovered),
+            mock.patch.object(writer, "integrate_pr", side_effect=fake_integrate),
+            mock.patch.object(writer, "cleanup_task_after_merge", return_value={"status": "no-task-record"}),
+        ):
+            result = writer.process_ready_prs("gernalix")
+        self.assertEqual("checks-pending", result["results"][0]["reason"])
+        self.assertEqual("queue-behind-earlier", result["results"][1]["reason"])
+        self.assertEqual("merged", result["results"][2]["status"])
 
     def test_integrate_pr_merges_only_ready_task_pr(self) -> None:
         calls: list[list[str]] = []

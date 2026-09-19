@@ -832,7 +832,10 @@ def wait_task_merged(
     repo = repo.expanduser().resolve()
     payload = finish_task(repo, task_id)
     if payload.get("status") == "merged":
-        return payload
+        return {
+            **payload,
+            "no_op": payload.get("integration") == "no-op",
+        }
     deadline = time.monotonic() + timeout
     while True:
         current = json.loads(_task_record(repo, task_id).read_text(encoding="utf-8"))

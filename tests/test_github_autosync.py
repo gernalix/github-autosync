@@ -89,11 +89,14 @@ class AutosyncTests(unittest.TestCase):
                 "pushed_at": "A",
                 "archived": "0",
             }
-            with mock.patch.object(
-                autosync,
-                "sync_roadmap_repo",
-                return_value=("up_to_date", None),
-            ) as reconcile:
+            with (
+                mock.patch.object(autosync, "git_repo_matches_remote", return_value=True),
+                mock.patch.object(
+                    autosync,
+                    "sync_roadmap_repo",
+                    return_value=("up_to_date", None),
+                ) as reconcile,
+            ):
                 result = autosync.sync_changed_repo(repo, projects, dry_run=False)
             self.assertEqual(("up_to_date", None), result)
             reconcile.assert_called_once()

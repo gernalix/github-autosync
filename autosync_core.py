@@ -571,8 +571,12 @@ def issue(entry: dict[str, Any] | None, kind: str, detail: str = "") -> dict[str
     }
 
 
-def git_counts(worktree: Path) -> tuple[int, int] | None:
-    result = run(["git", "rev-list", "--left-right", "--count", "HEAD...@{u}"], worktree, timeout=30)
+def git_counts(worktree: Path, upstream_ref: str = "@{u}") -> tuple[int, int] | None:
+    result = run(
+        ["git", "rev-list", "--left-right", "--count", f"HEAD...{upstream_ref}"],
+        worktree,
+        timeout=30,
+    )
     if result.returncode != 0:
         return None
     parts = result.stdout.split()
@@ -582,6 +586,37 @@ def git_counts(worktree: Path) -> tuple[int, int] | None:
         return int(parts[0]), int(parts[1])
     except ValueError:
         return None
+
+
+def _tracking_ref_exists(worktree: Path, remote_name: str, branch: str) -> bool:
+    ref = f"refs/remotes/{remote_name}/{branch}"
+    return run(["git", "show-ref", "--verify", "--quiet", ref], worktree, timeout=30).returncode == 0
+
+
+def _repair_tracking_branch(
+    worktree: Path,
+    *,
+    local_branch: str,
+    remote_name: str,
+    default_branch: str,
+) -> str | None:
+    candidates: list[str] = []
+    for candidate in (local_branch, default_branch):
+        candidate = str(candidate or "").strip()
+        if not candidate or candidate == "UNKNOWN" or candidate in candidates:
+            continue
+        candidates.append(candidate)
+    for candidate in candidates:
+        if not _tracking_ref_exists(worktree, remote_name, candidate):
+            continue
+        tracking = run(
+            ["git", "branch", f"--set-upstream-to={remote_name}/{candidate}", local_branch],
+            worktree,
+            timeout=30,
+        )
+        if tracking.returncode == 0:
+            return f"{remote_name}/{candidate}"
+    return None
 
 
 def _is_roadmap_canonical_path(path: str) -> bool:
@@ -608,6 +643,7 @@ def _push_with_race_recovery(
     remote_branch: str,
     *,
     allow_rebase: bool,
+    upstream_ref: str = "@{u}",
 ) -> tuple[str, str]:
     """Push once, then use one fresh fetch as evidence for a bounded recovery.
 
@@ -621,7 +657,7 @@ def _push_with_race_recovery(
     fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)
     if fetch.returncode != 0:
         return "blocked", "push_failed_then_fetch_failed"
-    counts = git_counts(worktree)
+    counts = git_counts(worktree, upstream_ref)
     if counts is None:
         return "blocked", "push_failed_relation_check_failed"
     ahead, behind = counts
@@ -635,7 +671,7 @@ def _push_with_race_recovery(
         status = run(["git", "status", "--porcelain"], worktree, timeout=30)
         if status.returncode != 0 or status.stdout.strip():
             return "blocked", f"diverged_dirty_after_push_race:ahead={ahead},behind={behind}"
-        rebase = run(["git", "rebase", "@{u}"], worktree, timeout=300)
+        rebase = run(["git", "rebase", upstream_ref], worktree, timeout=300)
         if rebase.returncode != 0:
             run(["git", "rebase", "--abort"], worktree, timeout=120)
             return "blocked", f"rebase_conflict_after_push_race:ahead={ahead},behind={behind}"
@@ -646,7 +682,7 @@ def _push_with_race_recovery(
     verify_fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)
     if verify_fetch.returncode != 0:
         return "blocked", "post_push_fetch_failed"
-    verify = git_counts(worktree)
+    verify = git_counts(worktree, upstream_ref)
     if verify != (0, 0):
         return "blocked", f"post_push_verify_failed:counts={verify}"
     return "pushed", ""
@@ -849,6 +885,7 @@ def audit_worktree(
             remote_name,
             remote_branch,
             allow_rebase=True,
+            upstream_ref=upstream_name,
         )
         if action == "pushed":
             return [], True
@@ -992,12 +1029,27 @@ def sync_changed_repo(
             return "deferred", issue(entry, "fetch_failed")
         fetched_remote = "origin"
         exists = run(["git", "show-ref", "--verify", "--quiet", remote_branch_ref], worktree, timeout=30)
-        if exists.returncode != 0:
+        if exists.returncode == 0:
+            tracking = run(
+                ["git", "branch", f"--set-upstream-to=origin/{branch_name}", branch_name],
+                worktree,
+                timeout=30,
+            )
+            if tracking.returncode != 0:
+                return "deferred", issue(entry, "no_upstream")
+            upstream_name = f"origin/{branch_name}"
+        elif auto_commit_dirty:
+            repaired = _repair_tracking_branch(
+                worktree,
+                local_branch=branch_name,
+                remote_name="origin",
+                default_branch=repo.get("default_branch") or "UNKNOWN",
+            )
+            if repaired is None:
+                return "deferred", issue(entry, "no_upstream")
+            upstream_name = repaired
+        else:
             return "deferred", issue(entry, "no_upstream")
-        tracking = run(["git", "branch", f"--set-upstream-to=origin/{branch_name}", branch_name], worktree, timeout=30)
-        if tracking.returncode != 0:
-            return "deferred", issue(entry, "no_upstream")
-        upstream_name = f"origin/{branch_name}"
     else:
         upstream_name = upstream.stdout.strip()
         fetched_remote = None
@@ -1007,16 +1059,27 @@ def sync_changed_repo(
     if fetched_remote != remote_name:
         fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)
         if fetch.returncode != 0:
-            raise AutosyncError(f"fetch_failed:{repo['name']}")
-    counts = git_counts(worktree)
+            return "deferred", issue(entry, "fetch_failed")
+    counts = git_counts(worktree, upstream_name)
+    if counts is None and auto_commit_dirty:
+        repaired = _repair_tracking_branch(
+            worktree,
+            local_branch=branch_name,
+            remote_name=remote_name,
+            default_branch=repo.get("default_branch") or "UNKNOWN",
+        )
+        if repaired is not None:
+            upstream_name = repaired
+            remote_name, remote_branch = upstream_name.split("/", 1)
+            counts = git_counts(worktree, upstream_name)
     if counts is None:
-        raise AutosyncError(f"relation_check_failed:{repo['name']}")
+        return "deferred", issue(entry, "relation_check_failed", f"upstream={upstream_name}")
     ahead, behind = counts
     if ahead and behind:
         if not auto_commit_dirty:
             return "deferred", issue(entry, "diverged", f"ahead={ahead},behind={behind}")
         rebase = run(
-            ["git", "-c", "rerere.enabled=true", "rebase", "@{u}"],
+            ["git", "-c", "rerere.enabled=true", "rebase", upstream_name],
             worktree,
             timeout=600,
         )
@@ -1032,13 +1095,14 @@ def sync_changed_repo(
             remote_name,
             remote_branch,
             allow_rebase=True,
+            upstream_ref=upstream_name,
         )
         if action == "pushed":
             return "pushed", None
         if action == "synced":
             return "up_to_date", None
         if action == "remote_ahead":
-            merge = run(["git", "merge", "--ff-only", "@{u}"], worktree, timeout=120)
+            merge = run(["git", "merge", "--ff-only", upstream_name], worktree, timeout=120)
             if merge.returncode == 0:
                 return "updated", None
         return "deferred", issue(entry, "push_failed", detail or "after_rebase")
@@ -1054,7 +1118,7 @@ def sync_changed_repo(
         if action == "synced":
             return "up_to_date", None
         if action == "remote_ahead":
-            merge = run(["git", "merge", "--ff-only", "@{u}"], worktree, timeout=120)
+            merge = run(["git", "merge", "--ff-only", upstream_name], worktree, timeout=120)
             if merge.returncode != 0:
                 return "deferred", issue(entry, "fast_forward_failed", detail)
             return "updated", None
@@ -1397,13 +1461,30 @@ def command_run(args: argparse.Namespace) -> int:
                     elif not did_push:
                         counts["skipped_unchanged"] += 1
                     continue
-                result, repo_issue = sync_changed_repo(
-                    repo,
-                    projects_dir,
-                    dry_run=args.dry_run,
-                    inventory_entry=inventory_entry,
-                    auto_commit_dirty=auto_commit_dirty,
-                )
+                try:
+                    result, repo_issue = sync_changed_repo(
+                        repo,
+                        projects_dir,
+                        dry_run=args.dry_run,
+                        inventory_entry=inventory_entry,
+                        auto_commit_dirty=auto_commit_dirty,
+                    )
+                except (AutosyncError, subprocess.TimeoutExpired) as exc:
+                    if not full_reconcile:
+                        raise
+                    error_entry = inventory_entry or {
+                        "project_id": None,
+                        "slug": repo["name"],
+                        "worktree": str(worktree),
+                        "remote_url": repo["url"],
+                        "branch": repo.get("default_branch") or "UNKNOWN",
+                    }
+                    repo_issue = issue(
+                        error_entry,
+                        "reconcile_error",
+                        f"{type(exc).__name__}:{exc}",
+                    )
+                    result = "deferred"
                 if repo_issue is not None:
                     issues.append(repo_issue)
                     counts["deferred"] += 1
@@ -1508,6 +1589,14 @@ def command_run(args: argparse.Namespace) -> int:
         "managed_repos": [repo["name"] for repo in repos],
         "auto_pushed": auto_pushed,
         "issues": len(issues),
+        "reconcile_issues": [
+            {
+                "repo": item.get("repo"),
+                "kind": item.get("kind"),
+                "detail": item.get("detail"),
+            }
+            for item in issues
+        ] if full_reconcile else [],
         "telegram": notify,
         "activity_telegram": activity_notify,
         "activity_events": activity_events,

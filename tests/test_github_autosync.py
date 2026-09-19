@@ -20,6 +20,11 @@ def ok(stdout: str = "") -> subprocess.CompletedProcess[str]:
 
 
 class AutosyncTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.kuma_heartbeat = mock.patch.object(autosync, "_push_kuma_heartbeat", return_value=True)
+        self.kuma_heartbeat_mock = self.kuma_heartbeat.start()
+        self.addCleanup(self.kuma_heartbeat.stop)
+
     def make_repo_pair(self, root: Path) -> tuple[Path, Path]:
         root.mkdir(parents=True, exist_ok=True)
         bare = root / "origin.git"
@@ -575,6 +580,58 @@ class AutosyncTests(unittest.TestCase):
     def test_real_github_failure_is_nonzero(self) -> None:
         with mock.patch.object(autosync, "megavault_inventory", return_value=[]), mock.patch.object(autosync, "audit_inventory", return_value=([], 0)), mock.patch.object(autosync, "github_repos", side_effect=autosync.AutosyncError("github_repo_list_failed")):
             self.assertEqual(75, autosync.main(["--no-telegram", "--no-data-mirror", "run"]))
+
+
+    def test_periodic_run_sends_kuma_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = autosync.build_parser().parse_args(
+                [
+                    "--projects-dir",
+                    str(root / "projects"),
+                    "--state-dir",
+                    str(root / "state"),
+                    "--megavault",
+                    str(root / "mv"),
+                    "--no-data-mirror",
+                    "run",
+                ]
+            )
+            self.kuma_heartbeat_mock.reset_mock()
+            with (
+                mock.patch.object(autosync, "megavault_inventory", return_value=[]),
+                mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
+                mock.patch.object(autosync, "github_repos", return_value=[]),
+                mock.patch.object(autosync, "megavault_registered_remotes", return_value=set()),
+                mock.patch.object(
+                    autosync,
+                    "register_in_megavault",
+                    return_value={"validation": "not_needed", "deferred": 0},
+                ),
+                mock.patch("builtins.print"),
+            ):
+                self.assertEqual(0, autosync.command_run(args))
+            self.kuma_heartbeat_mock.assert_called_once_with(True, 0, [])
+
+    def test_missing_kuma_url_is_a_heartbeat_failure(self) -> None:
+        with mock.patch.dict(autosync.os.environ, {}, clear=True):
+            self.assertFalse(autosync._push_kuma_status("up", "ok"))
+
+    def test_fatal_error_pushes_explicit_down_heartbeat(self) -> None:
+        with (
+            mock.patch.object(autosync, "command_run", side_effect=autosync.AutosyncError("boom")),
+            mock.patch.object(autosync, "_push_kuma_status", return_value=True) as push,
+            mock.patch("builtins.print"),
+        ):
+            self.assertEqual(75, autosync.main(["run"]))
+        push.assert_called_once_with("down", "errore fatale: boom")
+
+    def test_systemd_periodic_service_uses_lightweight_run(self) -> None:
+        service = (
+            Path(__file__).resolve().parents[1] / "systemd" / "github-autosync.service"
+        ).read_text(encoding="utf-8")
+        self.assertIn("github_autosync.py run", service)
+        self.assertNotIn(".local/bin/github-reconcile", service)
 
 
 if __name__ == "__main__":

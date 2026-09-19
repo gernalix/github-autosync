@@ -18,7 +18,7 @@ The service manages **only** these repositories:
 - `gernalix/amici_fb`
 - `gernalix/salute`
 
-All other current or future GitHub repositories are ignored completely until explicitly added to `ALLOWED_REPOSITORIES`. They are not cloned, fetched, pulled, pushed, audited, registered in MegaVault, persisted in repo state, or included in Telegram alerts.
+All other current or future GitHub repositories are ignored completely until explicitly added to `ALLOWED_REPOSITORIES`. They are not cloned, fetched, pulled, pushed, audited, registered in MegaVault, or persisted in repo state.
 
 ## One-command global reconcile
 
@@ -37,17 +37,35 @@ github-reconcile
 
 This forces a fresh network reconciliation instead of relying on the normal fingerprint fast path. It covers every non-archived GitHub repository already represented by an active MegaVault worktree, already present under `~/projects/<repo>`, or included in the normal autosync allowlist.
 
-For ordinary repositories, current non-ignored local changes are checkpointed into one explicit `github-reconcile: ...` commit, then the command fetches upstream, fast-forwards remote-only changes, rebases clean local/remote divergence, and pushes the resulting branch. Stale/deleted tracking branches are repaired mechanically to the matching remote branch or the repository default branch when available. If a real rebase conflict remains, the rebase is aborted and the repository is reported rather than resolved by guessing.
+Canonical branches are now single-writer protected. Agent work must happen in dedicated `task/*` branches/worktrees and is integrated through a `[single-writer]` pull request. `github-reconcile` is the only automated writer of each canonical branch; it also fast-forwards the local canonical checkout to the exact remote canonical tip. Stale/deleted tracking branches are still repaired mechanically when unambiguous.
 
 A failure in one repository does not abort the global pass: the remaining repositories are still reconciled, and the final JSON exposes any unresolved entries in `reconcile_issues`.
 
 `codex-roadmap` remains special: it is delegated to the canonical guarded `roadmap_pull.py` path and canonical roadmap state is never auto-committed, preserving the single-writer boundary.
 
+
+## Parallel ChatGPT/Codex work
+
+For every repository except `codex-roadmap`, use one isolated worktree per task:
+
+```bash
+repo-task start --repo ~/projects/PersonalHub --task-id 123456 --actor codex
+```
+
+The command prints the worktree path. Work only there. When the task is complete:
+
+```bash
+repo-task finish --repo ~/projects/PersonalHub --task-id 123456
+```
+
+This checkpoints the completed task, pushes its `task/123456` branch and creates a `[single-writer]` PR. The minute-by-minute `github-reconcile` service serializes eligible PRs into the repository's canonical branch after checks pass. Multiple ChatGPT/Codex sessions can therefore work on the same repository concurrently without sharing a checkout.
+
+The canonical branch is guarded locally: direct commits/merges to it are rejected. A local fast-forward to the exact fetched remote canonical tip is allowed because it is synchronization, not a new canonical write. `codex-roadmap` keeps its existing dedicated writer/guard instead of this generic path.
+
 Optional forms:
 
 ```bash
 github-reconcile --dry-run
-github-reconcile --no-telegram
 ```
 
 The periodic timer runs `github-reconcile` and uses the same guarded behavior as a manual reconcile.
@@ -59,16 +77,15 @@ The periodic timer runs `github-reconcile` and uses the same guarded behavior as
 - clone a missing managed repository into its MegaVault canonical worktree when one is registered, otherwise under `/home/daniele/projects/<repo>`;
 - fetch/update a managed repository when its GitHub metadata fingerprint changes;
 - perform a lightweight **local-only audit** even when the remote fingerprint is unchanged, so dirty worktrees and local commits are not hidden by the remote fast path;
-- automatically push clean, ahead-only managed repositories using a normal non-force push;
+- protect canonical branches with a per-repository single-writer guard and integrate completed `task/*` work through `[single-writer]` PRs;
 - recover a rejected clean push with one evidence-producing fetch, then retry or rebase-and-push only when the new relation makes that safe;
 - always reconcile `codex-roadmap` through its canonical `tools/roadmap_pull.py` path, even when the GitHub fingerprint is unchanged, so generated-view dirt, interrupted guarded fast-forwards, and stale/missing pull guards heal automatically;
 - append every successful automatic repository mutation (`clone`, fast-forward `pull`, `push`) to a durable JSONL activity ledger;
-- send one Telegram notification for every automatic `push` or fast-forward `pull`, with a persistent delivery cursor so failed sends are retried on a later run;
 - skip network reconciliation for unchanged, clean, synchronized repositories except `codex-roadmap`, whose guarded reconciler is intentionally checked every run;
 - never stash, hard-reset, force-pull or force-push user work; unresolved semantic conflicts remain deferred for review;
 - register genuinely new managed repositories in MegaVault when its worktree is clean and synchronized;
 - expose truthful machine-readable states: `ok`, `partial`, `deferred`, `error`, or `locked`;
-- notify through the shared `telegram_notify` package when unresolved sync problems change;
+- report health only through the existing Uptime Kuma Push monitor; this service sends no Telegram notifications;
 - run from a `systemd --user` calendar timer every minute.
 
 The periodic path no longer uses `ghorg --fetch-all`. `ghorg` can still be used manually for bootstrap/recovery, but it is not part of the steady-state timer.
@@ -129,13 +146,6 @@ Successful automatic mutations are written outside every Git worktree to avoid r
 
 Each JSONL row records the UTC timestamp, action, repository, branch, project ID when known, worktree, and a short detail. The ledger currently records `clone`, fast-forward `pull`, and `push`. Read-only audits, no-op checks, and fetches that do not change the checkout are intentionally not logged as mutations.
 
-Telegram delivery progress for activity events is persisted separately in:
-
-```text
-/home/daniele/.local/state/codex-github-autosync/telegram-activity-state.json
-```
-
-Only `push` and `pull` activity rows generate a Telegram message. The cursor advances only after successful delivery, so a transient Telegram failure is retried on a later service run.
 
 ### Private Git mirror
 
@@ -165,22 +175,6 @@ The cursor advances only after the remote push is verified. A crash after commit
 
 The local ledger remains the immediate recovery source; the private repository is the durable, remotely accessible history. Use `--no-data-mirror` only for tests or manual diagnostics.
 
-## Telegram alerts
-
-Notifications use the existing shared top-level Python package:
-
-```text
-python3 -m telegram_notify
-```
-
-The package resolves its configured default destination; this repository does not store or print Telegram secrets or chat IDs. Persistent alerts remain deduplicated in:
-
-```text
-/home/daniele/.local/state/codex-github-autosync/telegram-alert-state.json
-```
-
-`--dry-run` and explicit `--no-telegram` never send or advance Telegram alert state.
-
 ## Runtime
 
 Canonical Fedora checkout:
@@ -206,18 +200,13 @@ The service reads its private Kuma Push URL from
 machine-readable result; an unresolved repository returns exit code 2 after
 the other repositories have been processed.
 
-The generic repository policy is: clean synced => no-op; ahead => normal push;
-behind => fast-forward; diverged => rebase and normal push. Stable local
-changes become one checkpoint commit. An operation already in progress, an
-unstable worktree, an ambiguous branch mapping, or a true content conflict
-stays untouched and is reported. After a failed rebase, the reconciler aborts
-and checks for unresolved state. The roadmap always uses its guarded pull.
+The canonical checkout is no longer a worker workspace. Agent changes belong in `repo-task` worktrees. The canonical checkout is synchronized with the remote canonical branch and protected against direct local writes. Completed task PRs are serialized by the per-repository single writer; pending/failed checks or real merge conflicts remain unmerged and do not corrupt other work. The roadmap always uses its own guarded writer.
 
 ## Verification
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
-python3 github_autosync.py --dry-run --no-telegram run
+python3 github_autosync.py --dry-run run
 systemctl --user status github-autosync.timer --no-pager
 systemctl --user list-timers github-autosync.timer --all --no-pager
 ```

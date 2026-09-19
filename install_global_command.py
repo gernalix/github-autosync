@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 COMMAND_NAME = "github-reconcile"
+TASK_COMMAND_NAME = "repo-task"
 DEFAULT_REPO = Path.home() / "projects" / "github-autosync"
 
 
@@ -25,7 +26,20 @@ def main() -> int:
     )
     os.chmod(tmp, 0o755)
     tmp.replace(target)
+
+    task_entrypoint = repo / "repo_single_writer.py"
+    task_target = bindir / TASK_COMMAND_NAME
+    task_tmp = task_target.with_suffix(".tmp")
+    task_tmp.write_text(
+        "#!/bin/sh\n"
+        f'exec /usr/bin/python3 "{task_entrypoint}" "$@"\n',
+        encoding="utf-8",
+    )
+    os.chmod(task_tmp, 0o755)
+    task_tmp.replace(task_target)
+
     print(target)
+    print(task_target)
     return 0
 
 

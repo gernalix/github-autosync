@@ -201,9 +201,9 @@ class ReconcileIntegration(unittest.TestCase):
     def test_worktree_change_during_stability_window_preserves_index(self) -> None:
         (self.local / "base.txt").write_bytes(b"first\n")
         before_index = (self.local / ".git" / "index").read_bytes()
-        def change(_: float) -> None:
+        def change() -> None:
             (self.local / "base.txt").write_bytes(b"second\n")
-        with mock.patch.object(autosync.time, "sleep", side_effect=change):
+        with mock.patch.object(autosync, "_stability_pause", side_effect=change):
             result, problem = self.reconcile()
         self.assertEqual("deferred", result)
         self.assertEqual("worktree_changing", problem["kind"])

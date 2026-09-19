@@ -1135,14 +1135,38 @@ def _commit_dirty_for_reconcile(
         restore_index()
         return issue(entry, "staged_diff_check_failed")
 
+    branch = run(["git", "branch", "--show-current"], worktree, timeout=30)
+    head = run(["git", "rev-parse", "--verify", "HEAD"], worktree, timeout=30)
+    if branch.returncode != 0 or not branch.stdout.strip() or head.returncode != 0:
+        restore_index()
+        return issue(entry, "auto_commit_failed")
+    tree = run(["git", "write-tree"], worktree, timeout=30)
+    if tree.returncode != 0 or not tree.stdout.strip():
+        restore_index()
+        return issue(entry, "auto_commit_failed")
+
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     slug = str(entry.get("slug") or "repository")
     commit = run(
-        ["git", "commit", "-m", f"github-reconcile: sync local changes in {slug} ({stamp})"],
+        ["git", "commit-tree", tree.stdout.strip(), "-p", head.stdout.strip(), "-m", f"github-reconcile: sync local changes in {slug} ({stamp})"],
         worktree,
         timeout=300,
     )
-    if commit.returncode != 0:
+    if commit.returncode != 0 or not commit.stdout.strip():
+        restore_index()
+        return issue(entry, "auto_commit_failed")
+    auth = repo_single_writer.authorize_ref_update(
+        worktree, head.stdout.strip(), commit.stdout.strip(), branch.stdout.strip()
+    )
+    try:
+        update = run(
+            ["git", "update-ref", f"refs/heads/{branch.stdout.strip()}", commit.stdout.strip(), head.stdout.strip()],
+            worktree,
+            timeout=30,
+        )
+    finally:
+        auth.unlink(missing_ok=True)
+    if update.returncode != 0:
         restore_index()
         return issue(entry, "auto_commit_failed")
     return None
@@ -1567,7 +1591,7 @@ def command_run(args: argparse.Namespace) -> int:
                         projects_dir,
                         dry_run=args.dry_run,
                         inventory_entry=inventory_entry,
-                        auto_commit_dirty=False if full_reconcile else auto_commit_dirty,
+                        auto_commit_dirty=auto_commit_dirty,
                     )
                 except Exception as exc:
                     if not full_reconcile:

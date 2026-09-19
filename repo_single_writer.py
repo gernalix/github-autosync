@@ -133,6 +133,19 @@ for line in payload.splitlines():
 if not updates:
     raise SystemExit(0)
 
+# A local fast-forward to the exact fetched canonical remote tip is a read-side
+# synchronization, not a new canonical write. Allow it without writer auth.
+remote_ref = "refs/remotes/origin/" + CANONICAL_REF.rsplit("/", 1)[-1]
+remote_tip = subprocess.run(
+    ["git", "rev-parse", "--verify", remote_ref],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    check=False,
+).stdout.strip()
+if remote_tip and all(update[1] == remote_tip for update in updates):
+    raise SystemExit(0)
+
 try:
     with open(AUTH_PATH, "r", encoding="utf-8") as handle:
         auth = json.load(handle)

@@ -1309,8 +1309,27 @@ def command_run(args: argparse.Namespace) -> int:
     activity_events = 0
     try:
         with ExclusiveLock(state_dir / "autosync.lock"):
-            inventory = filter_allowed_inventory(megavault_inventory(megavault))
-            repos = [{**repo, "owner": args.owner} for repo in filter_allowed_repos(args.owner, github_repos(args.owner))]
+            raw_inventory = megavault_inventory(megavault)
+            inventory = raw_inventory if full_reconcile else filter_allowed_inventory(raw_inventory)
+            discovered_repos = github_repos(args.owner)
+            if full_reconcile:
+                inventory_remotes = {
+                    normalize_remote(str(entry["remote_url"]))
+                    for entry in inventory
+                }
+                selected = [
+                    repo
+                    for repo in discovered_repos
+                    if repo.get("archived") != "1"
+                    and (
+                        normalize_remote(repo["url"]) in inventory_remotes
+                        or (projects_dir / repo["name"]).exists()
+                        or is_allowed_repo(args.owner, repo["name"])
+                    )
+                ]
+            else:
+                selected = filter_allowed_repos(args.owner, discovered_repos)
+            repos = [{**repo, "owner": args.owner} for repo in selected]
             inventory_by_remote: dict[str, dict[str, Any]] = {}
             for entry in inventory:
                 key = normalize_remote(str(entry["remote_url"]))
@@ -1365,7 +1384,11 @@ def command_run(args: argparse.Namespace) -> int:
                             branch=str(local_entry.get("branch") or repo.get("default_branch") or "UNKNOWN"),
                             project_id=local_entry.get("project_id"),
                             worktree=str(worktree),
-                            detail="clean ahead-only checkout",
+                            detail=(
+                            "full reconcile push"
+                            if full_reconcile
+                            else "clean ahead-only checkout"
+                        ),
                         )
                         activity_events += 1
                     if repo_issues:
@@ -1421,7 +1444,11 @@ def command_run(args: argparse.Namespace) -> int:
                         branch=repo.get("default_branch") or None,
                         project_id=inventory_entry.get("project_id") if inventory_entry else None,
                         worktree=str(worktree),
-                        detail="clean ahead-only checkout",
+                        detail=(
+                            "full reconcile push"
+                            if full_reconcile
+                            else "clean ahead-only checkout"
+                        ),
                     )
                     activity_events += 1
                 if not args.dry_run:

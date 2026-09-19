@@ -419,6 +419,108 @@ def _task_by_branch(repo_slug: str, branch: str) -> tuple[Path, dict[str, Any]] 
     return None
 
 
+
+def _observe_task(
+    repo_slug: str,
+    branch: str,
+    state: str,
+    *,
+    reason: str | None = None,
+    pr_number: int | None = None,
+    pr_url: str | None = None,
+    queue_position: int | None = None,
+    queue_size: int | None = None,
+) -> None:
+    found = _task_by_branch(repo_slug, branch)
+    if found is None:
+        return
+    path, payload = found
+    payload["integration_state"] = state
+    payload["integration_reason"] = reason
+    payload["integration_observed_at"] = _iso_now()
+    if pr_number is not None:
+        payload["pr_number"] = pr_number
+    if pr_url is not None:
+        payload["pr_url"] = pr_url
+    if queue_position is not None:
+        payload["queue_position"] = queue_position
+    if queue_size is not None:
+        payload["queue_size"] = queue_size
+    _atomic_json(path, payload)
+
+
+def _pipeline_state(payload: dict[str, Any]) -> str:
+    status = str(payload.get("status") or "")
+    integration = str(payload.get("integration_state") or "")
+    if status == "merged":
+        return "done"
+    if status in {"blocked", "orphaned"}:
+        return "needs-fix"
+    if integration in {
+        "semantic-conflict",
+        "checks-failed",
+        "task-worktree-missing",
+        "task-worktree-dirty",
+        "task-git-operation-in-progress",
+        "wrong-base-branch",
+        "non-task-branch",
+        "merge-race-or-failure",
+    }:
+        return "needs-fix"
+    if status in {"queued", "ready"}:
+        return "integration"
+    if status == "active":
+        return "running"
+    return status or "unknown"
+
+
+def task_status_any(task_id: str) -> dict[str, Any]:
+    found = _find_task_record_any(task_id)
+    if found is None:
+        return {"task_id": _safe_task_id(task_id), "status": "no-task-record", "pipeline_state": "unknown"}
+    _, payload = found
+    return {
+        "task_id": payload.get("task_id"),
+        "roadmap_prompt_id": payload.get("roadmap_prompt_id"),
+        "repo": payload.get("repo"),
+        "branch": payload.get("branch"),
+        "status": payload.get("status"),
+        "pipeline_state": _pipeline_state(payload),
+        "integration_state": payload.get("integration_state"),
+        "integration_reason": payload.get("integration_reason"),
+        "integration_observed_at": payload.get("integration_observed_at"),
+        "pr_number": payload.get("pr_number"),
+        "pr_url": payload.get("pr_url"),
+        "queue_position": payload.get("queue_position"),
+        "queue_size": payload.get("queue_size"),
+        "queued_at": payload.get("queued_at"),
+        "merged_at": payload.get("merged_at"),
+        "merge_sha": payload.get("merge_sha"),
+        "roadmap_completion_queued_at": payload.get("roadmap_completion_queued_at"),
+    }
+
+
+def all_task_statuses(*, roadmap_only: bool = False) -> list[dict[str, Any]]:
+    if not STATE_ROOT.is_dir():
+        return []
+    items: list[dict[str, Any]] = []
+    for path in sorted(STATE_ROOT.glob("*/tasks/*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        task_id = str(payload.get("task_id") or "")
+        if not task_id:
+            continue
+        if roadmap_only and not (
+            str(payload.get("roadmap_prompt_id") or "") == task_id
+            or (re.fullmatch(r"\d{6}", task_id) and str(payload.get("actor") or "") == "codex")
+        ):
+            continue
+        items.append(task_status_any(task_id))
+    return sorted(items, key=lambda item: str(item.get("task_id") or ""))
+
+
 def _operation_in_progress(worktree: Path) -> bool:
     if _git(worktree, "ls-files", "-u").stdout.strip():
         return True
@@ -587,6 +689,9 @@ def finish_task(repo: Path, task_id: str) -> dict[str, Any]:
         "head_sha": head,
         "pr_number": pr_number,
         "pr_url": pr_url,
+        "integration_state": "queued",
+        "integration_reason": None,
+        "integration_observed_at": _iso_now(),
     })
     _atomic_json(record_path, payload)
     return payload
@@ -759,23 +864,31 @@ def integrate_pr(repo: str, number: int) -> dict[str, Any]:
             return {"repo": repo, "number": number, "status": "deferred", "reason": "non-task-branch"}
         allowed, check_reason = _check_rollup_allows_merge(info.get("statusCheckRollup"))
         if not allowed:
+            _observe_task(repo, head_branch, check_reason, reason=check_reason, pr_number=number)
             return {"repo": repo, "number": number, "status": "deferred", "reason": check_reason}
         if not head:
             return {"repo": repo, "number": number, "status": "deferred", "reason": "head-missing"}
         refreshed = _refresh_task_branch_to_latest_base(repo, head_branch, default_branch, head)
         if refreshed.get("status") == "refreshed":
+            _observe_task(repo, head_branch, "rebasing", reason="branch-refreshed", pr_number=number)
             return {"repo": repo, "number": number, "status": "deferred", "reason": "branch-refreshed"}
         if refreshed.get("status") == "deferred":
-            return {"repo": repo, "number": number, "status": "deferred", "reason": str(refreshed.get("reason") or "branch-refresh-failed")}
+            refresh_reason = str(refreshed.get("reason") or "branch-refresh-failed")
+            _observe_task(repo, head_branch, refresh_reason, reason=refresh_reason, pr_number=number)
+            return {"repo": repo, "number": number, "status": "deferred", "reason": refresh_reason}
         mergeable = str(info.get("mergeable") or "").upper()
         if mergeable != "MERGEABLE":
-            return {"repo": repo, "number": number, "status": "deferred", "reason": f"mergeable-{mergeable.lower() or 'unknown'}"}
+            merge_reason = f"mergeable-{mergeable.lower() or 'unknown'}"
+            _observe_task(repo, head_branch, "merge-wait", reason=merge_reason, pr_number=number)
+            return {"repo": repo, "number": number, "status": "deferred", "reason": merge_reason}
+        _observe_task(repo, head_branch, "integrating", pr_number=number)
         merged = run(
             ["gh", "api", "--method", "PUT", f"repos/{repo}/pulls/{number}/merge",
              "-f", f"sha={head}", "-f", "merge_method=merge"],
             timeout=180,
         )
         if merged.returncode:
+            _observe_task(repo, head_branch, "merge-race-or-failure", reason="merge-race-or-failure", pr_number=number)
             return {"repo": repo, "number": number, "status": "deferred", "reason": "merge-race-or-failure"}
         try:
             payload = json.loads(merged.stdout)
@@ -796,9 +909,31 @@ def integrate_pr(repo: str, number: int) -> dict[str, Any]:
 def process_ready_prs(owner: str) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     blocked_repos: set[str] = set()
-    for item in discover_ready_prs(owner):
+    discovered = discover_ready_prs(owner)
+    repo_sizes: dict[str, int] = {}
+    repo_positions: dict[str, int] = {}
+    for item in discovered:
+        key = str(item["repo"]).lower()
+        repo_sizes[key] = repo_sizes.get(key, 0) + 1
+    for item in discovered:
         repo_key = str(item["repo"]).lower()
+        repo_positions[repo_key] = repo_positions.get(repo_key, 0) + 1
+        position = repo_positions[repo_key]
+        size = repo_sizes[repo_key]
+        branch = f"{TASK_PREFIX}{item['number']}"
+        # Prefer the real task branch from the PR if the numeric PR is not the task id.
+        pr_view = run(
+            ["gh", "pr", "view", str(item["number"]), "--repo", item["repo"], "--json", "headRefName"],
+            timeout=60,
+        )
+        if pr_view.returncode == 0:
+            try:
+                branch = str(json.loads(pr_view.stdout).get("headRefName") or branch)
+            except json.JSONDecodeError:
+                pass
+        _observe_task(item["repo"], branch, "queued", pr_number=item["number"], pr_url=str(item.get("url") or ""), queue_position=position, queue_size=size)
         if repo_key in blocked_repos:
+            _observe_task(item["repo"], branch, "queued-behind-earlier", reason="queue-behind-earlier", pr_number=item["number"], queue_position=position, queue_size=size)
             results.append({"repo": item["repo"], "number": item["number"], "status": "deferred", "reason": "queue-behind-earlier"})
             continue
         result = integrate_pr(item["repo"], item["number"])
@@ -932,6 +1067,10 @@ def build_parser() -> argparse.ArgumentParser:
     finish.add_argument("--task-id", required=True)
     finish_any = sub.add_parser("finish-any")
     finish_any.add_argument("--task-id", required=True)
+    status_any = sub.add_parser("status-any")
+    status_any.add_argument("--task-id", required=True)
+    status_all = sub.add_parser("status-all")
+    status_all.add_argument("--roadmap-only", action="store_true")
     heartbeat = sub.add_parser("heartbeat")
     heartbeat.add_argument("--repo", type=Path, required=True)
     heartbeat.add_argument("--task-id", required=True)
@@ -970,6 +1109,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "finish-any":
             payload = finish_task_any(args.task_id)
             print(json.dumps(payload, sort_keys=True))
+        elif args.command == "status-any":
+            print(json.dumps(task_status_any(args.task_id), sort_keys=True))
+        elif args.command == "status-all":
+            print(json.dumps({"tasks": all_task_statuses(roadmap_only=args.roadmap_only)}, sort_keys=True))
         elif args.command == "heartbeat":
             payload = heartbeat_task(args.repo, args.task_id)
             print(payload["lease_expires_at"])

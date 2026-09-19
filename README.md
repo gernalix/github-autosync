@@ -18,7 +18,7 @@ The service manages **only** these repositories:
 - `gernalix/amici_fb`
 - `gernalix/salute`
 
-All other current or future GitHub repositories are ignored completely until explicitly added to `ALLOWED_REPOSITORIES`. They are not cloned, fetched, pulled, pushed, audited, registered in MegaVault, persisted in repo state, or included in Telegram alerts.
+All other current or future GitHub repositories are ignored completely until explicitly added to `ALLOWED_REPOSITORIES`. They are not cloned, fetched, pulled, pushed, audited, registered in MegaVault, or persisted in repo state.
 
 ## One-command global reconcile
 
@@ -66,7 +66,6 @@ Optional forms:
 
 ```bash
 github-reconcile --dry-run
-github-reconcile --no-telegram
 ```
 
 The periodic timer runs `github-reconcile` and uses the same guarded behavior as a manual reconcile.
@@ -147,13 +146,6 @@ Successful automatic mutations are written outside every Git worktree to avoid r
 
 Each JSONL row records the UTC timestamp, action, repository, branch, project ID when known, worktree, and a short detail. The ledger currently records `clone`, fast-forward `pull`, and `push`. Read-only audits, no-op checks, and fetches that do not change the checkout are intentionally not logged as mutations.
 
-Telegram delivery progress for activity events is persisted separately in:
-
-```text
-/home/daniele/.local/state/codex-github-autosync/telegram-activity-state.json
-```
-
-Only `push` and `pull` activity rows generate a Telegram message. The cursor advances only after successful delivery, so a transient Telegram failure is retried on a later service run.
 
 ### Private Git mirror
 
@@ -214,7 +206,7 @@ The canonical checkout is no longer a worker workspace. Agent changes belong in 
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
-python3 github_autosync.py --dry-run --no-telegram run
+python3 github_autosync.py --dry-run run
 systemctl --user status github-autosync.timer --no-pager
 systemctl --user list-timers github-autosync.timer --all --no-pager
 ```

@@ -902,9 +902,44 @@ def clone_repo(
     return "cloned"
 
 
+def _commit_dirty_for_reconcile(
+    worktree: Path,
+    entry: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Turn a generic dirty worktree into one explicit sync checkpoint commit."""
+    unresolved = run(["git", "diff", "--name-only", "--diff-filter=U"], worktree, timeout=30)
+    if unresolved.returncode != 0:
+        return issue(entry, "conflict_check_failed")
+    if unresolved.stdout.strip():
+        paths = ",".join(unresolved.stdout.splitlines()[:20])
+        return issue(entry, "unresolved_conflicts", f"paths={paths}")
+
+    add = run(["git", "add", "-A"], worktree, timeout=120)
+    if add.returncode != 0:
+        return issue(entry, "git_add_failed")
+
+    staged = run(["git", "diff", "--cached", "--quiet"], worktree, timeout=30)
+    if staged.returncode == 0:
+        return None
+    if staged.returncode != 1:
+        return issue(entry, "staged_diff_check_failed")
+
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    slug = str(entry.get("slug") or "repository")
+    commit = run(
+        ["git", "commit", "-m", f"github-reconcile: sync local changes in {slug} ({stamp})"],
+        worktree,
+        timeout=300,
+    )
+    if commit.returncode != 0:
+        return issue(entry, "auto_commit_failed")
+    return None
+
+
 def sync_changed_repo(
     repo: dict[str, str], projects_dir: Path, *, dry_run: bool,
     inventory_entry: dict[str, Any] | None = None,
+    auto_commit_dirty: bool = False,
 ) -> tuple[str, dict[str, Any] | None]:
     worktree = Path(str(inventory_entry["worktree"])) if inventory_entry else projects_dir / repo["name"]
     entry: dict[str, Any] = {
@@ -925,7 +960,15 @@ def sync_changed_repo(
     if status.returncode != 0:
         return "deferred", issue(entry, "status_failed")
     if status.stdout.strip():
-        return "deferred", issue(entry, "dirty_worktree")
+        if dry_run:
+            if not auto_commit_dirty:
+                return "deferred", issue(entry, "dirty_worktree")
+            return "would_update", None
+        if not auto_commit_dirty:
+            return "deferred", issue(entry, "dirty_worktree")
+        commit_issue = _commit_dirty_for_reconcile(worktree, entry)
+        if commit_issue is not None:
+            return "deferred", commit_issue
     branch = run(["git", "branch", "--show-current"], worktree, timeout=30)
     if branch.returncode != 0 or not branch.stdout.strip():
         return "deferred", issue(entry, "detached_or_unknown_branch")
@@ -970,7 +1013,35 @@ def sync_changed_repo(
         raise AutosyncError(f"relation_check_failed:{repo['name']}")
     ahead, behind = counts
     if ahead and behind:
-        return "deferred", issue(entry, "diverged", f"ahead={ahead},behind={behind}")
+        if not auto_commit_dirty:
+            return "deferred", issue(entry, "diverged", f"ahead={ahead},behind={behind}")
+        rebase = run(
+            ["git", "-c", "rerere.enabled=true", "rebase", "@{u}"],
+            worktree,
+            timeout=600,
+        )
+        if rebase.returncode != 0:
+            run(["git", "rebase", "--abort"], worktree, timeout=120)
+            return "deferred", issue(
+                entry,
+                "rebase_conflict",
+                f"ahead={ahead},behind={behind}",
+            )
+        action, detail = _push_with_race_recovery(
+            worktree,
+            remote_name,
+            remote_branch,
+            allow_rebase=True,
+        )
+        if action == "pushed":
+            return "pushed", None
+        if action == "synced":
+            return "up_to_date", None
+        if action == "remote_ahead":
+            merge = run(["git", "merge", "--ff-only", "@{u}"], worktree, timeout=120)
+            if merge.returncode == 0:
+                return "updated", None
+        return "deferred", issue(entry, "push_failed", detail or "after_rebase")
     if ahead:
         action, detail = _push_with_race_recovery(
             worktree,
@@ -1218,6 +1289,8 @@ def _status_for(issues: list[dict[str, Any]], work_done: int) -> str:
 
 def command_run(args: argparse.Namespace) -> int:
     projects_dir = Path(args.projects_dir).expanduser()
+    full_reconcile = bool(getattr(args, "full_reconcile", False))
+    auto_commit_dirty = bool(getattr(args, "auto_commit_dirty", False))
     state_dir = Path(args.state_dir).expanduser()
     megavault = Path(args.megavault).expanduser()
     telegram_enabled = not args.no_telegram and not args.dry_run
@@ -1261,7 +1334,8 @@ def command_run(args: argparse.Namespace) -> int:
                 inventory_entry = inventory_by_remote.get(normalize_remote(repo["url"]))
                 worktree = Path(str(inventory_entry["worktree"])) if inventory_entry else projects_dir / repo["name"]
                 if (
-                    previous == fingerprint
+                    not full_reconcile
+                    and previous == fingerprint
                     and worktree.exists()
                     and github_remote_key(repo["url"]) != ROADMAP_REPOSITORY
                 ):
@@ -1301,7 +1375,11 @@ def command_run(args: argparse.Namespace) -> int:
                         counts["skipped_unchanged"] += 1
                     continue
                 result, repo_issue = sync_changed_repo(
-                    repo, projects_dir, dry_run=args.dry_run, inventory_entry=inventory_entry
+                    repo,
+                    projects_dir,
+                    dry_run=args.dry_run,
+                    inventory_entry=inventory_entry,
+                    auto_commit_dirty=auto_commit_dirty,
                 )
                 if repo_issue is not None:
                     issues.append(repo_issue)
@@ -1426,7 +1504,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-data-mirror", action="store_true", help="Disable the private github-autosync-data mirror")
     sub = parser.add_subparsers(dest="command", required=True)
     run_p = sub.add_parser("run")
-    run_p.set_defaults(func=command_run)
+    run_p.set_defaults(func=command_run, full_reconcile=False, auto_commit_dirty=False)
+    reconcile_p = sub.add_parser(
+        "reconcile-all",
+        help="Force a network reconcile of every managed repo and checkpoint generic dirty worktrees.",
+    )
+    reconcile_p.set_defaults(func=command_run, full_reconcile=True, auto_commit_dirty=True)
     return parser
 
 

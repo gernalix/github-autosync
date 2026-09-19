@@ -335,6 +335,52 @@ def _operation_in_progress(worktree: Path) -> bool:
     return False
 
 
+def cleanup_task_after_merge(
+    repo_slug: str,
+    branch: str,
+    *,
+    expected_head: str | None = None,
+    merge_sha: str | None = None,
+) -> dict[str, Any]:
+    found = _task_by_branch(repo_slug, branch)
+    if found is None:
+        return {"status": "no-task-record"}
+    record_path, payload = found
+    repo = Path(str(payload["repo_path"])).expanduser().resolve()
+    worktree = Path(str(payload["worktree"])).expanduser()
+    payload["status"] = "merged"
+    payload["merged_at"] = _iso_now()
+    payload["merge_sha"] = merge_sha
+    payload["lease_expires_at"] = None
+
+    cleanup: list[str] = []
+    if worktree.exists():
+        dirty = _git(worktree, "status", "--porcelain")
+        if dirty.returncode == 0 and not dirty.stdout.strip() and not _operation_in_progress(worktree):
+            removed = _git(repo, "worktree", "remove", str(worktree), timeout=180)
+            if removed.returncode == 0:
+                cleanup.append("worktree")
+
+    if expected_head:
+        remote = _git(repo, "ls-remote", "--heads", "origin", f"refs/heads/{branch}", timeout=120)
+        if remote.returncode == 0:
+            fields = remote.stdout.split()
+            if fields and fields[0] == expected_head:
+                deleted = _git(repo, "push", "origin", "--delete", branch, timeout=180)
+                if deleted.returncode == 0:
+                    cleanup.append("remote-branch")
+
+    local_ref = _git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+    if local_ref.returncode == 0 and not worktree.exists():
+        deleted_local = _git(repo, "branch", "-d", branch, timeout=60)
+        if deleted_local.returncode == 0:
+            cleanup.append("local-branch")
+
+    payload["cleanup"] = cleanup
+    _atomic_json(record_path, payload)
+    return {"status": "merged", "cleanup": cleanup, "task_id": payload.get("task_id")}
+
+
 def _checkpoint_task(worktree: Path, task_id: str) -> None:
     if _operation_in_progress(worktree):
         raise RuntimeError("task has an unfinished Git operation/conflict")

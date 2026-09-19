@@ -812,7 +812,43 @@ def start_roadmap_task(
     repo = resolve_repo_path(repo_slug, project_id)
     if repo is None:
         raise RuntimeError(f"canonical worktree not found for {repo_slug}")
-    return start_task(repo, task_id, actor)
+    payload = start_task(repo, task_id, actor)
+    payload["roadmap_prompt_id"] = _safe_task_id(task_id)
+    _atomic_json(_task_record(repo, task_id), payload)
+    return payload
+
+
+def pending_roadmap_completions() -> list[dict[str, Any]]:
+    """Return merged roadmap-backed tasks whose terminal PASS has not been queued yet."""
+    if not STATE_ROOT.is_dir():
+        return []
+    pending: list[dict[str, Any]] = []
+    for path in sorted(STATE_ROOT.glob("*/tasks/*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        task_id = str(payload.get("task_id") or "")
+        if payload.get("status") != "merged" or not re.fullmatch(r"\d{6}", task_id):
+            continue
+        is_roadmap = str(payload.get("roadmap_prompt_id") or "") == task_id
+        # Backward compatibility for roadmap tasks created before roadmap_prompt_id existed.
+        if not is_roadmap:
+            is_roadmap = str(payload.get("actor") or "") == "codex"
+        if not is_roadmap or payload.get("roadmap_completion_queued_at"):
+            continue
+        pending.append(payload)
+    return pending
+
+
+def mark_roadmap_completion_queued(task_id: str) -> dict[str, Any]:
+    found = _find_task_record_any(task_id)
+    if found is None:
+        raise RuntimeError(f"unknown task: {task_id}")
+    path, payload = found
+    payload["roadmap_completion_queued_at"] = _iso_now()
+    _atomic_json(path, payload)
+    return payload
 
 
 def wait_task_any(task_id: str, *, timeout: float = 900.0) -> dict[str, Any]:

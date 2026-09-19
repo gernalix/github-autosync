@@ -63,6 +63,7 @@ ALLOWED_REPOSITORIES = frozenset(
         "gernalix/fedora-system-monitor",
         "gernalix/codex-usage",
         "gernalix/github-autosync",
+        "gernalix/workflowy-importer",
         "gernalix/PersonalHub",
         "gernalix/codex-usage-monitor",
         "gernalix/fedora-t7-backup",

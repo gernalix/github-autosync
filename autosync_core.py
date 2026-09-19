@@ -1426,7 +1426,11 @@ def command_run(args: argparse.Namespace) -> int:
                 for repo in repos:
                     inventory_entry = inventory_by_remote.get(normalize_remote(repo["url"]))
                     worktree = Path(str(inventory_entry["worktree"])) if inventory_entry else projects_dir / repo["name"]
-                    if not worktree.exists() or allowed_repo_key(args.owner, repo["name"]).lower() == ROADMAP_REPOSITORY.lower():
+                    if (
+                        not worktree.exists()
+                        or allowed_repo_key(args.owner, repo["name"]).lower() == ROADMAP_REPOSITORY.lower()
+                        or not git_repo_matches_remote(worktree, repo["url"])
+                    ):
                         continue
                     try:
                         repo_single_writer.ensure_guard(

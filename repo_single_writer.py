@@ -479,13 +479,38 @@ def finish_task(repo: Path, task_id: str) -> dict[str, Any]:
     if not record_path.exists():
         raise RuntimeError(f"unknown task: {task_id}")
     payload = json.loads(record_path.read_text(encoding="utf-8"))
-    if payload.get("status") == "ready":
+    if payload.get("status") in {"ready", "merged"}:
         return payload
     if payload.get("status") not in {"active", "blocked"}:
         raise RuntimeError(f"task is not finishable: {payload.get('status')}")
     worktree = Path(payload["worktree"])
     _checkpoint_task(worktree, task_id)
     branch = str(payload["branch"])
+
+    canonical = str(payload["canonical_branch"])
+    fetched = _git(
+        worktree,
+        "fetch",
+        "--no-tags",
+        "origin",
+        f"+refs/heads/{canonical}:refs/remotes/origin/{canonical}",
+        timeout=180,
+    )
+    if fetched.returncode:
+        raise RuntimeError(fetched.stderr.strip() or "canonical fetch failed")
+    head = _ok(worktree, "rev-parse", "HEAD")
+    canonical_head = _ok(worktree, "rev-parse", f"refs/remotes/origin/{canonical}")
+    if head == canonical_head:
+        cleanup_task_after_merge(
+            str(payload["repo"]),
+            branch,
+            merge_sha=head,
+        )
+        final = json.loads(record_path.read_text(encoding="utf-8"))
+        final["integration"] = "no-op"
+        _atomic_json(record_path, final)
+        return final
+
     push = _git(worktree, "push", "-u", "origin", branch, timeout=300)
     if push.returncode:
         raise RuntimeError(push.stderr.strip() or "task branch push failed")
@@ -709,6 +734,16 @@ def wait_task_merged(
 
     repo = repo.expanduser().resolve()
     payload = finish_task(repo, task_id)
+    if payload.get("status") == "merged" and not payload.get("pr_number"):
+        return {
+            "repo": payload.get("repo"),
+            "status": "merged",
+            "sha": payload.get("merge_sha"),
+            "head_branch": payload.get("branch"),
+            "head_sha": payload.get("merge_sha"),
+            "no_op": True,
+            "cleanup": {"status": "merged", "cleanup": payload.get("cleanup", [])},
+        }
     pr_number = payload.get("pr_number")
     if not pr_number:
         raise RuntimeError("task PR number is unavailable")

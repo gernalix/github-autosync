@@ -120,8 +120,70 @@ def require_ok(result: subprocess.CompletedProcess[str], label: str) -> None:
         raise AutosyncError(label)
 
 
-def github_repos(owner: str) -> list[dict[str, str]]:
-    """One metadata discovery command; no per-repo network probes."""
+def _normalize_repo_metadata(item: dict[str, Any], *, rest: bool) -> dict[str, str]:
+    if rest:
+        owner = item.get("owner") or {}
+        owner_login = str(owner.get("login") or "")
+        return {
+            "name": str(item["name"]),
+            "url": str(item.get("html_url") or item.get("url") or ""),
+            "default_branch": str(item.get("default_branch") or "UNKNOWN"),
+            "pushed_at": str(item.get("pushed_at") or "UNKNOWN"),
+            "archived": "1" if item.get("archived") else "0",
+            "_owner": owner_login,
+        }
+    branch = item.get("defaultBranchRef") or {}
+    return {
+        "name": str(item["name"]),
+        "url": str(item["url"]),
+        "default_branch": str(branch.get("name") or "UNKNOWN"),
+        "pushed_at": str(item.get("pushedAt") or "UNKNOWN"),
+        "archived": "1" if item.get("isArchived") else "0",
+        "_owner": "",
+    }
+
+
+def _github_repos_rest(owner: str) -> list[dict[str, str]] | None:
+    """Prefer REST to avoid coupling the minute timer to GraphQL quota."""
+    result = run(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "X-GitHub-Api-Version: 2022-11-28",
+            "user/repos?affiliation=owner&per_page=100&sort=full_name",
+        ],
+        timeout=120,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        pages = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(pages, list):
+        return None
+    repos: list[dict[str, str]] = []
+    for page in pages:
+        if not isinstance(page, list):
+            return None
+        for item in page:
+            if not isinstance(item, dict):
+                return None
+            row = _normalize_repo_metadata(item, rest=True)
+            if row.pop("_owner", "").lower() != owner.lower():
+                continue
+            if not row["url"]:
+                return None
+            repos.append(row)
+    return sorted(repos, key=lambda row: row["name"])
+
+
+def _github_repos_graphql(owner: str) -> list[dict[str, str]] | None:
     result = run(
         [
             "gh",
@@ -136,24 +198,32 @@ def github_repos(owner: str) -> list[dict[str, str]]:
         timeout=120,
     )
     if result.returncode != 0:
-        raise AutosyncError("github_repo_list_failed")
-    repos: list[dict[str, str]] = []
+        return None
     try:
         payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise AutosyncError("github_repo_list_invalid_json") from exc
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    repos: list[dict[str, str]] = []
     for item in payload:
-        branch = item.get("defaultBranchRef") or {}
-        repos.append(
-            {
-                "name": str(item["name"]),
-                "url": str(item["url"]),
-                "default_branch": str(branch.get("name") or "UNKNOWN"),
-                "pushed_at": str(item.get("pushedAt") or "UNKNOWN"),
-                "archived": "1" if item.get("isArchived") else "0",
-            }
-        )
+        if not isinstance(item, dict):
+            return None
+        row = _normalize_repo_metadata(item, rest=False)
+        row.pop("_owner", None)
+        repos.append(row)
     return sorted(repos, key=lambda row: row["name"])
+
+
+def github_repos(owner: str) -> list[dict[str, str]]:
+    """One metadata discovery path; REST first, GraphQL only as bounded fallback."""
+    repos = _github_repos_rest(owner)
+    if repos is not None:
+        return repos
+    repos = _github_repos_graphql(owner)
+    if repos is not None:
+        return repos
+    raise AutosyncError("github_repo_list_failed")
 
 
 def allowed_repo_key(owner: str, name: str) -> str:
@@ -1901,5 +1971,10 @@ def main(argv: list[str] | None = None) -> int:
     except AutosyncError as exc:
         if not args.dry_run:
             _push_kuma_status("down", f"errore fatale: {str(exc)[:160]}")
-        print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True) if args.json else "GitHub reconcile: controllo non completato.", file=sys.stderr)
+        message = (
+            json.dumps({"status": "error", "error": str(exc)}, sort_keys=True)
+            if args.json
+            else f"GitHub reconcile: controllo non completato ({str(exc)})."
+        )
+        print(message, file=sys.stderr)
         return 75

@@ -257,6 +257,40 @@ def ensure_guard(repo: Path, canonical_branch: str | None = None) -> dict[str, A
     return {"repo": slug, "status": "installed", "branch": branch}
 
 
+def remove_guard(repo: Path) -> dict[str, Any]:
+    """Remove only this tool's canonical-branch guard, restoring a prior hook."""
+    repo = repo.expanduser().resolve()
+    slug = _repo_slug(repo)
+    if slug.lower() == ROADMAP_REPOSITORY.lower():
+        return {"repo": slug, "status": "delegated-roadmap"}
+    hooks = _effective_hooks_dir(repo)
+    target = hooks / "reference-transaction"
+    prior = hooks / "reference-transaction.pre-single-writer"
+    auth = _auth_path(repo)
+
+    if not target.exists():
+        if prior.exists():
+            prior.replace(target)
+            auth.unlink(missing_ok=True)
+            return {"repo": slug, "status": "restored-prior"}
+        auth.unlink(missing_ok=True)
+        return {"repo": slug, "status": "absent"}
+
+    current = target.read_text(encoding="utf-8", errors="replace")
+    if HOOK_MARKER not in current:
+        return {"repo": slug, "status": "unmanaged"}
+
+    if prior.exists():
+        target.unlink()
+        prior.replace(target)
+        status = "restored-prior"
+    else:
+        target.unlink()
+        status = "removed"
+    auth.unlink(missing_ok=True)
+    return {"repo": slug, "status": status}
+
+
 def authorize_ref_update(repo: Path, old: str, new: str, branch: str) -> Path:
     path = _auth_path(repo)
     payload = {"old": old, "new": new, "ref": f"refs/heads/{branch}"}

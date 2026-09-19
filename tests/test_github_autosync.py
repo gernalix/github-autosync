@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import github_autosync as autosync
+import repo_single_writer
 
 
 def git(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -126,6 +127,20 @@ class AutosyncTests(unittest.TestCase):
             self.assertEqual("", git(["status", "--porcelain"], repo_path).stdout.strip())
             self.assertEqual((0, 0), autosync.git_counts(repo_path))
             self.assertTrue((repo_path / "dirty.txt").is_file())
+
+    def test_reconcile_all_checkpoints_dirty_protected_canonical_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path, bare = self.make_repo_pair(root / "pair")
+            repo_single_writer.ensure_guard(repo_path, "main")
+            (repo_path / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+            repo = {"name": "repo", "url": str(bare), "default_branch": "main", "pushed_at": "A", "archived": "0"}
+            result, problem = autosync.sync_changed_repo(
+                repo, root, dry_run=False, inventory_entry=self.entry(repo_path, bare), auto_commit_dirty=True
+            )
+            self.assertEqual("pushed", result)
+            self.assertIsNone(problem)
+            self.assertEqual("", git(["status", "--porcelain"], repo_path).stdout.strip())
 
     def test_reconcile_all_rebases_generic_divergence_then_pushes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -385,7 +400,7 @@ class AutosyncTests(unittest.TestCase):
             ):
                 self.assertEqual(0, autosync.command_run(args))
             sync.assert_called_once()
-            self.assertFalse(sync.call_args.kwargs["auto_commit_dirty"])
+            self.assertTrue(sync.call_args.kwargs["auto_commit_dirty"])
 
     def test_new_repo_is_cloned_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

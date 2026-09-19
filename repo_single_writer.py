@@ -674,6 +674,13 @@ def build_parser() -> argparse.ArgumentParser:
     finish = sub.add_parser("finish")
     finish.add_argument("--repo", type=Path, required=True)
     finish.add_argument("--task-id", required=True)
+    heartbeat = sub.add_parser("heartbeat")
+    heartbeat.add_argument("--repo", type=Path, required=True)
+    heartbeat.add_argument("--task-id", required=True)
+    wait = sub.add_parser("wait")
+    wait.add_argument("--repo", type=Path, required=True)
+    wait.add_argument("--task-id", required=True)
+    wait.add_argument("--timeout", type=float, default=900.0)
     guard = sub.add_parser("guard")
     guard.add_argument("--repo", type=Path, required=True)
     guard.add_argument("--branch")
@@ -691,6 +698,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "finish":
             payload = finish_task(args.repo, args.task_id)
             print(payload.get("pr_url") or f"PR #{payload.get('pr_number')}")
+        elif args.command == "heartbeat":
+            payload = heartbeat_task(args.repo, args.task_id)
+            print(payload["lease_expires_at"])
+        elif args.command == "wait":
+            payload = wait_task_merged(args.repo, args.task_id, timeout=args.timeout)
+            print(payload.get("sha") or "merged")
         elif args.command == "guard":
             print(json.dumps(ensure_guard(args.repo, args.branch), sort_keys=True))
         elif args.command == "process":

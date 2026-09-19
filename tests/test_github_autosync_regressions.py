@@ -24,16 +24,16 @@ class AutosyncRegressionTests(unittest.TestCase):
             root = Path(tmp)
             worktree = root / "canonical"
             worktree.mkdir()
-            remote = "https://github.com/gernalix/codex-roadmap"
+            remote = "https://github.com/gernalix/salute"
             inventory = {
                 "project_id": 51,
-                "slug": "codex-roadmap",
+                "slug": "salute",
                 "worktree": str(worktree),
                 "remote_url": remote,
                 "branch": "main",
             }
             repo = {
-                "name": "codex-roadmap",
+                "name": "salute",
                 "url": remote,
                 "default_branch": "main",
                 "pushed_at": "A",
@@ -88,16 +88,16 @@ class AutosyncRegressionTests(unittest.TestCase):
             root = Path(tmp)
             worktree = root / "canonical"
             worktree.mkdir()
-            remote = "https://github.com/gernalix/codex-roadmap"
+            remote = "https://github.com/gernalix/salute"
             inventory = {
                 "project_id": 51,
-                "slug": "codex-roadmap",
+                "slug": "salute",
                 "worktree": str(worktree),
                 "remote_url": remote,
                 "branch": "main",
             }
             repo = {
-                "name": "codex-roadmap",
+                "name": "salute",
                 "url": remote,
                 "default_branch": "main",
                 "pushed_at": "A",

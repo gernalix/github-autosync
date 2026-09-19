@@ -20,7 +20,7 @@ def main() -> int:
     tmp = target.with_suffix(".tmp")
     tmp.write_text(
         "#!/bin/sh\n"
-        f'exec /usr/bin/python3 "{entrypoint}" reconcile-all "$@"\n',
+        f'exec /usr/bin/python3 "{entrypoint}" "$@" reconcile-all\n',
         encoding="utf-8",
     )
     os.chmod(tmp, 0o755)

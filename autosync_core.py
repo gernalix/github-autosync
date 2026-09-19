@@ -1465,7 +1465,21 @@ def queue_merged_roadmap_completions() -> dict[str, Any]:
     return result
 
 
+def bootstrap_repo_integrator_runtime() -> None:
+    """One-time Fedora bootstrap after this architecture lands on the canonical checkout."""
+    if Path.home() != Path("/home/daniele"):
+        return
+    probe = run(["systemctl", "--user", "is-enabled", "repo-integrator.timer"], timeout=30)
+    if probe.returncode == 0:
+        return
+    installer = Path(__file__).resolve().with_name("install_systemd.py")
+    if installer.is_file():
+        run(["python3", str(installer)], timeout=120)
+
+
 def command_run(args: argparse.Namespace) -> int:
+    if not args.dry_run:
+        bootstrap_repo_integrator_runtime()
     projects_dir = Path(args.projects_dir).expanduser()
     full_reconcile = bool(getattr(args, "full_reconcile", False))
     auto_commit_dirty = bool(getattr(args, "auto_commit_dirty", False))

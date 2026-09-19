@@ -30,4 +30,4 @@ jobs:
           PYTHONDONTWRITEBYTECODE: '1'
         run: python -m unittest discover -s tests -v
       - name: Compile Python
-        run: python -m py_compile autosync_core.py github_autosync.py install_global_command.py install_systemd.py configure_kuma.py
+        run: python -m py_compile autosync_core.py github_autosync.py repo_single_writer.py install_global_command.py install_systemd.py install_global_command.py install_systemd.py configure_kuma.py

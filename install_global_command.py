@@ -6,6 +6,7 @@ from pathlib import Path
 
 COMMAND_NAME = "github-reconcile"
 TASK_COMMAND_NAME = "repo-task"
+INTEGRATOR_COMMAND_NAME = "repo-integrate"
 DEFAULT_REPO = Path.home() / "projects" / "github-autosync"
 
 
@@ -38,8 +39,20 @@ def main() -> int:
     os.chmod(task_tmp, 0o755)
     task_tmp.replace(task_target)
 
+    integrator_entrypoint = repo / "repo_integrator.py"
+    integrator_target = bindir / INTEGRATOR_COMMAND_NAME
+    integrator_tmp = integrator_target.with_suffix(".tmp")
+    integrator_tmp.write_text(
+        "#!/bin/sh\n"
+        f'exec /usr/bin/python3 "{integrator_entrypoint}" "$@"\n',
+        encoding="utf-8",
+    )
+    os.chmod(integrator_tmp, 0o755)
+    integrator_tmp.replace(integrator_target)
+
     print(target)
     print(task_target)
+    print(integrator_target)
     return 0
 
 

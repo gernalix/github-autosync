@@ -62,6 +62,19 @@ class ReconcileRuntimeTests(unittest.TestCase):
         self.assertIn("Persistent=true", timer)
         self.assertIn("AccuracySec=1s", timer)
 
+    def test_systemd_runtime_refresh_detects_missing_or_stale_unit(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            self.assertTrue(autosync._systemd_runtime_needs_refresh(target))
+            source = ROOT / "systemd"
+            for name in autosync.SYSTEMD_RUNTIME_UNITS:
+                (target / name).write_bytes((source / name).read_bytes())
+            self.assertFalse(autosync._systemd_runtime_needs_refresh(target))
+            (target / "github-autosync.service").write_text("stale\n", encoding="utf-8")
+            self.assertTrue(autosync._systemd_runtime_needs_refresh(target))
+
     def test_no_automatic_destructive_git_commands(self) -> None:
         code = (ROOT / "autosync_core.py").read_text()
         for forbidden in ("reset --hard", "clean -fd", "--force-with-lease", "git push --force"):

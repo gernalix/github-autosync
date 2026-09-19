@@ -1466,16 +1466,43 @@ def queue_merged_roadmap_completions() -> dict[str, Any]:
     return result
 
 
+SYSTEMD_RUNTIME_UNITS = (
+    "github-autosync.service",
+    "github-autosync.timer",
+    "repo-integrator.service",
+    "repo-integrator.timer",
+)
+
+
+def _systemd_runtime_needs_refresh(target_root: Path | None = None) -> bool:
+    source_root = Path(__file__).resolve().with_name("systemd")
+    target_root = target_root or (Path.home() / ".config" / "systemd" / "user")
+    for name in SYSTEMD_RUNTIME_UNITS:
+        source = source_root / name
+        target = target_root / name
+        if not source.is_file() or not target.is_file():
+            return True
+        try:
+            if source.read_bytes() != target.read_bytes():
+                return True
+        except OSError:
+            return True
+    return False
+
+
 def bootstrap_repo_integrator_runtime() -> None:
-    """One-time Fedora bootstrap after this architecture lands on the canonical checkout."""
+    """Keep the Fedora user-systemd runtime aligned with the canonical checkout."""
     if Path.home() != Path("/home/daniele"):
         return
     probe = run(["systemctl", "--user", "is-enabled", "repo-integrator.timer"], timeout=30)
-    if probe.returncode == 0:
+    if probe.returncode == 0 and not _systemd_runtime_needs_refresh():
         return
     installer = Path(__file__).resolve().with_name("install_systemd.py")
-    if installer.is_file():
-        run(["python3", str(installer)], timeout=120)
+    if not installer.is_file():
+        raise AutosyncError("systemd_runtime_installer_missing")
+    installed = run(["python3", str(installer)], timeout=120)
+    if installed.returncode:
+        raise AutosyncError("systemd_runtime_bootstrap_failed")
 
 
 def command_run(args: argparse.Namespace) -> int:

@@ -225,6 +225,9 @@ reconciliation of every repository. The service reads its private Kuma Push URL 
 Every non-dry periodic run sends a Kuma heartbeat; fatal autosync errors send an
 explicit DOWN heartbeat instead of silently aging into "No heartbeat in the time window".
 A missing/unusable Push URL is treated as a heartbeat failure rather than success.
+The Fedora bootstrap also compares the installed user units with the repository copies;
+after a canonical checkout advances, the next reconcile repairs stale unit files and
+reloads systemd automatically, so an ExecStart change does not require a separate manual deploy.
 
 `github-reconcile` remains the manual forced `reconcile-all` command. It prints a
 short Italian summary. `--json` emits the full machine-readable result; an unresolved

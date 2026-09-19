@@ -521,6 +521,20 @@ def all_task_statuses(*, roadmap_only: bool = False) -> list[dict[str, Any]]:
     return sorted(items, key=lambda item: str(item.get("task_id") or ""))
 
 
+def _task_by_pr(repo_slug: str, number: int) -> tuple[Path, dict[str, Any]] | None:
+    root = _task_dir_for_slug(repo_slug)
+    if not root.is_dir():
+        return None
+    for path in sorted(root.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("pr_number") == number:
+            return path, payload
+    return None
+
+
 def _operation_in_progress(worktree: Path) -> bool:
     if _git(worktree, "ls-files", "-u").stdout.strip():
         return True
@@ -920,20 +934,13 @@ def process_ready_prs(owner: str) -> dict[str, Any]:
         repo_positions[repo_key] = repo_positions.get(repo_key, 0) + 1
         position = repo_positions[repo_key]
         size = repo_sizes[repo_key]
-        branch = f"{TASK_PREFIX}{item['number']}"
-        # Prefer the real task branch from the PR if the numeric PR is not the task id.
-        pr_view = run(
-            ["gh", "pr", "view", str(item["number"]), "--repo", item["repo"], "--json", "headRefName"],
-            timeout=60,
-        )
-        if pr_view.returncode == 0:
-            try:
-                branch = str(json.loads(pr_view.stdout).get("headRefName") or branch)
-            except json.JSONDecodeError:
-                pass
-        _observe_task(item["repo"], branch, "queued", pr_number=item["number"], pr_url=str(item.get("url") or ""), queue_position=position, queue_size=size)
+        found = _task_by_pr(str(item["repo"]), int(item["number"]))
+        branch = str(found[1].get("branch") or "") if found else ""
+        if branch:
+            _observe_task(item["repo"], branch, "queued", pr_number=item["number"], pr_url=str(item.get("url") or ""), queue_position=position, queue_size=size)
         if repo_key in blocked_repos:
-            _observe_task(item["repo"], branch, "queued-behind-earlier", reason="queue-behind-earlier", pr_number=item["number"], queue_position=position, queue_size=size)
+            if branch:
+                _observe_task(item["repo"], branch, "queued-behind-earlier", reason="queue-behind-earlier", pr_number=item["number"], queue_position=position, queue_size=size)
             results.append({"repo": item["repo"], "number": item["number"], "status": "deferred", "reason": "queue-behind-earlier"})
             continue
         result = integrate_pr(item["repo"], item["number"])

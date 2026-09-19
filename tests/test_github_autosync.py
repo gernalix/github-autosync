@@ -385,7 +385,7 @@ class AutosyncTests(unittest.TestCase):
             ):
                 self.assertEqual(0, autosync.command_run(args))
             sync.assert_called_once()
-            self.assertTrue(sync.call_args.kwargs["auto_commit_dirty"])
+            self.assertFalse(sync.call_args.kwargs["auto_commit_dirty"])
 
     def test_new_repo_is_cloned_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

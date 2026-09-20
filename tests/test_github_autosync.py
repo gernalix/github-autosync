@@ -232,6 +232,11 @@ class AutosyncTests(unittest.TestCase):
         self.assertTrue(args.full_reconcile)
         self.assertTrue(args.auto_commit_dirty)
 
+    def test_run_parser_enables_dirty_checkpointing(self) -> None:
+        args = autosync.build_parser().parse_args(["run"])
+        self.assertFalse(args.full_reconcile)
+        self.assertTrue(args.auto_commit_dirty)
+
     def test_reconcile_all_repairs_stale_upstream_to_default_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -412,6 +417,32 @@ class AutosyncTests(unittest.TestCase):
                 self.assertEqual(0, autosync.command_run(args))
                 self.assertEqual(1, sync.call_count)
                 self.assertEqual("codex-roadmap", sync.call_args.args[0]["name"])
+
+    def test_unchanged_remote_with_dirty_local_worktree_is_reconciled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            local = projects / "codex-usage"
+            local.mkdir(parents=True)
+            self.assertEqual(0, git(["init"], local).returncode)
+            (local / "pending.txt").write_text("publisher update\n", encoding="utf-8")
+            state = root / "state"
+            repo = {"name": "codex-usage", "url": "https://github.com/gernalix/codex-usage", "default_branch": "main", "pushed_at": "A", "archived": "0"}
+            autosync.save_repo_state(state, {repo["name"]: autosync.repo_fingerprint(repo)})
+            args = autosync.build_parser().parse_args(["--projects-dir", str(projects), "--state-dir", str(state), "--megavault", str(root / "mv"), "--no-data-mirror", "run"])
+            with (
+                mock.patch.object(autosync, "megavault_inventory", return_value=[]),
+                mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
+                mock.patch.object(autosync, "github_repos", return_value=[repo]),
+                mock.patch.object(autosync, "sync_changed_repo", return_value=("pushed", None)) as sync,
+                mock.patch.object(autosync, "audit_worktree") as audit,
+                mock.patch.object(autosync, "megavault_registered_remotes", return_value={autosync.normalize_remote(repo["url"])}),
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}),
+            ):
+                self.assertEqual(0, autosync.command_run(args))
+            sync.assert_called_once()
+            audit.assert_not_called()
+            self.assertTrue(sync.call_args.kwargs["auto_commit_dirty"])
 
     def test_reconcile_all_includes_non_allowlisted_repo_already_present_locally(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

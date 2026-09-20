@@ -1688,6 +1688,10 @@ def command_run(args: argparse.Namespace) -> int:
                 previous = old_state.get(repo["name"])
                 inventory_entry = inventory_by_remote.get(normalize_remote(repo["url"]))
                 worktree = Path(str(inventory_entry["worktree"])) if inventory_entry else projects_dir / repo["name"]
+                local_dirty = False
+                if not full_reconcile and auto_commit_dirty and previous == fingerprint and worktree.exists():
+                    local_status = run(["git", "status", "--porcelain"], worktree, timeout=30)
+                    local_dirty = local_status.returncode == 0 and bool(local_status.stdout.strip())
                 if is_independent_canonical_writer_repo(args.owner, repo["name"]):
                     counts["skipped_unchanged"] += 1
                     if not args.dry_run:
@@ -1697,6 +1701,7 @@ def command_run(args: argparse.Namespace) -> int:
                     not full_reconcile
                     and previous == fingerprint
                     and worktree.exists()
+                    and not local_dirty
                     and github_remote_key(repo["url"]) != ROADMAP_REPOSITORY
                 ):
                     if args.dry_run:
@@ -1949,7 +1954,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="Emit full machine-readable result")
     sub = parser.add_subparsers(dest="command", required=True)
     run_p = sub.add_parser("run")
-    run_p.set_defaults(func=command_run, full_reconcile=False, auto_commit_dirty=False)
+    run_p.set_defaults(func=command_run, full_reconcile=False, auto_commit_dirty=True)
     reconcile_p = sub.add_parser(
         "reconcile-all",
         help="Force a network reconcile of every managed repo and checkpoint generic dirty worktrees.",

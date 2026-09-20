@@ -258,6 +258,87 @@ class AutosyncTests(unittest.TestCase):
         self.assertEqual(["654321"], result["failed"])
         mark.assert_called_once_with("123456")
 
+    def test_runtime_deploy_contract_covers_workflowy_and_chrome_switcher(self) -> None:
+        self.assertIn("gernalix/workflowy-importer", autosync.ALLOWED_REPOSITORIES)
+        self.assertIn("gernalix/chrome-codex-switcher", autosync.ALLOWED_REPOSITORIES)
+        self.assertEqual(
+            ("python3", "deploy_runtime.py"),
+            autosync.RUNTIME_DEPLOYERS["gernalix/workflowy-importer"],
+        )
+        self.assertEqual(
+            ("bash", "install.sh"),
+            autosync.RUNTIME_DEPLOYERS["gernalix/chrome-codex-switcher"],
+        )
+
+    def test_runtime_deploy_runs_once_per_checked_out_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            (worktree / "install.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            state: dict[str, str] = {}
+            calls: list[tuple[str, ...]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None, **kwargs: object) -> subprocess.CompletedProcess[str]:
+                calls.append(tuple(cmd))
+                if cmd[:3] == ["git", "rev-parse", "--verify"]:
+                    return ok("abc123\n")
+                if cmd == ["bash", "install.sh"]:
+                    return ok()
+                raise AssertionError(cmd)
+
+            with mock.patch.object(autosync, "run", side_effect=fake_run):
+                first = autosync.deploy_runtime_if_needed(
+                    "gernalix/chrome-codex-switcher",
+                    worktree,
+                    state,
+                    dry_run=False,
+                )
+                second = autosync.deploy_runtime_if_needed(
+                    "gernalix/chrome-codex-switcher",
+                    worktree,
+                    state,
+                    dry_run=False,
+                )
+
+            self.assertEqual(("deployed", "abc123"), first)
+            self.assertEqual(("up_to_date", "abc123"), second)
+            self.assertEqual("abc123", state["gernalix/chrome-codex-switcher"])
+            self.assertEqual(1, calls.count(("bash", "install.sh")))
+
+    def test_runtime_deploy_failure_is_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            (worktree / "deploy_runtime.py").write_text("pass\n", encoding="utf-8")
+            state: dict[str, str] = {}
+
+            def fake_run(cmd: list[str], cwd: Path | None = None, **kwargs: object) -> subprocess.CompletedProcess[str]:
+                if cmd[:3] == ["git", "rev-parse", "--verify"]:
+                    return ok("def456\n")
+                if cmd == ["python3", "deploy_runtime.py"]:
+                    return subprocess.CompletedProcess(cmd, 1, "", "runtime failed")
+                raise AssertionError(cmd)
+
+            with mock.patch.object(autosync, "run", side_effect=fake_run):
+                result = autosync.deploy_runtime_if_needed(
+                    "gernalix/workflowy-importer",
+                    worktree,
+                    state,
+                    dry_run=False,
+                )
+
+            self.assertEqual("failed", result[0])
+            self.assertIn("runtime failed", result[1])
+            self.assertNotIn("gernalix/workflowy-importer", state)
+
+    def test_runtime_deploy_state_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            expected = {
+                "gernalix/workflowy-importer": "abc",
+                "gernalix/chrome-codex-switcher": "def",
+            }
+            autosync.save_runtime_deploy_state(state_dir, expected)
+            self.assertEqual(expected, autosync.load_runtime_deploy_state(state_dir))
+
     def test_reconcile_all_parser_enables_full_reconcile_and_dirty_checkpointing(self) -> None:
         args = autosync.build_parser().parse_args(["reconcile-all"])
         self.assertTrue(args.full_reconcile)

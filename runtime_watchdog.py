@@ -124,17 +124,33 @@ def kick_reconcile() -> dict[str, Any]:
 
 def repair() -> dict[str, Any]:
     checkout = refresh_checkout()
+    if checkout.get("status") == "blocked":
+        reason = str(checkout.get("reason") or "blocked")
+        return {
+            "status": "blocked",
+            "checkout": checkout,
+            "install": {"status": "skipped", "reason": "checkout-blocked"},
+            "kick": {"status": "skipped", "reason": "checkout-blocked"},
+            "blockers": [f"checkout:{reason}"],
+        }
+
     install = install_runtime()
+    if install.get("status") == "blocked":
+        reason = str(install.get("reason") or "blocked")
+        return {
+            "status": "blocked",
+            "checkout": checkout,
+            "install": install,
+            "kick": {"status": "skipped", "reason": "install-blocked"},
+            "blockers": [f"install:{reason}"],
+        }
+
     kick = kick_reconcile()
-    status = "ok"
     blockers = []
-    for name, part in (("checkout", checkout), ("install", install), ("kick", kick)):
-        if part.get("status") == "blocked":
-            blockers.append(f"{name}:{part.get('reason', 'blocked')}")
-    if blockers:
-        status = "blocked"
+    if kick.get("status") == "blocked":
+        blockers.append(f"kick:{kick.get('reason', 'blocked')}")
     return {
-        "status": status,
+        "status": "blocked" if blockers else "ok",
         "checkout": checkout,
         "install": install,
         "kick": kick,

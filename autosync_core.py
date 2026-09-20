@@ -664,6 +664,39 @@ def issue(entry: dict[str, Any] | None, kind: str, detail: str = "") -> dict[str
     }
 
 
+_GIT_CORRUPTION_MARKERS = (
+    "object file",
+    "loose object",
+    "bad object",
+    "invalid object",
+    "missing blob",
+    "missing tree",
+    "missing commit",
+    "unable to read sha1 file",
+)
+
+
+def _git_failure_issue(
+    entry: dict[str, Any],
+    default_kind: str,
+    result: subprocess.CompletedProcess[str],
+) -> dict[str, Any]:
+    """Preserve concise Git stderr so runtime failures are diagnosable in one pass."""
+    raw = (result.stderr.strip() or result.stdout.strip())
+    compact = " ".join(raw.split())
+    detail = compact[:500]
+    lowered = compact.lower()
+    corrupt = any(marker in lowered for marker in _GIT_CORRUPTION_MARKERS) and (
+        "empty" in lowered
+        or "corrupt" in lowered
+        or "bad object" in lowered
+        or "invalid object" in lowered
+        or "missing " in lowered
+        or "unable to read" in lowered
+    )
+    return issue(entry, "git_object_corrupt" if corrupt else default_kind, detail)
+
+
 def git_counts(worktree: Path, upstream_ref: str = "@{u}") -> tuple[int, int] | None:
     result = run(
         ["git", "rev-list", "--left-right", "--count", f"HEAD...{upstream_ref}"],
@@ -996,7 +1029,7 @@ def sync_roadmap_repo(
 
     status = run(["git", "status", "--porcelain"], worktree, timeout=30)
     if status.returncode != 0:
-        return "deferred", issue(entry, "status_failed")
+        return "deferred", _git_failure_issue(entry, "status_failed", status)
     if status.stdout.strip():
         return "deferred", issue(entry, "roadmap_post_reconcile_dirty")
 
@@ -1058,7 +1091,7 @@ def audit_worktree(
     remote_name, remote_branch = upstream_name.split("/", 1)
     status = run(["git", "status", "--porcelain"], worktree, timeout=30)
     if status.returncode != 0:
-        return [issue(entry, "status_failed")], False
+        return [_git_failure_issue(entry, "status_failed", status)], False
     dirty = bool(status.stdout.strip())
     if fetch_remote and fetched_remote != remote_name:
         fetch = run(["git", "fetch", "--prune", remote_name], worktree, timeout=120)

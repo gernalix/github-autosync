@@ -83,6 +83,34 @@ class AutosyncError(RuntimeError):
     pass
 
 
+def load_runtime_credentials() -> None:
+    """Load the narrow systemd credential surface without overriding explicit env."""
+    directory = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
+    if not directory:
+        return
+    path = Path(directory) / "reconcile.env"
+    if not path.is_file():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise AutosyncError("credential_read_failed") from exc
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise AutosyncError(f"credential_format_invalid:line={number}")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key != "GITHUB_RECONCILE_PUSH_URL":
+            raise AutosyncError(f"credential_key_unexpected:{key or 'empty'}")
+        value = value.strip()
+        if not value:
+            raise AutosyncError("credential_value_empty:GITHUB_RECONCILE_PUSH_URL")
+        os.environ.setdefault(key, value)
+
+
 class ExclusiveLock:
     def __init__(self, path: Path):
         self.path = path
@@ -2145,6 +2173,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_runtime_credentials()
     args = build_parser().parse_args(argv)
     args.human_output = args.full_reconcile and not args.json
     try:

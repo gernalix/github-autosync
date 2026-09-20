@@ -69,6 +69,38 @@ class RuntimeWatchdogTests(unittest.TestCase):
             any(call.args == ("merge", "--ff-only", remote) for call in git.call_args_list)
         )
 
+    def test_repair_stops_before_install_when_checkout_is_blocked(self) -> None:
+        with (
+            mock.patch.object(
+                watchdog,
+                "refresh_checkout",
+                return_value={"status": "blocked", "reason": "status-failed"},
+            ),
+            mock.patch.object(watchdog, "install_runtime") as install,
+            mock.patch.object(watchdog, "kick_reconcile") as kick,
+        ):
+            result = watchdog.repair()
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("skipped", result["install"]["status"])
+        self.assertEqual("skipped", result["kick"]["status"])
+        install.assert_not_called()
+        kick.assert_not_called()
+
+    def test_repair_stops_before_kick_when_install_is_blocked(self) -> None:
+        with (
+            mock.patch.object(watchdog, "refresh_checkout", return_value={"status": "current"}),
+            mock.patch.object(
+                watchdog,
+                "install_runtime",
+                return_value={"status": "blocked", "reason": "install-failed"},
+            ),
+            mock.patch.object(watchdog, "kick_reconcile") as kick,
+        ):
+            result = watchdog.repair()
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("skipped", result["kick"]["status"])
+        kick.assert_not_called()
+
     def test_repair_kicks_primary_service_after_runtime_install(self) -> None:
         with (
             mock.patch.object(watchdog, "refresh_checkout", return_value={"status": "current"}),

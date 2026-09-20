@@ -31,7 +31,12 @@ ACTIVITY_DATA_REMOTE = "https://github.com/gernalix/github-autosync-data.git"
 ACTIVITY_DATA_BRANCH = "main"
 ACTIVITY_SCHEMA_VERSION = 1
 REPO_STATE_FILE = "repo-state.json"
+RUNTIME_DEPLOY_STATE_FILE = "runtime-deploy-state.json"
 ROADMAP_REPOSITORY = "gernalix/codex-roadmap"
+RUNTIME_DEPLOYERS: dict[str, tuple[str, ...]] = {
+    "gernalix/workflowy-importer": ("python3", "deploy_runtime.py"),
+    "gernalix/chrome-codex-switcher": ("bash", "install.sh"),
+}
 INDEPENDENT_CANONICAL_WRITER_REPOSITORIES = frozenset(
     {
         "gernalix/activity-watch-data",
@@ -64,6 +69,7 @@ ALLOWED_REPOSITORIES = frozenset(
         "gernalix/codex-usage",
         "gernalix/github-autosync",
         "gernalix/workflowy-importer",
+        "gernalix/chrome-codex-switcher",
         "gernalix/PersonalHub",
         "gernalix/codex-usage-monitor",
         "gernalix/fedora-t7-backup",
@@ -295,6 +301,62 @@ def save_repo_state(state_dir: Path, state: dict[str, str]) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps({"repos": state}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def load_runtime_deploy_state(state_dir: Path) -> dict[str, str]:
+    path = state_dir / RUNTIME_DEPLOY_STATE_FILE
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    repos = raw.get("repos") if isinstance(raw, dict) else None
+    if not isinstance(repos, dict):
+        return {}
+    return {str(key): str(value) for key, value in repos.items()}
+
+
+def save_runtime_deploy_state(state_dir: Path, state: dict[str, str]) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / RUNTIME_DEPLOY_STATE_FILE
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"repos": state}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def deploy_runtime_if_needed(
+    repo_key: str,
+    worktree: Path,
+    deployed_state: dict[str, str],
+    *,
+    dry_run: bool,
+) -> tuple[str, str]:
+    command = RUNTIME_DEPLOYERS.get(repo_key)
+    if command is None:
+        return "not_applicable", ""
+
+    head = run(["git", "rev-parse", "--verify", "HEAD"], worktree, timeout=30)
+    if head.returncode != 0 or not head.stdout.strip():
+        return "failed", "runtime_deploy_head_unavailable"
+    head_sha = head.stdout.strip()
+    if deployed_state.get(repo_key) == head_sha:
+        return "up_to_date", head_sha
+
+    entrypoint = worktree / command[-1]
+    if not entrypoint.is_file():
+        return "failed", f"runtime_deploy_entrypoint_missing:{command[-1]}"
+    if dry_run:
+        return "would_deploy", head_sha
+
+    deployed = run(list(command), worktree, timeout=240)
+    if deployed.returncode != 0:
+        evidence = (deployed.stderr or deployed.stdout or "command_failed").strip()
+        evidence = " ".join(evidence.split())[:400]
+        return "failed", f"runtime_deploy_failed:{evidence}"
+
+    deployed_state[repo_key] = head_sha
+    return "deployed", head_sha
 
 
 def append_activity(
@@ -1625,6 +1687,7 @@ def command_run(args: argparse.Namespace) -> int:
         "cloned": 0,
         "updated": 0,
         "pushed": 0,
+        "deployed": 0,
         "audited_unchanged": 0,
         "skipped_unchanged": 0,
         "deferred": 0,
@@ -1716,6 +1779,8 @@ def command_run(args: argparse.Namespace) -> int:
 
             old_state = load_repo_state(state_dir)
             next_state = dict(old_state)
+            deployed_state = load_runtime_deploy_state(state_dir)
+            next_deployed_state = dict(deployed_state)
             for repo in repos:
                 fingerprint = repo_fingerprint(repo)
                 previous = old_state.get(repo["name"])
@@ -1773,8 +1838,39 @@ def command_run(args: argparse.Namespace) -> int:
                     if repo_issues:
                         issues.extend(repo_issues)
                         counts["deferred"] += 1
-                    elif not did_push:
+                        continue
+                    if not did_push:
                         counts["skipped_unchanged"] += 1
+
+                    repo_key = allowed_repo_key(args.owner, repo["name"])
+                    deploy_result, deploy_detail = deploy_runtime_if_needed(
+                        repo_key,
+                        worktree,
+                        next_deployed_state,
+                        dry_run=args.dry_run,
+                    )
+                    if deploy_result == "failed":
+                        issues.append(
+                            issue(
+                                local_entry,
+                                "runtime_deploy_failed",
+                                deploy_detail,
+                            )
+                        )
+                        counts["deferred"] += 1
+                        continue
+                    if deploy_result == "deployed":
+                        counts["deployed"] += 1
+                        append_activity(
+                            state_dir,
+                            action="deploy",
+                            repo=repo_key,
+                            branch=str(local_entry.get("branch") or repo.get("default_branch") or "UNKNOWN"),
+                            project_id=local_entry.get("project_id"),
+                            worktree=str(worktree),
+                            detail=f"runtime deployed at {deploy_detail[:12]}",
+                        )
+                        activity_events += 1
                     continue
                 try:
                     result, repo_issue = sync_changed_repo(
@@ -1847,6 +1943,43 @@ def command_run(args: argparse.Namespace) -> int:
                         ),
                     )
                     activity_events += 1
+
+                repo_key = allowed_repo_key(args.owner, repo["name"])
+                deploy_entry = inventory_entry or {
+                    "project_id": None,
+                    "slug": repo["name"],
+                    "worktree": str(worktree),
+                    "remote_url": repo["url"],
+                    "branch": repo.get("default_branch") or "UNKNOWN",
+                }
+                deploy_result, deploy_detail = deploy_runtime_if_needed(
+                    repo_key,
+                    worktree,
+                    next_deployed_state,
+                    dry_run=args.dry_run,
+                )
+                if deploy_result == "failed":
+                    issues.append(
+                        issue(
+                            deploy_entry,
+                            "runtime_deploy_failed",
+                            deploy_detail,
+                        )
+                    )
+                    counts["deferred"] += 1
+                elif deploy_result == "deployed":
+                    counts["deployed"] += 1
+                    append_activity(
+                        state_dir,
+                        action="deploy",
+                        repo=repo_key,
+                        branch=repo.get("default_branch") or None,
+                        project_id=inventory_entry.get("project_id") if inventory_entry else None,
+                        worktree=str(worktree),
+                        detail=f"runtime deployed at {deploy_detail[:12]}",
+                    )
+                    activity_events += 1
+
                 if not args.dry_run:
                     next_state[repo["name"]] = fingerprint
 
@@ -1854,6 +1987,13 @@ def command_run(args: argparse.Namespace) -> int:
                 live_names = {repo["name"] for repo in repos}
                 next_state = {name: value for name, value in next_state.items() if name in live_names}
                 save_repo_state(state_dir, next_state)
+                live_repo_keys = {allowed_repo_key(args.owner, repo["name"]) for repo in repos}
+                next_deployed_state = {
+                    key: value
+                    for key, value in next_deployed_state.items()
+                    if key in live_repo_keys
+                }
+                save_runtime_deploy_state(state_dir, next_deployed_state)
 
             registered = megavault_registered_remotes(megavault)
             missing_reg = [repo for repo in repos if normalize_remote(repo["url"]) not in registered]
@@ -1890,7 +2030,13 @@ def command_run(args: argparse.Namespace) -> int:
         raise AutosyncError(f"unexpected_{type(exc).__name__}") from exc
 
     issues = dedupe_issues(issues)
-    work_done = counts["cloned"] + counts["updated"] + counts["pushed"] + auto_pushed
+    work_done = (
+        counts["cloned"]
+        + counts["updated"]
+        + counts["pushed"]
+        + counts["deployed"]
+        + auto_pushed
+    )
     payload = {
         "status": _status_for(issues, work_done),
         "dry_run": bool(args.dry_run),
@@ -1961,6 +2107,8 @@ def _print_human_summary(payload: dict[str, Any]) -> None:
         print(f"Aggiornati dal remoto: {payload['updated']}")
     if payload["pushed"] + payload["auto_pushed"]:
         print(f"Inviati a GitHub: {payload['pushed'] + payload['auto_pushed']}")
+    if payload.get("deployed"):
+        print(f"Runtime aggiornati: {payload['deployed']}")
     for item in payload["reconcile_issues"][:3]:
         print(f"Problema: {item['repo']} — {_human_issue(item['kind'])}.")
 

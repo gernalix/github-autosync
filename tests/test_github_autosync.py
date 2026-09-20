@@ -560,11 +560,11 @@ class AutosyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             projects = root / "projects"
-            local = projects / "workflowy-importer"
+            local = projects / "legacy-local"
             local.mkdir(parents=True)
-            remote = "https://github.com/gernalix/workflowy-importer"
+            remote = "https://github.com/gernalix/legacy-local"
             repo = {
-                "name": "workflowy-importer",
+                "name": "legacy-local",
                 "url": remote,
                 "default_branch": "main",
                 "pushed_at": "A",

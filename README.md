@@ -235,7 +235,7 @@ the oneshot service is already running. A process lock also excludes manual runs
 The timer deliberately executes the lightweight fingerprint/audit `run` path, not
 the forced `reconcile-all` path, so routine heartbeats do not require a full network
 reconciliation of every repository. The service reads its private Kuma Push URL from
-`~/.config/github-autosync/reconcile.env`, installed by `python3 configure_kuma.py`.
+`~/.config/github-autosync/reconcile.env`, installed by `python3 configure_kuma.py`. The user service no longer imports that file with `EnvironmentFile=`: it passes it as the systemd credential `reconcile.env`, and the runtime reads only `GITHUB_RECONCILE_PUSH_URL` from `$CREDENTIALS_DIRECTORY`. The plaintext file is retained only as a migration source until an encrypted systemd credential is provisioned locally.
 Every non-dry periodic run sends a Kuma heartbeat; fatal autosync errors send an
 explicit DOWN heartbeat instead of silently aging into "No heartbeat in the time window".
 A missing/unusable Push URL is treated as a heartbeat failure rather than success.

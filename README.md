@@ -12,6 +12,8 @@ The service manages **only** these repositories:
 - `gernalix/fedora-system-monitor`
 - `gernalix/codex-usage`
 - `gernalix/github-autosync`
+- `gernalix/workflowy-importer`
+- `gernalix/chrome-codex-switcher`
 - `gernalix/PersonalHub`
 - `gernalix/codex-usage-monitor`
 - `gernalix/fedora-t7-backup`
@@ -110,10 +112,22 @@ The integrator persists observations such as `queued`, `checks-pending`, `rebasi
 - never stash, hard-reset, force-pull or force-push user work; unresolved semantic conflicts remain deferred for review;
 - register genuinely new managed repositories in MegaVault when its worktree is clean and synchronized;
 - expose truthful machine-readable states: `ok`, `partial`, `deferred`, `error`, or `locked`;
+- deploy explicitly allowlisted local runtimes once per checked-out revision and retry failed deploys on later minute ticks;
 - report health only through the existing Uptime Kuma Push monitor; this service sends no Telegram notifications;
 - run from a `systemd --user` calendar timer every minute.
 
 The periodic path no longer uses `ghorg --fetch-all`. `ghorg` can still be used manually for bootstrap/recovery, but it is not part of the steady-state timer.
+
+### Runtime deployment after sync
+
+Repositories that have a local runtime may opt into a narrow, explicit post-sync deploy command. Deployment is keyed by the checked-out commit SHA and persisted in `runtime-deploy-state.json`, so a given revision is deployed once, while a failed deployment is retried on the next minute tick without repeating Git work.
+
+Current deploy contracts:
+
+- `gernalix/workflowy-importer` → `python3 deploy_runtime.py`; this refreshes the user-systemd units, restarts the Workflowy bridge, and immediately runs one roadmap sync.
+- `gernalix/chrome-codex-switcher` → `bash install.sh`; this refreshes the installed host/extension files and restarts the local switcher service.
+
+A deploy failure is surfaced as `runtime_deploy_failed` and does not advance the deploy-state SHA. The ordinary repository fingerprint may still advance because Git synchronization itself succeeded; the next timer run therefore retries only the deployment step.
 
 ## Change detection and local audit
 

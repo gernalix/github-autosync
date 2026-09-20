@@ -6,7 +6,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=-/home/daniele/.config/github-autosync/reconcile.env
+LoadCredential=reconcile.env:/home/daniele/.config/github-autosync/reconcile.env
 WorkingDirectory=/home/daniele/projects/github-autosync
 ExecStart=/usr/bin/python3 /home/daniele/projects/github-autosync/github_autosync.py run
 TimeoutStartSec=10min

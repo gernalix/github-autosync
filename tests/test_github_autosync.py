@@ -25,6 +25,37 @@ class AutosyncTests(unittest.TestCase):
         self.kuma_heartbeat_mock = self.kuma_heartbeat.start()
         self.addCleanup(self.kuma_heartbeat.stop)
 
+    def test_git_failure_issue_classifies_corrupt_object_and_keeps_evidence(self) -> None:
+        result = subprocess.CompletedProcess(
+            [],
+            128,
+            stdout="",
+            stderr=(
+                "error: object file .git/objects/aa/bb is empty\n"
+                "fatal: loose object aabb is corrupt"
+            ),
+        )
+        problem = autosync._git_failure_issue(
+            {"project_id": 1, "slug": "demo", "worktree": "/tmp/demo"},
+            "status_failed",
+            result,
+        )
+        self.assertEqual("git_object_corrupt", problem["kind"])
+        self.assertIn("object file", problem["detail"])
+        self.assertIn("is empty", problem["detail"])
+
+    def test_git_failure_issue_preserves_generic_status_error(self) -> None:
+        result = subprocess.CompletedProcess(
+            [], 128, stdout="", stderr="fatal: this operation must be run in a work tree"
+        )
+        problem = autosync._git_failure_issue(
+            {"project_id": 1, "slug": "demo", "worktree": "/tmp/demo"},
+            "status_failed",
+            result,
+        )
+        self.assertEqual("status_failed", problem["kind"])
+        self.assertIn("must be run in a work tree", problem["detail"])
+
     def make_repo_pair(self, root: Path) -> tuple[Path, Path]:
         root.mkdir(parents=True, exist_ok=True)
         bare = root / "origin.git"

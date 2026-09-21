@@ -234,8 +234,7 @@ The one-minute calendar timer has `Persistent=true`; systemd coalesces ticks whi
 the oneshot service is already running. A process lock also excludes manual runs.
 The timer deliberately executes the lightweight fingerprint/audit `run` path, not
 the forced `reconcile-all` path, so routine heartbeats do not require a full network
-reconciliation of every repository. The service reads its private Kuma Push URL from
-`~/.config/github-autosync/reconcile.env`, installed by `python3 configure_kuma.py`. The user service no longer imports that file with `EnvironmentFile=`: it passes it as the systemd credential `reconcile.env`, and the runtime reads only `GITHUB_RECONCILE_PUSH_URL` from `$CREDENTIALS_DIRECTORY`. The plaintext file is retained only as a migration source until an encrypted systemd credential is provisioned locally.
+reconciliation of every repository. Runtime credential resolution now prefers an explicit ephemeral `GITHUB_RECONCILE_PUSH_URL`, then the Fedora Secret Service/libsecret entry `application=github-autosync, credential=github-reconcile-push-url`. The existing systemd `reconcile.env` credential and `~/.config/github-autosync/reconcile.env` remain migration fallbacks so the minute timer and user lingering keep working during the live cutover. `configure_kuma.py` is the remaining migration boundary: once the live Secret Service entry is provisioned and verified for the lingering user manager, its legacy file sink and the unit `LoadCredential=` fallback can be retired.
 Every non-dry periodic run sends a Kuma heartbeat; fatal autosync errors send an
 explicit DOWN heartbeat instead of silently aging into "No heartbeat in the time window".
 A missing/unusable Push URL is treated as a heartbeat failure rather than success.

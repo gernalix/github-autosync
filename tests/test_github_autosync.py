@@ -25,28 +25,49 @@ class AutosyncTests(unittest.TestCase):
         self.kuma_heartbeat_mock = self.kuma_heartbeat.start()
         self.addCleanup(self.kuma_heartbeat.stop)
 
-    def test_systemd_credential_loads_kuma_url_without_overriding_env(self) -> None:
+    def test_secret_service_kuma_url_precedes_legacy_sources_and_preserves_explicit_env(self) -> None:
+        with (
+            mock.patch.object(
+                autosync,
+                "_secret_service_lookup",
+                return_value="https://secret.example/api/push/test",
+            ) as lookup,
+            mock.patch.dict(autosync.os.environ, {}, clear=False),
+        ):
+            autosync.os.environ.pop("GITHUB_RECONCILE_PUSH_URL", None)
+            autosync.load_runtime_credentials()
+            self.assertEqual(
+                "https://secret.example/api/push/test",
+                autosync.os.environ["GITHUB_RECONCILE_PUSH_URL"],
+            )
+            autosync.os.environ["GITHUB_RECONCILE_PUSH_URL"] = "https://explicit.test/push"
+            autosync.load_runtime_credentials()
+            self.assertEqual(
+                "https://explicit.test/push",
+                autosync.os.environ["GITHUB_RECONCILE_PUSH_URL"],
+            )
+            self.assertEqual(1, lookup.call_count)
+            autosync.os.environ.pop("GITHUB_RECONCILE_PUSH_URL", None)
+
+    def test_systemd_credential_remains_migration_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             credential = Path(tmp) / "reconcile.env"
             credential.write_text(
                 "GITHUB_RECONCILE_PUSH_URL=https://example.test/api/push/test\n",
                 encoding="utf-8",
             )
-            with mock.patch.dict(
-                autosync.os.environ,
-                {"CREDENTIALS_DIRECTORY": tmp},
-                clear=False,
+            with (
+                mock.patch.object(autosync, "_secret_service_lookup", return_value=None),
+                mock.patch.dict(
+                    autosync.os.environ,
+                    {"CREDENTIALS_DIRECTORY": tmp},
+                    clear=False,
+                ),
             ):
                 autosync.os.environ.pop("GITHUB_RECONCILE_PUSH_URL", None)
                 autosync.load_runtime_credentials()
                 self.assertEqual(
                     "https://example.test/api/push/test",
-                    autosync.os.environ["GITHUB_RECONCILE_PUSH_URL"],
-                )
-                autosync.os.environ["GITHUB_RECONCILE_PUSH_URL"] = "https://explicit.test/push"
-                autosync.load_runtime_credentials()
-                self.assertEqual(
-                    "https://explicit.test/push",
                     autosync.os.environ["GITHUB_RECONCILE_PUSH_URL"],
                 )
                 autosync.os.environ.pop("GITHUB_RECONCILE_PUSH_URL", None)

@@ -83,32 +83,84 @@ class AutosyncError(RuntimeError):
     pass
 
 
-def load_runtime_credentials() -> None:
-    """Load the narrow systemd credential surface without overriding explicit env."""
-    directory = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
-    if not directory:
-        return
-    path = Path(directory) / "reconcile.env"
+SECRET_SERVICE_ATTRIBUTES = (
+    "application",
+    "github-autosync",
+    "credential",
+    "github-reconcile-push-url",
+)
+LEGACY_RECONCILE_ENV = Path.home() / ".config" / "github-autosync" / "reconcile.env"
+
+
+def _secret_service_lookup() -> str | None:
+    """Read the private Kuma Push URL from Secret Service/libsecret."""
+    try:
+        proc = subprocess.run(
+            ["secret-tool", "lookup", *SECRET_SERVICE_ATTRIBUTES],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    value = proc.stdout.strip()
+    return value or None
+
+
+def _load_legacy_reconcile_env(path: Path) -> str | None:
     if not path.is_file():
-        return
+        return None
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
         raise AutosyncError("credential_read_failed") from exc
+    value: str | None = None
     for number, raw in enumerate(lines, 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         if "=" not in line:
             raise AutosyncError(f"credential_format_invalid:line={number}")
-        key, value = line.split("=", 1)
+        key, candidate = line.split("=", 1)
         key = key.strip()
         if key != "GITHUB_RECONCILE_PUSH_URL":
             raise AutosyncError(f"credential_key_unexpected:{key or 'empty'}")
-        value = value.strip()
-        if not value:
+        candidate = candidate.strip()
+        if not candidate:
             raise AutosyncError("credential_value_empty:GITHUB_RECONCILE_PUSH_URL")
-        os.environ.setdefault(key, value)
+        value = candidate
+    return value
+
+
+def load_runtime_credentials() -> None:
+    """Prefer explicit env, then Secret Service; keep file credentials as migration fallback."""
+    if os.environ.get("GITHUB_RECONCILE_PUSH_URL", "").strip():
+        return
+
+    secret = _secret_service_lookup()
+    if secret:
+        os.environ["GITHUB_RECONCILE_PUSH_URL"] = secret
+        return
+
+    candidates: list[Path] = []
+    directory = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
+    if directory:
+        candidates.append(Path(directory) / "reconcile.env")
+    candidates.append(LEGACY_RECONCILE_ENV)
+
+    seen: set[Path] = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        value = _load_legacy_reconcile_env(path)
+        if value:
+            os.environ["GITHUB_RECONCILE_PUSH_URL"] = value
+            return
 
 
 class ExclusiveLock:

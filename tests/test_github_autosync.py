@@ -21,6 +21,7 @@ def ok(stdout: str = "") -> subprocess.CompletedProcess[str]:
 
 class AutosyncTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.real_kuma_heartbeat = autosync._push_kuma_heartbeat
         self.kuma_heartbeat = mock.patch.object(autosync, "_push_kuma_heartbeat", return_value=True)
         self.kuma_heartbeat_mock = self.kuma_heartbeat.start()
         self.addCleanup(self.kuma_heartbeat.stop)
@@ -911,7 +912,7 @@ class AutosyncTests(unittest.TestCase):
     def test_repo_issue_keeps_operational_kuma_monitor_up_and_exposes_cause(self) -> None:
         issues = [{"repo": "PersonalHub", "kind": "dirty_worktree", "detail": ""}]
         with mock.patch.object(autosync, "_push_kuma_status", return_value=True) as push:
-            self.assertTrue(autosync._push_kuma_heartbeat(False, 13, issues))
+            self.assertTrue(self.real_kuma_heartbeat(False, 13, issues))
         push.assert_called_once_with(
             "up",
             "reconcile attivo; 1 repository da verificare: PersonalHub/dirty_worktree",

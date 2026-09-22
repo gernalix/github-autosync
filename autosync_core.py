@@ -2132,7 +2132,7 @@ def command_run(args: argparse.Namespace) -> int:
                 "detail": item.get("detail"),
             }
             for item in issues
-        ] if full_reconcile else [],
+        ],
         "activity_events": activity_events,
         "activity_log": str(state_dir / ACTIVITY_LOG_FILE),
         "activity_data": activity_data,
@@ -2170,8 +2170,18 @@ def _push_kuma_status(status: str, message: str) -> bool:
 
 
 def _push_kuma_heartbeat(healthy: bool, total: int, issues: list[dict[str, Any]]) -> bool:
-    message = f"{total} repository sincronizzati" if healthy else f"{len(issues)} repository richiedono attenzione"
-    return _push_kuma_status("up" if healthy else "down", message)
+    """Report service liveness to Kuma; repository-level findings are not service outages."""
+    if healthy:
+        message = f"{total} repository sincronizzati"
+    else:
+        first = issues[0] if issues else {}
+        repo = str(first.get("repo") or "repository")
+        kind = str(first.get("kind") or "verifica")
+        suffix = f": {repo}/{kind}" if issues else ""
+        message = f"reconcile attivo; {len(issues)} repository da verificare{suffix}"
+    # Reaching this point means the reconcile process completed and can report
+    # its findings. Only fatal execution/heartbeat failures mark the service DOWN.
+    return _push_kuma_status("up", message)
 
 
 def _print_human_summary(payload: dict[str, Any]) -> None:

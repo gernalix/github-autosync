@@ -13,9 +13,12 @@ SPEC.loader.exec_module(configure_kuma)
 
 class ConfigureKumaTests(TestCase):
     def test_stores_push_url_in_secret_service_via_stdin(self) -> None:
-        remote = mock.Mock(returncode=0, stdout=json.dumps({"id": 7, "token": "test-token", "updated": False))
+        remote = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({"id": 7, "token": "test-token", "updated": False}),
+        )
         secret_store = mock.Mock(returncode=0)
-        with mock.patch.object(configure_kuma.subprocess, "run", side_effect=[remote.return_value, secret_store.return_value]) as run:
+        with mock.patch.object(configure_kuma.subprocess, "run", side_effect=[remote, secret_store]) as run:
             result = configure_kuma.configure()
 
         self.assertEqual({"id": 7, "updated": False}, result)

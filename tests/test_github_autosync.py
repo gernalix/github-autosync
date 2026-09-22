@@ -812,6 +812,15 @@ class AutosyncTests(unittest.TestCase):
                 self.assertEqual(0, autosync.command_run(args))
             self.kuma_heartbeat_mock.assert_called_once_with(True, 0, [])
 
+    def test_repo_issue_keeps_operational_kuma_monitor_up_and_exposes_cause(self) -> None:
+        issues = [{"repo": "PersonalHub", "kind": "dirty_worktree", "detail": ""}]
+        with mock.patch.object(autosync, "_push_kuma_status", return_value=True) as push:
+            self.assertTrue(autosync._push_kuma_heartbeat(False, 13, issues))
+        push.assert_called_once_with(
+            "up",
+            "reconcile attivo; 1 repository da verificare: PersonalHub/dirty_worktree",
+        )
+
     def test_missing_kuma_url_is_a_heartbeat_failure(self) -> None:
         with mock.patch.dict(autosync.os.environ, {}, clear=True):
             self.assertFalse(autosync._push_kuma_status("up", "ok"))

@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 from urllib.parse import urlencode

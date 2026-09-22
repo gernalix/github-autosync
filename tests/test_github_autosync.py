@@ -170,6 +170,102 @@ class AutosyncTests(unittest.TestCase):
         self.assertEqual(2, calls["push"])
         self.assertEqual(2, calls["fetch"])
 
+    def test_roadmap_pull_bootstraps_once_from_fetched_remote_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            script = worktree / autosync.ROADMAP_PULL_SCRIPT
+            script.parent.mkdir(parents=True)
+            script.write_text("# old guard\n", encoding="utf-8")
+            python_calls: list[Path] = []
+            show_calls = 0
+
+            def fake_run(cmd: list[str], cwd: Path | None = None, timeout: int = 120):
+                nonlocal show_calls
+                self.assertEqual(worktree, cwd)
+                if cmd[0] == autosync.sys.executable:
+                    called_script = Path(cmd[1])
+                    python_calls.append(called_script)
+                    if called_script == script:
+                        return subprocess.CompletedProcess(
+                            cmd,
+                            2,
+                            stdout=json.dumps(
+                                {
+                                    "status": "BLOCKED",
+                                    "reason": "running_prompt_modified_remote:354882",
+                                }
+                            ),
+                            stderr="",
+                        )
+                    self.assertEqual("# new guard\n", called_script.read_text(encoding="utf-8"))
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout=json.dumps({"status": "PASS", "head": "new"}) + "\n",
+                        stderr="",
+                    )
+                if cmd[:2] == ["git", "show"]:
+                    show_calls += 1
+                    self.assertEqual(
+                        "origin/main:tools/roadmap_pull.py",
+                        cmd[2],
+                    )
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout="# new guard\n",
+                        stderr="",
+                    )
+                raise AssertionError(cmd)
+
+            with mock.patch.object(autosync, "run", side_effect=fake_run):
+                ok_result, payload = autosync._run_roadmap_pull(
+                    worktree,
+                    "origin",
+                    "main",
+                )
+
+            self.assertTrue(ok_result)
+            self.assertEqual("PASS", payload["status"])
+            self.assertEqual(2, len(python_calls))
+            self.assertEqual(script, python_calls[0])
+            self.assertEqual(1, show_calls)
+
+    def test_roadmap_pull_does_not_bootstrap_for_operational_content_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            script = worktree / autosync.ROADMAP_PULL_SCRIPT
+            script.parent.mkdir(parents=True)
+            script.write_text("# local guard\n", encoding="utf-8")
+
+            def fake_run(cmd: list[str], cwd: Path | None = None, timeout: int = 120):
+                if cmd[0] == autosync.sys.executable:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        2,
+                        stdout=json.dumps(
+                            {
+                                "status": "BLOCKED",
+                                "reason": "running_prompt_content_modified_remote:354882",
+                            }
+                        ),
+                        stderr="",
+                    )
+                raise AssertionError("unexpected bootstrap attempt")
+
+            with mock.patch.object(autosync, "run", side_effect=fake_run):
+                ok_result, payload = autosync._run_roadmap_pull(
+                    worktree,
+                    "origin",
+                    "main",
+                )
+
+            self.assertFalse(ok_result)
+            self.assertEqual(
+                "running_prompt_content_modified_remote:354882",
+                payload["reason"],
+            )
+
     def test_sync_changed_roadmap_dispatches_to_canonical_reconciler(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             projects = Path(tmp)

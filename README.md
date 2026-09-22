@@ -237,6 +237,8 @@ the forced `reconcile-all` path, so routine heartbeats do not require a full net
 reconciliation of every repository. Runtime credential resolution now prefers an explicit ephemeral `GITHUB_RECONCILE_PUSH_URL`, then the Fedora Secret Service/libsecret entry `application=github-autosync, credential=github-reconcile-push-url`. The existing systemd `reconcile.env` credential and `~/.config/github-autosync/reconcile.env` remain migration fallbacks so the minute timer and user lingering keep working during the live cutover. `configure_kuma.py` is the remaining migration boundary: once the live Secret Service entry is provisioned and verified for the lingering user manager, its legacy file sink and the unit `LoadCredential=` fallback can be retired.
 Every non-dry periodic run sends a Kuma heartbeat; fatal autosync errors send an
 explicit DOWN heartbeat instead of silently aging into "No heartbeat in the time window".
+Repository-level reconciliation findings keep the service heartbeat UP and are included
+in the heartbeat message as diagnostics; they do not masquerade as a service outage.
 A missing/unusable Push URL is treated as a heartbeat failure rather than success.
 The Fedora bootstrap also compares the installed user units with the repository copies;
 after a canonical checkout advances, the next reconcile repairs stale unit files and

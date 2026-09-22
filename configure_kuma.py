@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import json
-import os
-from pathlib import Path
 import secrets
 import subprocess
+from pathlib import Path
 
 
 SSH = Path("/home/daniele/projects/vm_oracle/scripts/oracle_ssh.sh")
-ENV_FILE = Path.home() / ".config/github-autosync/reconcile.env"
 KUMA_BASE = "https://kuma.danielegalati.com"
+SECRET_SERVICE_ATTRIBUTES = (
+    "application",
+    "github-autosync",
+    "credential",
+    "github-reconcile-push-url",
+)
 
 
 def configure() -> dict[str, object]:
@@ -73,12 +77,27 @@ print(json.dumps({'id':monitor_id,'token':token,'updated':bool(change)}))
     token = str(data.pop("token"))
     if not token or "/" in token:
         raise RuntimeError("invalid_kuma_token")
-    ENV_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(ENV_FILE.parent, 0o700)
-    descriptor = os.open(ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        stream.write(f"GITHUB_RECONCILE_PUSH_URL={KUMA_BASE}/api/push/{token}\n")
-    os.chmod(ENV_FILE, 0o600)
+    push_url = f"{KUMA_BASE}/api/push/{token}"
+    try:
+        secret_service = subprocess.run(
+            [
+                "secret-tool",
+                "store",
+                "--label=GitHub Autosync Kuma push URL",
+                *SECRET_SERVICE_ATTRIBUTES,
+            ],
+            input=push_url + "\n",
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("secret-tool is not installed; install Fedora libsecret") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"secret_service_store_failed:{exc.__class__.__name__}") from exc
+    if secret_service.returncode:
+        raise RuntimeError("secret_service_store_failed")
     return data
 
 

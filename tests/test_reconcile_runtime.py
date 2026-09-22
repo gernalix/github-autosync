@@ -100,7 +100,8 @@ class ReconcileRuntimeTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"GITHUB_RECONCILE_PUSH_URL": "https://kuma.invalid/api/push/private-token"}):
             with mock.patch.object(autosync, "urlopen", return_value=Response()) as send:
                 self.assertTrue(autosync._push_kuma_heartbeat(False, 2, [{"kind": "rebase_conflict"}]))
-        self.assertIn("status=down", send.call_args.args[0].full_url)
+        self.assertIn("status=up", send.call_args.args[0].full_url)
+        self.assertIn("reconcile+attivo", send.call_args.args[0].full_url)
         self.assertEqual("github-autosync/kuma-heartbeat", send.call_args.args[0].get_header("User-agent"))
         self.assertNotIn("private-token", str(autosync._human_issue("rebase_conflict")))
 

@@ -411,9 +411,10 @@ class AutosyncTests(unittest.TestCase):
         self.assertEqual(["654321"], result["failed"])
         mark.assert_called_once_with("123456")
 
-    def test_runtime_deploy_contract_covers_workflowy_and_chrome_switcher(self) -> None:
+    def test_runtime_deploy_contract_covers_managed_local_runtimes(self) -> None:
         self.assertIn("gernalix/workflowy-importer", autosync.ALLOWED_REPOSITORIES)
         self.assertIn("gernalix/chrome-codex-switcher", autosync.ALLOWED_REPOSITORIES)
+        self.assertIn("gernalix/PersonalHub", autosync.ALLOWED_REPOSITORIES)
         self.assertEqual(
             ("python3", "deploy_runtime.py"),
             autosync.RUNTIME_DEPLOYERS["gernalix/workflowy-importer"],
@@ -421,6 +422,10 @@ class AutosyncTests(unittest.TestCase):
         self.assertEqual(
             ("bash", "install.sh"),
             autosync.RUNTIME_DEPLOYERS["gernalix/chrome-codex-switcher"],
+        )
+        self.assertEqual(
+            ("python3", "deploy_runtime.py"),
+            autosync.RUNTIME_DEPLOYERS["gernalix/PersonalHub"],
         )
 
     def test_runtime_deploy_runs_once_per_checked_out_head(self) -> None:

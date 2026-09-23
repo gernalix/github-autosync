@@ -126,6 +126,7 @@ Current deploy contracts:
 
 - `gernalix/workflowy-importer` → `python3 deploy_runtime.py`; this refreshes the user-systemd units, restarts the Workflowy bridge, and immediately runs one roadmap sync.
 - `gernalix/chrome-codex-switcher` → `bash install.sh`; this refreshes the installed host/extension files and restarts the local switcher service.
+- `gernalix/PersonalHub` → `python3 deploy_runtime.py`; this installs the consolidation watcher. Once every non-`main` remote branch is already contained in `origin/main`, the watcher builds one signed/minified release APK from that exact main SHA, retries if the physical Pixel is unavailable, installs the exact artifact, verifies the installed version, and only then sends the Telegram completion notification. State is keyed by main SHA so build/install/notification phases are not repeated after success.
 
 A deploy failure is surfaced as `runtime_deploy_failed` and does not advance the deploy-state SHA. The ordinary repository fingerprint may still advance because Git synchronization itself succeeded; the next timer run therefore retries only the deployment step.
 

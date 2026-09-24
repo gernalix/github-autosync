@@ -399,7 +399,7 @@ class AutosyncTests(unittest.TestCase):
         with (
             mock.patch.object(repo_single_writer, "pending_roadmap_completions", return_value=pending),
             mock.patch.object(repo_single_writer, "mark_roadmap_completion_queued") as mark,
-            mock.patch.object(autosync, "ROADMAP_RESULT_SCRIPT", Path("/tmp/roadmap_result.py")),
+            mock.patch.object(autosync, "ROADMAP_FINISH_SCRIPT", Path("/tmp/roadmap_finish.py")),
             mock.patch.object(Path, "is_file", return_value=True),
             mock.patch.object(autosync, "run", side_effect=fake_run),
         ):

@@ -211,6 +211,25 @@ class SingleWriterTests(unittest.TestCase):
                 writer.mark_roadmap_completion_queued("654321")
                 self.assertEqual([], writer.pending_roadmap_completions())
 
+    def test_actor_only_legacy_task_is_not_a_roadmap_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            task_dir = state / "example" / "tasks"
+            task_dir.mkdir(parents=True)
+            (task_dir / "879838.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "879838",
+                        "actor": "codex",
+                        "status": "merged",
+                        "repo": "gernalix/example",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(writer, "STATE_ROOT", state):
+                self.assertEqual([], writer.pending_roadmap_completions())
+
     def test_wait_any_is_noop_for_non_git_roadmap_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(writer, "STATE_ROOT", Path(tmp) / "state"):

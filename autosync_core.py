@@ -42,6 +42,7 @@ RUNTIME_DEPLOYERS: dict[str, tuple[str, ...]] = {
 INDEPENDENT_CANONICAL_WRITER_REPOSITORIES = frozenset(
     {
         "gernalix/activity-watch-data",
+        "gernalix/codex-usage",
     }
 )
 ROADMAP_PULL_SCRIPT = Path("tools/roadmap_pull.py")

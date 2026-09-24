@@ -20,68 +20,6 @@ def ok(stdout: str = "") -> subprocess.CompletedProcess[str]:
 
 
 class AutosyncTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.real_kuma_heartbeat = autosync._push_kuma_heartbeat
-        self.kuma_heartbeat = mock.patch.object(autosync, "_push_kuma_heartbeat", return_value=True)
-        self.kuma_heartbeat_mock = self.kuma_heartbeat.start()
-        self.addCleanup(self.kuma_heartbeat.stop)
-
-    def test_secret_service_kuma_url_precedes_legacy_sources_and_preserves_explicit_env(self) -> None:
-        with (
-            mock.patch.object(
-                autosync,
-                "_secret_service_lookup",
-                return_value="https://secret.example/api/push/test",
-            ) as lookup,
-            mock.patch.dict(autosync.os.environ, {}, clear=False),
-        ):
-            autosync.os.environ.pop("GITHUB_RECONCILE_PUSH_URL", None)
-            autosync.load_runtime_credentials()
-            self.assertEqual(
-                "https://secret.example/api/push/test",
-                autosync.os.environ["GITHUB_RECONCILE_PUSH_URL"],
-            )
-            autosync.os.environ["GITHUB_RECONCILE_PUSH_URL"] = "https://explicit.test/push"
-            autosync.load_runtime_credentials()
-            self.assertEqual(
-                "https://explicit.test/push",
-                autosync.os.environ["GITHUB_RECONCILE_PUSH_URL"],
-            )
-            self.assertEqual(1, lookup.call_count)
-            autosync.os.environ.pop("GITHUB_RECONCILE_PUSH_URL", None)
-
-    def test_systemd_credential_remains_migration_fallback(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            credential = Path(tmp) / "reconcile.env"
-            credential.write_text(
-                "GITHUB_RECONCILE_PUSH_URL=https://example.test/api/push/test\n",
-                encoding="utf-8",
-            )
-            with (
-                mock.patch.object(autosync, "_secret_service_lookup", return_value=None),
-                mock.patch.dict(
-                    autosync.os.environ,
-                    {"CREDENTIALS_DIRECTORY": tmp},
-                    clear=False,
-                ),
-            ):
-                autosync.os.environ.pop("GITHUB_RECONCILE_PUSH_URL", None)
-                autosync.load_runtime_credentials()
-                self.assertEqual(
-                    "https://example.test/api/push/test",
-                    autosync.os.environ["GITHUB_RECONCILE_PUSH_URL"],
-                )
-                autosync.os.environ.pop("GITHUB_RECONCILE_PUSH_URL", None)
-
-    def test_systemd_unit_uses_loadcredential_not_environmentfile(self) -> None:
-        unit = Path(__file__).resolve().parents[1] / "systemd" / "github-autosync.service"
-        text = unit.read_text(encoding="utf-8")
-        self.assertIn(
-            "LoadCredential=reconcile.env:/home/daniele/.config/github-autosync/reconcile.env",
-            text,
-        )
-        self.assertNotIn("EnvironmentFile=", text)
-
     def test_git_failure_issue_classifies_corrupt_object_and_keeps_evidence(self) -> None:
         result = subprocess.CompletedProcess(
             [],
@@ -883,59 +821,6 @@ class AutosyncTests(unittest.TestCase):
         with mock.patch.object(autosync, "megavault_inventory", return_value=[]), mock.patch.object(autosync, "audit_inventory", return_value=([], 0)), mock.patch.object(autosync, "github_repos", side_effect=autosync.AutosyncError("github_repo_list_failed")):
             self.assertEqual(75, autosync.main(["--no-telegram", "--no-data-mirror", "run"]))
 
-
-    def test_periodic_run_sends_kuma_heartbeat(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            args = autosync.build_parser().parse_args(
-                [
-                    "--projects-dir",
-                    str(root / "projects"),
-                    "--state-dir",
-                    str(root / "state"),
-                    "--megavault",
-                    str(root / "mv"),
-                    "--no-data-mirror",
-                    "run",
-                ]
-            )
-            self.kuma_heartbeat_mock.reset_mock()
-            with (
-                mock.patch.object(autosync, "megavault_inventory", return_value=[]),
-                mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
-                mock.patch.object(autosync, "github_repos", return_value=[]),
-                mock.patch.object(autosync, "megavault_registered_remotes", return_value=set()),
-                mock.patch.object(
-                    autosync,
-                    "register_in_megavault",
-                    return_value={"validation": "not_needed", "deferred": 0},
-                ),
-                mock.patch("builtins.print"),
-            ):
-                self.assertEqual(0, autosync.command_run(args))
-            self.kuma_heartbeat_mock.assert_called_once_with(True, 0, [])
-
-    def test_repo_issue_keeps_operational_kuma_monitor_up_and_exposes_cause(self) -> None:
-        issues = [{"repo": "PersonalHub", "kind": "dirty_worktree", "detail": ""}]
-        with mock.patch.object(autosync, "_push_kuma_status", return_value=True) as push:
-            self.assertTrue(self.real_kuma_heartbeat(False, 13, issues))
-        push.assert_called_once_with(
-            "up",
-            "reconcile attivo; 1 repository da verificare: PersonalHub/dirty_worktree",
-        )
-
-    def test_missing_kuma_url_is_a_heartbeat_failure(self) -> None:
-        with mock.patch.dict(autosync.os.environ, {}, clear=True):
-            self.assertFalse(autosync._push_kuma_status("up", "ok"))
-
-    def test_fatal_error_pushes_explicit_down_heartbeat(self) -> None:
-        with (
-            mock.patch.object(autosync, "command_run", side_effect=autosync.AutosyncError("boom")),
-            mock.patch.object(autosync, "_push_kuma_status", return_value=True) as push,
-            mock.patch("builtins.print"),
-        ):
-            self.assertEqual(75, autosync.main(["run"]))
-        push.assert_called_once_with("down", "errore fatale: boom")
 
     def test_systemd_periodic_service_uses_lightweight_run(self) -> None:
         service = (

@@ -19,11 +19,6 @@ def fail(stderr: str = "") -> subprocess.CompletedProcess[str]:
 
 
 class AutosyncRegressionTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.kuma_heartbeat = mock.patch.object(autosync, "_push_kuma_heartbeat", return_value=True)
-        self.kuma_heartbeat.start()
-        self.addCleanup(self.kuma_heartbeat.stop)
-
     def test_unchanged_repo_is_locally_audited_and_ahead_can_auto_push(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

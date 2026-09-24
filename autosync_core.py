@@ -15,8 +15,6 @@ import sys
 import tempfile
 import time
 from typing import Any
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 from uuid import uuid4
 
 import repo_single_writer
@@ -84,86 +82,6 @@ ALLOWED_REPOSITORIES = frozenset(
 
 class AutosyncError(RuntimeError):
     pass
-
-
-SECRET_SERVICE_ATTRIBUTES = (
-    "application",
-    "github-autosync",
-    "credential",
-    "github-reconcile-push-url",
-)
-LEGACY_RECONCILE_ENV = Path.home() / ".config" / "github-autosync" / "reconcile.env"
-
-
-def _secret_service_lookup() -> str | None:
-    """Read the private Kuma Push URL from Secret Service/libsecret."""
-    try:
-        proc = subprocess.run(
-            ["secret-tool", "lookup", *SECRET_SERVICE_ATTRIBUTES],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=5,
-        )
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
-        return None
-    value = proc.stdout.strip()
-    return value or None
-
-
-def _load_legacy_reconcile_env(path: Path) -> str | None:
-    if not path.is_file():
-        return None
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise AutosyncError("credential_read_failed") from exc
-    value: str | None = None
-    for number, raw in enumerate(lines, 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            raise AutosyncError(f"credential_format_invalid:line={number}")
-        key, candidate = line.split("=", 1)
-        key = key.strip()
-        if key != "GITHUB_RECONCILE_PUSH_URL":
-            raise AutosyncError(f"credential_key_unexpected:{key or 'empty'}")
-        candidate = candidate.strip()
-        if not candidate:
-            raise AutosyncError("credential_value_empty:GITHUB_RECONCILE_PUSH_URL")
-        value = candidate
-    return value
-
-
-def load_runtime_credentials() -> None:
-    """Prefer explicit env, then Secret Service; keep file credentials as migration fallback."""
-    if os.environ.get("GITHUB_RECONCILE_PUSH_URL", "").strip():
-        return
-
-    secret = _secret_service_lookup()
-    if secret:
-        os.environ["GITHUB_RECONCILE_PUSH_URL"] = secret
-        return
-
-    candidates: list[Path] = []
-    directory = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
-    if directory:
-        candidates.append(Path(directory) / "reconcile.env")
-    candidates.append(LEGACY_RECONCILE_ENV)
-
-    seen: set[Path] = set()
-    for path in candidates:
-        if path in seen:
-            continue
-        seen.add(path)
-        value = _load_legacy_reconcile_env(path)
-        if value:
-            os.environ["GITHUB_RECONCILE_PUSH_URL"] = value
-            return
 
 
 class ExclusiveLock:
@@ -2190,47 +2108,11 @@ def command_run(args: argparse.Namespace) -> int:
         **counts,
         "megavault": registration,
     }
-    if not args.dry_run:
-        if not _push_kuma_heartbeat(not issues, len(repos), issues):
-            issues.append(issue(None, "heartbeat_failed"))
-            payload["issues"] = len(issues)
-            payload["status"] = _status_for(issues, work_done)
-            payload["reconcile_issues"].append({"repo": "autosync", "kind": "heartbeat_failed", "detail": ""})
     if getattr(args, "human_output", False):
         _print_human_summary(payload)
     else:
         print(json.dumps(payload, sort_keys=True))
-    heartbeat_failed = any(item.get("kind") == "heartbeat_failed" for item in issues)
-    return 2 if issues and (full_reconcile or heartbeat_failed) else 0
-
-
-def _push_kuma_status(status: str, message: str) -> bool:
-    url = os.environ.get("GITHUB_RECONCILE_PUSH_URL", "").strip()
-    if not url:
-        return False
-    separator = "&" if "?" in url else "?"
-    target = url + separator + urlencode({"status": status, "msg": message})
-    try:
-        request = Request(target, headers={"User-Agent": "github-autosync/kuma-heartbeat"}, method="GET")
-        with urlopen(request, timeout=10) as response:
-            return response.status == 200 and json.loads(response.read(4096)).get("ok") is True
-    except Exception:
-        return False
-
-
-def _push_kuma_heartbeat(healthy: bool, total: int, issues: list[dict[str, Any]]) -> bool:
-    """Report service liveness to Kuma; repository-level findings are not service outages."""
-    if healthy:
-        message = f"{total} repository sincronizzati"
-    else:
-        first = issues[0] if issues else {}
-        repo = str(first.get("repo") or "repository")
-        kind = str(first.get("kind") or "verifica")
-        suffix = f": {repo}/{kind}" if issues else ""
-        message = f"reconcile attivo; {len(issues)} repository da verificare{suffix}"
-    # Reaching this point means the reconcile process completed and can report
-    # its findings. Only fatal execution/heartbeat failures mark the service DOWN.
-    return _push_kuma_status("up", message)
+    return 2 if issues and full_reconcile else 0
 
 
 def _print_human_summary(payload: dict[str, Any]) -> None:
@@ -2284,19 +2166,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_runtime_credentials()
     args = build_parser().parse_args(argv)
     args.human_output = args.full_reconcile and not args.json
     try:
         return int(args.func(args))
     except BlockingIOError:
-        if not args.dry_run:
-            _push_kuma_status("up", "reconcile gia in corso")
         print(json.dumps({"status": "locked"}, sort_keys=True) if args.json else "GitHub reconcile: un'altra esecuzione è già in corso.")
         return 0
     except AutosyncError as exc:
-        if not args.dry_run:
-            _push_kuma_status("down", f"errore fatale: {str(exc)[:160]}")
         message = (
             json.dumps({"status": "error", "error": str(exc)}, sort_keys=True)
             if args.json

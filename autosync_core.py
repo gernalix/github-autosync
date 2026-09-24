@@ -46,7 +46,7 @@ INDEPENDENT_CANONICAL_WRITER_REPOSITORIES = frozenset(
     }
 )
 ROADMAP_PULL_SCRIPT = Path("tools/roadmap_pull.py")
-ROADMAP_RESULT_SCRIPT = Path.home() / "projects" / "codex-roadmap" / "tools" / "roadmap_result.py"
+ROADMAP_FINISH_SCRIPT = Path.home() / "projects" / "codex-roadmap" / "tools" / "roadmap_finish.py"
 ROADMAP_CANONICAL_FILES = frozenset(
     {
         "roadmap.sqlite",
@@ -1732,16 +1732,16 @@ def queue_merged_roadmap_completions() -> dict[str, Any]:
     result: dict[str, Any] = {"queued": 0, "deferred": 0, "prompt_ids": [], "failed": []}
     for task in pending:
         prompt_id = str(task.get("task_id") or "")
-        if not ROADMAP_RESULT_SCRIPT.is_file():
+        if not ROADMAP_FINISH_SCRIPT.is_file():
             result["deferred"] += 1
             result["failed"].append(prompt_id)
             continue
         proc = run(
             [
                 "python3",
-                str(ROADMAP_RESULT_SCRIPT),
+                str(ROADMAP_FINISH_SCRIPT),
                 "--repo",
-                str(ROADMAP_RESULT_SCRIPT.parents[1]),
+                str(ROADMAP_FINISH_SCRIPT.parents[1]),
                 "--prompt-id",
                 prompt_id,
                 "--result",

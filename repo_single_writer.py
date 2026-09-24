@@ -1020,10 +1020,11 @@ def pending_roadmap_completions() -> list[dict[str, Any]]:
         task_id = str(payload.get("task_id") or "")
         if payload.get("status") != "merged" or not re.fullmatch(r"\d{6}", task_id):
             continue
+        # Only tasks explicitly created through roadmap_start are allowed to
+        # drive roadmap completion. Actor=codex is not sufficient: ordinary or
+        # historical Codex task records must never synthesize terminal roadmap
+        # requests for unrelated six-digit IDs.
         is_roadmap = str(payload.get("roadmap_prompt_id") or "") == task_id
-        # Backward compatibility for roadmap tasks created before roadmap_prompt_id existed.
-        if not is_roadmap:
-            is_roadmap = str(payload.get("actor") or "") == "codex"
         if not is_roadmap or payload.get("roadmap_completion_queued_at"):
             continue
         pending.append(payload)

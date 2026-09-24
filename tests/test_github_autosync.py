@@ -367,20 +367,21 @@ class AutosyncTests(unittest.TestCase):
             self.assertTrue((repo_path / "remote.txt").is_file())
 
     def test_independent_canonical_writer_repo_is_not_reconciled(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = {
-                "owner": "gernalix",
-                "name": "activity-watch-data",
-                "url": "https://github.com/gernalix/activity-watch-data.git",
-                "default_branch": "main",
-                "pushed_at": "A",
-                "archived": "0",
-            }
-            result, problem = autosync.sync_changed_repo(repo, root, dry_run=False)
-            self.assertEqual("external-writer", result)
-            self.assertIsNone(problem)
-            self.assertFalse((root / "activity-watch-data").exists())
+        for name in ("activity-watch-data", "codex-usage"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                repo = {
+                    "owner": "gernalix",
+                    "name": name,
+                    "url": f"https://github.com/gernalix/{name}.git",
+                    "default_branch": "main",
+                    "pushed_at": "A",
+                    "archived": "0",
+                }
+                result, problem = autosync.sync_changed_repo(repo, root, dry_run=False)
+                self.assertEqual("external-writer", result)
+                self.assertIsNone(problem)
+                self.assertFalse((root / name).exists())
 
     def test_autosync_does_not_own_repository_integration_queue(self) -> None:
         source = Path(autosync.__file__).read_text(encoding="utf-8")

@@ -68,7 +68,7 @@ Multiple ChatGPT/Codex sessions can therefore work on the same repository concur
 
 The canonical branch is guarded locally: direct commits/merges to it are rejected. A local fast-forward to the exact fetched remote canonical tip is allowed because it is synchronization, not a new canonical write. `codex-roadmap` keeps its existing dedicated writer/guard instead of this generic path.
 
-Repositories whose canonical branch is intentionally owned by a dedicated local service are excluded from the generic writer. Currently `gernalix/activity-watch-data` is owned by `activity-watch-uploader`: `github-reconcile` removes only its own generic reference hook (restoring any pre-existing hook) and leaves that checkout untouched. This prevents the autosync writer from racing or blocking the service that is authoritative for the data repository.
+Repositories whose canonical branch is intentionally owned by a dedicated local service are excluded from the generic writer. Currently `gernalix/activity-watch-data` is owned by `activity-watch-uploader`, and `gernalix/codex-usage` is owned by the Fedora `codex-usage-publisher`: `github-reconcile` removes only its own generic reference hook (restoring any pre-existing hook) and leaves those checkouts untouched. This prevents the autosync writer from racing or blocking the service that is authoritative for each data repository.
 
 Optional forms:
 

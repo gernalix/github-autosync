@@ -689,7 +689,7 @@ class AutosyncTests(unittest.TestCase):
                 self.assertEqual(1, sync.call_count)
                 self.assertEqual("codex-roadmap", sync.call_args.args[0]["name"])
 
-    def test_unchanged_remote_with_dirty_local_worktree_is_reconciled(self) -> None:
+    def test_independent_writer_repo_is_not_reconciled_by_generic_autosync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             projects = root / "projects"
@@ -705,15 +705,15 @@ class AutosyncTests(unittest.TestCase):
                 mock.patch.object(autosync, "megavault_inventory", return_value=[]),
                 mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
                 mock.patch.object(autosync, "github_repos", return_value=[repo]),
-                mock.patch.object(autosync, "sync_changed_repo", return_value=("pushed", None)) as sync,
+                mock.patch.object(autosync, "sync_changed_repo") as sync,
                 mock.patch.object(autosync, "audit_worktree") as audit,
                 mock.patch.object(autosync, "megavault_registered_remotes", return_value={autosync.normalize_remote(repo["url"])}),
                 mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed", "deferred": 0}),
             ):
                 self.assertEqual(0, autosync.command_run(args))
-            sync.assert_called_once()
+            sync.assert_not_called()
             audit.assert_not_called()
-            self.assertTrue(sync.call_args.kwargs["auto_commit_dirty"])
+
 
     def test_reconcile_all_includes_non_allowlisted_repo_already_present_locally(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

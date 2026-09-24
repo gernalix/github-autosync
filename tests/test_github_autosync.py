@@ -20,6 +20,11 @@ def ok(stdout: str = "") -> subprocess.CompletedProcess[str]:
 
 
 class AutosyncTests(unittest.TestCase):
+    def setUp(self) -> None:
+        bootstrap = mock.patch.object(autosync, "bootstrap_repo_integrator_runtime")
+        bootstrap.start()
+        self.addCleanup(bootstrap.stop)
+
     def test_git_failure_issue_classifies_corrupt_object_and_keeps_evidence(self) -> None:
         result = subprocess.CompletedProcess(
             [],

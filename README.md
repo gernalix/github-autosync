@@ -80,6 +80,8 @@ Two periodic timers have separate responsibilities: `github-autosync.timer` sync
 
 ### Roadmap cockpit contract
 
+Only task records carrying an explicit `roadmap_prompt_id` created by `roadmap_start.py` may feed a completion back to `codex-roadmap`. A historical `actor=codex` record is not enough. After merge, `repo-integrator` calls the canonical `roadmap_finish.py --result PASS`; it never writes roadmap state itself.
+
 `github-autosync` is also the authoritative local source for **repository integration state** shown by the Workflowy roadmap cockpit. It does not decide the canonical roadmap status; it reports the real Git pipeline for each roadmap `PROMPT_ID`.
 
 Use one bulk call:

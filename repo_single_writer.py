@@ -714,10 +714,50 @@ def finish_task(repo: Path, task_id: str) -> dict[str, Any]:
     return payload
 
 
+def _check_rollup_activity_key(item: dict[str, Any]) -> tuple[str, str] | None:
+    name = str(item.get("name") or item.get("context") or "").strip()
+    if not name:
+        return None
+    workflow = str(item.get("workflowName") or item.get("workflow_name") or "").strip()
+    return workflow, name
+
+
+def _check_rollup_activity_at(item: dict[str, Any]) -> str | None:
+    completed = str(item.get("completedAt") or item.get("completed_at") or "").strip()
+    if completed and not completed.startswith("0001-"):
+        return completed
+    started = str(item.get("startedAt") or item.get("started_at") or "").strip()
+    if started and not started.startswith("0001-"):
+        return started
+    created = str(item.get("createdAt") or item.get("created_at") or "").strip()
+    if created and not created.startswith("0001-"):
+        return created
+    return None
+
+
+def _latest_check_rollup(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    latest: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
+    passthrough: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = _check_rollup_activity_key(item)
+        activity_at = _check_rollup_activity_at(item)
+        if key is None or activity_at is None:
+            passthrough.append(item)
+            continue
+        current = latest.get(key)
+        if current is None or activity_at > current[0]:
+            latest[key] = (activity_at, item)
+    return passthrough + [row for _, row in latest.values()]
+
+
 def _check_rollup_allows_merge(items: Any) -> tuple[bool, str]:
     if not items:
         return True, "no-checks"
-    for item in items:
+    for item in _latest_check_rollup(items):
         if not isinstance(item, dict):
             continue
         status = str(item.get("status") or "").upper()

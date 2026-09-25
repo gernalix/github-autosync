@@ -387,6 +387,48 @@ class SingleWriterTests(unittest.TestCase):
         self.assertEqual("merged", result["status"])
         self.assertTrue(any(cmd[:2] == ["gh", "api"] for cmd in calls))
 
+    def test_check_rollup_uses_latest_duplicate_run(self) -> None:
+        items = [
+            {
+                "name": "instrumentation",
+                "workflowName": "Android instrumentation CI",
+                "status": "COMPLETED",
+                "conclusion": "CANCELLED",
+                "startedAt": "2026-09-25T18:09:43Z",
+                "completedAt": "2026-09-25T18:09:44Z",
+            },
+            {
+                "name": "instrumentation",
+                "workflowName": "Android instrumentation CI",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "startedAt": "2026-09-25T18:09:51Z",
+                "completedAt": "2026-09-25T18:26:28Z",
+            },
+        ]
+        self.assertEqual((True, "checks-pass"), writer._check_rollup_allows_merge(items))
+
+    def test_check_rollup_latest_pending_still_blocks(self) -> None:
+        items = [
+            {
+                "name": "unit",
+                "workflowName": "Android unit CI",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "startedAt": "2026-09-25T18:00:00Z",
+                "completedAt": "2026-09-25T18:05:00Z",
+            },
+            {
+                "name": "unit",
+                "workflowName": "Android unit CI",
+                "status": "IN_PROGRESS",
+                "conclusion": "",
+                "startedAt": "2026-09-25T18:10:00Z",
+                "completedAt": "0001-01-01T00:00:00Z",
+            },
+        ]
+        self.assertEqual((False, "checks-pending"), writer._check_rollup_allows_merge(items))
+
     def test_failed_or_pending_checks_are_not_merged(self) -> None:
         def fake_run(cmd: list[str], cwd: Path | None = None, timeout: int = 300):
             if cmd[:3] == ["gh", "pr", "view"]:

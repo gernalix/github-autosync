@@ -1,0 +1,100 @@
+schema_version: c2.project-capsule.v1
+identity:
+  project_id: 92
+  slug: github-autosync
+  repository_id: R0092
+scope:
+  purpose: Synchronize and integrate an explicit allowlist of gernalix GitHub repositories from Fedora.
+  boundaries:
+    - MegaVault owns project and repository identity and registry facts.
+    - codex-roadmap owns C2 work item lifecycle and its guarded roadmap state.
+    - This repository does not manage repositories outside ALLOWED_REPOSITORIES.
+repository:
+  canonical_workdir: /home/daniele/projects/github-autosync
+  branch_policy: main is canonical and protected; make changes in isolated task/* worktrees and integrate through repo-integrator.
+architecture:
+  summary: github_autosync.py orchestrates allowlisted synchronization through autosync_core.py; repo_single_writer.py creates isolated task branches and queues integration PRs; repo_integrator.py serializes integration; runtime_watchdog.py recovers the local service installation.
+  entrypoints:
+    - github_autosync.py
+    - repo_single_writer.py
+    - repo_integrator.py
+    - runtime_watchdog.py
+  important_paths:
+    - systemd
+    - tests
+    - README.md
+dependencies:
+  - name: MegaVault
+    project_id: 23
+    purpose: Canonical project and repository registry and external runtime state inventory.
+  - name: codex-roadmap
+    project_id: 51
+    purpose: C2 lifecycle and guarded roadmap integration.
+data:
+  schema: No application database lives in this repository. Runtime state is external JSON; the mutation activity ledger is external JSONL under /home/daniele/.local/state/codex-github-autosync.
+  migrations: Not applicable; there is no repository-local database schema.
+runtime:
+  services:
+    - github-autosync.service
+    - repo-integrator.service
+    - github-autosync-watchdog.service
+  timers:
+    - github-autosync.timer
+    - repo-integrator.timer
+    - github-autosync-watchdog.timer
+  containers: []
+devices: []
+commands:
+  setup: {not_applicable: The repository has no standalone build or package setup; host Python and GitHub CLI tools are provisioned separately.}
+  build: {not_applicable: Python scripts have no compiled build artifact.}
+  test_targeted: {argv: [python3, -B, -m, unittest, discover, -s, tests, -p, test_github_autosync_regressions.py, -v], cwd: .}
+  test_full: {argv: [python3, -B, -m, unittest, discover, -s, tests, -v], cwd: .}
+  lint: {not_applicable: No separate lint configuration is defined in this repository.}
+  deploy_install: {argv: [python3, install_systemd.py], cwd: .}
+  smoke: {argv: [python3, github_autosync.py, --dry-run, run], cwd: .}
+  verify:
+    fast: {argv: [python3, /home/daniele/projects/codex-roadmap/tools/project_capsule.py, --repo, ., --mode, FAST], cwd: .}
+    full: {argv: [python3, /home/daniele/projects/codex-roadmap/tools/project_capsule.py, --repo, ., --mode, FULL], cwd: .}
+safety:
+  invariants:
+    - Only repositories in ALLOWED_REPOSITORIES are synchronized by the service.
+    - Canonical branches remain protected; repo-integrator serializes final repository integration.
+    - codex-roadmap writes use its dedicated guarded single-writer path.
+    - Git recovery preserves dirty or divergent user work.
+  risky_operations:
+    - install_systemd.py changes installed user commands and systemd units; use only for an explicitly requested install or deployment.
+    - Forced github-reconcile performs network reconciliation and may push clean ahead-only branches; keep it separate from dry-run checks.
+    - Runtime state and activity logs live outside Git and must not be reset or replaced during repository work.
+  recovery:
+    - Inspect the installed units and journal, then use runtime_watchdog.py or the documented watchdog timer to recover a clean fast-forwardable installation.
+    - Keep task worktrees and checkpoints when integration is deferred; never resolve divergence by resetting or force-pushing.
+acceptance:
+  - FAST and FULL capsule checks pass with MegaVault identity verified.
+  - Targeted regression tests pass before the capsule is integrated.
+  - Repository integration and the resulting canonical head are read back before reporting completion.
+references:
+  megavault: /home/daniele/MegaVault/megavault.sqlite
+  c2: /home/daniele/projects/codex-roadmap/roadmap.sqlite
+freshness:
+  reviewed_commit: d01a4e131d4d240d61893f93780c916232151747
+  watch_paths:
+    - README.md
+    - github_autosync.py
+    - autosync_core.py
+    - repo_single_writer.py
+    - repo_integrator.py
+    - runtime_watchdog.py
+    - install_systemd.py
+    - systemd
+    - tests
+artifacts:
+  agents: AGENTS.md
+  repository_guide: README.md
+validation_hooks:
+  - id: full-unit-tests
+    argv: [python3, -B, -m, unittest, discover, -s, tests, -v]
+    cwd: .
+    safe: true
+change_verification:
+  - paths: [project-capsule.yaml, AGENTS.md]
+    commands: [test_targeted]

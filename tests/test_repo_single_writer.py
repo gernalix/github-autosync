@@ -137,6 +137,26 @@ class SingleWriterTests(unittest.TestCase):
                 again = writer.start_task(repo, "123456", "codex")
                 self.assertEqual(payload["worktree"], again["worktree"])
 
+    def test_start_task_does_not_reinstall_guard_for_independent_writer_repositories(self) -> None:
+        for slug in sorted(writer.INDEPENDENT_CANONICAL_WRITER_REPOSITORIES):
+            with self.subTest(repo=slug), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                repo_root = root / "git"
+                repo_root.mkdir()
+                repo, _ = self.make_repo(repo_root)
+                hooks = writer._effective_hooks_dir(repo)
+                hook = hooks / "reference-transaction"
+                self.assertFalse(hook.exists())
+                with (
+                    mock.patch.object(writer, "_repo_slug", return_value=slug),
+                    mock.patch.object(writer, "STATE_ROOT", root / "state"),
+                    mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees"),
+                ):
+                    payload = writer.start_task(repo, f"task-{repo.name}", "codex")
+                self.assertTrue(Path(payload["worktree"]).is_dir())
+                self.assertEqual("task-" + repo.name, payload["task_id"])
+                self.assertFalse(hook.exists())
+
     def test_task_coordination_does_not_use_a_repository_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

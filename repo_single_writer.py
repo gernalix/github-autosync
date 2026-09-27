@@ -26,6 +26,14 @@ PR_PREFIX = "[single-writer]"
 STATE_ROOT = Path.home() / ".local/state/codex-github-autosync/single-writer"
 WORKTREE_ROOT = Path.home() / ".local/share/codex-github-autosync/worktrees"
 ROADMAP_REPOSITORY = "gernalix/codex-roadmap"
+# These canonical branches are advanced by dedicated local writers. The
+# generic repository hook must not intercept their Git ref transactions.
+INDEPENDENT_CANONICAL_WRITER_REPOSITORIES = frozenset(
+    {
+        "gernalix/activity-watch-data",
+        "gernalix/codex-usage",
+    }
+)
 HOOK_MARKER = "github-autosync-single-writer-v1"
 
 
@@ -234,6 +242,8 @@ def ensure_guard(repo: Path, canonical_branch: str | None = None) -> dict[str, A
     slug = _repo_slug(repo)
     if slug.lower() == ROADMAP_REPOSITORY.lower():
         return {"repo": slug, "status": "delegated-roadmap"}
+    if slug.lower() in INDEPENDENT_CANONICAL_WRITER_REPOSITORIES:
+        return {"repo": slug, "status": "delegated-independent-writer"}
     branch = canonical_branch or _canonical_branch(repo)
     hooks = _effective_hooks_dir(repo)
     hooks.mkdir(parents=True, exist_ok=True)

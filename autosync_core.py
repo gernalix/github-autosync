@@ -38,11 +38,8 @@ RUNTIME_DEPLOYERS: dict[str, tuple[str, ...]] = {
     "gernalix/chrome-codex-switcher": ("bash", "install.sh"),
     "gernalix/PersonalHub": ("python3", "deploy_runtime.py"),
 }
-INDEPENDENT_CANONICAL_WRITER_REPOSITORIES = frozenset(
-    {
-        "gernalix/activity-watch-data",
-        "gernalix/codex-usage",
-    }
+INDEPENDENT_CANONICAL_WRITER_REPOSITORIES = (
+    repo_single_writer.INDEPENDENT_CANONICAL_WRITER_REPOSITORIES
 )
 ROADMAP_PULL_SCRIPT = Path("tools/roadmap_pull.py")
 ROADMAP_FINISH_SCRIPT = Path.home() / "projects" / "codex-roadmap" / "tools" / "roadmap_finish.py"

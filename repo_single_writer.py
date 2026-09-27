@@ -497,6 +497,8 @@ def task_status_any(task_id: str) -> dict[str, Any]:
         "merged_at": payload.get("merged_at"),
         "merge_sha": payload.get("merge_sha"),
         "roadmap_completion_queued_at": payload.get("roadmap_completion_queued_at"),
+        "roadmap_completion_deferred": bool(payload.get("roadmap_completion_deferred", False)),
+        "roadmap_completion_defer_reason": payload.get("roadmap_completion_defer_reason"),
     }
 
 
@@ -1065,10 +1067,43 @@ def pending_roadmap_completions() -> list[dict[str, Any]]:
         # historical Codex task records must never synthesize terminal roadmap
         # requests for unrelated six-digit IDs.
         is_roadmap = str(payload.get("roadmap_prompt_id") or "") == task_id
-        if not is_roadmap or payload.get("roadmap_completion_queued_at"):
+        if not is_roadmap or payload.get("roadmap_completion_queued_at") or payload.get("roadmap_completion_deferred"):
             continue
         pending.append(payload)
     return pending
+
+
+def defer_roadmap_completion(task_id: str, reason: str | None = None) -> dict[str, Any]:
+    found = _find_task_record_any(task_id)
+    if found is None:
+        raise RuntimeError(f"unknown task: {task_id}")
+    path, payload = found
+    if str(payload.get("roadmap_prompt_id") or "") != str(payload.get("task_id") or ""):
+        raise RuntimeError(f"task is not roadmap-backed: {task_id}")
+    normalized_reason = reason.strip() if reason and reason.strip() else None
+    if payload.get("roadmap_completion_deferred"):
+        if payload.get("roadmap_completion_defer_reason") != normalized_reason:
+            raise RuntimeError(f"roadmap completion already deferred with a different reason: {task_id}")
+        return payload
+    if payload.get("roadmap_completion_queued_at"):
+        raise RuntimeError(f"roadmap completion already queued: {task_id}")
+    payload["roadmap_completion_deferred"] = True
+    payload["roadmap_completion_defer_reason"] = normalized_reason
+    _atomic_json(path, payload)
+    return payload
+
+
+def release_roadmap_completion(task_id: str) -> dict[str, Any]:
+    found = _find_task_record_any(task_id)
+    if found is None:
+        raise RuntimeError(f"unknown task: {task_id}")
+    path, payload = found
+    if str(payload.get("roadmap_prompt_id") or "") != str(payload.get("task_id") or ""):
+        raise RuntimeError(f"task is not roadmap-backed: {task_id}")
+    payload.pop("roadmap_completion_deferred", None)
+    payload.pop("roadmap_completion_defer_reason", None)
+    _atomic_json(path, payload)
+    return payload
 
 
 def mark_roadmap_completion_queued(task_id: str) -> dict[str, Any]:
@@ -1120,6 +1155,11 @@ def build_parser() -> argparse.ArgumentParser:
     finish_any.add_argument("--task-id", required=True)
     status_any = sub.add_parser("status-any")
     status_any.add_argument("--task-id", required=True)
+    defer_completion = sub.add_parser("defer-roadmap-completion")
+    defer_completion.add_argument("--task-id", required=True)
+    defer_completion.add_argument("--reason")
+    release_completion = sub.add_parser("release-roadmap-completion")
+    release_completion.add_argument("--task-id", required=True)
     status_all = sub.add_parser("status-all")
     status_all.add_argument("--roadmap-only", action="store_true")
     heartbeat = sub.add_parser("heartbeat")
@@ -1162,6 +1202,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, sort_keys=True))
         elif args.command == "status-any":
             print(json.dumps(task_status_any(args.task_id), sort_keys=True))
+        elif args.command == "defer-roadmap-completion":
+            print(json.dumps(defer_roadmap_completion(args.task_id, args.reason), sort_keys=True))
+        elif args.command == "release-roadmap-completion":
+            print(json.dumps(release_roadmap_completion(args.task_id), sort_keys=True))
         elif args.command == "status-all":
             print(json.dumps({"tasks": all_task_statuses(roadmap_only=args.roadmap_only)}, sort_keys=True))
         elif args.command == "heartbeat":

@@ -208,6 +208,19 @@ class SingleWriterTests(unittest.TestCase):
                 writer._atomic_json(record_path, merged)
                 pending = writer.pending_roadmap_completions()
                 self.assertEqual(["654321"], [item["task_id"] for item in pending])
+                deferred = writer.defer_roadmap_completion("654321", "post-merge acceptance")
+                self.assertTrue(deferred["roadmap_completion_deferred"])
+                self.assertEqual("post-merge acceptance", deferred["roadmap_completion_defer_reason"])
+                self.assertEqual([], writer.pending_roadmap_completions())
+                self.assertTrue(writer.defer_roadmap_completion("654321", "post-merge acceptance")["roadmap_completion_deferred"])
+                status = writer.task_status_any("654321")
+                self.assertTrue(status["roadmap_completion_deferred"])
+                self.assertEqual("post-merge acceptance", status["roadmap_completion_defer_reason"])
+                released = writer.release_roadmap_completion("654321")
+                self.assertNotIn("roadmap_completion_deferred", released)
+                self.assertNotIn("roadmap_completion_queued_at", released)
+                self.assertEqual(["654321"], [item["task_id"] for item in writer.pending_roadmap_completions()])
+                writer.release_roadmap_completion("654321")
                 writer.mark_roadmap_completion_queued("654321")
                 self.assertEqual([], writer.pending_roadmap_completions())
 
@@ -229,6 +242,8 @@ class SingleWriterTests(unittest.TestCase):
             )
             with mock.patch.object(writer, "STATE_ROOT", state):
                 self.assertEqual([], writer.pending_roadmap_completions())
+                with self.assertRaisesRegex(RuntimeError, "not roadmap-backed"):
+                    writer.defer_roadmap_completion("879838")
 
     def test_wait_any_is_noop_for_non_git_roadmap_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

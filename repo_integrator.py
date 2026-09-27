@@ -34,7 +34,7 @@ def run_once(owner: str) -> dict[str, Any]:
         for i in queue.get("results", [])
         if i.get("status") == "deferred" and str(i.get("reason") or "deferred") not in transient
     ]
-    return {"status": "blocked" if hard else "ok", "queue": queue, "roadmap_finalization": roadmap, "hard_blockers": hard}
+    return {"status": "partial" if hard else "ok", "queue": queue, "roadmap_finalization": roadmap, "hard_blockers": hard}
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Integrate queued task PRs FIFO per repository.")

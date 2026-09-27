@@ -55,6 +55,7 @@ class AutosyncRegressionTests(unittest.TestCase):
                 ]
             )
             with (
+                mock.patch.object(autosync, "bootstrap_repo_integrator_runtime"),
                 mock.patch.object(autosync, "megavault_inventory", return_value=[inventory]),
                 mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
                 mock.patch.object(autosync, "github_repos", return_value=[repo]),
@@ -120,6 +121,7 @@ class AutosyncRegressionTests(unittest.TestCase):
             )
             dirty = autosync.issue(inventory, "dirty_worktree", "ahead=0,behind=0")
             with (
+                mock.patch.object(autosync, "bootstrap_repo_integrator_runtime"),
                 mock.patch.object(autosync, "megavault_inventory", return_value=[inventory]),
                 mock.patch.object(autosync, "audit_inventory", return_value=([], 0)),
                 mock.patch.object(autosync, "github_repos", return_value=[repo]),

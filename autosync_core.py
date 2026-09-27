@@ -32,6 +32,7 @@ ACTIVITY_SCHEMA_VERSION = 1
 REPO_STATE_FILE = "repo-state.json"
 RUNTIME_DEPLOY_STATE_FILE = "runtime-deploy-state.json"
 ROADMAP_REPOSITORY = "gernalix/codex-roadmap"
+MEGAVAULT_REPOSITORY = "gernalix/MegaVault"
 RUNTIME_DEPLOYERS: dict[str, tuple[str, ...]] = {
     "gernalix/workflowy-importer": ("python3", "deploy_runtime.py"),
     "gernalix/chrome-codex-switcher": ("bash", "install.sh"),
@@ -1401,6 +1402,10 @@ def sync_changed_repo(
     inventory_entry: dict[str, Any] | None = None,
     auto_commit_dirty: bool = False,
 ) -> tuple[str, dict[str, Any] | None]:
+    if allowed_repo_key(str(repo.get("owner") or DEFAULT_OWNER), repo["name"]).lower() == MEGAVAULT_REPOSITORY.lower():
+        # MegaVault SQLite is canonical data. Dirty state must be reconciled by
+        # its explicit writer/recovery workflow, never converted into a commit.
+        auto_commit_dirty = False
     worktree = Path(str(inventory_entry["worktree"])) if inventory_entry else projects_dir / repo["name"]
     entry: dict[str, Any] = {
         "project_id": None,

@@ -274,6 +274,32 @@ class AutosyncTests(unittest.TestCase):
             self.assertIsNone(problem)
             self.assertEqual("", git(["status", "--porcelain"], repo_path).stdout.strip())
 
+    def test_megavault_dirty_state_is_never_auto_committed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_path, bare = self.make_repo_pair(root / "pair")
+            before = git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+            (repo_path / "megavault.sqlite").write_text("preserve\n", encoding="utf-8")
+            repo = {
+                "owner": "gernalix",
+                "name": "MegaVault",
+                "url": str(bare),
+                "default_branch": "main",
+                "pushed_at": "A",
+                "archived": "0",
+            }
+            result, problem = autosync.sync_changed_repo(
+                repo,
+                root,
+                dry_run=False,
+                inventory_entry=self.entry(repo_path, bare),
+                auto_commit_dirty=True,
+            )
+            self.assertEqual("deferred", result)
+            self.assertEqual("dirty_worktree", problem["kind"])
+            self.assertEqual(before, git(["rev-parse", "HEAD"], repo_path).stdout.strip())
+            self.assertEqual("preserve\n", (repo_path / "megavault.sqlite").read_text(encoding="utf-8"))
+
     def test_reconcile_all_rebases_generic_divergence_then_pushes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -333,6 +333,8 @@ def start_task(repo: Path, task_id: str, actor: str = "agent") -> dict[str, Any]
     record_path = _task_record(repo, task_id)
     if record_path.exists():
         existing = json.loads(record_path.read_text(encoding="utf-8"))
+        if existing.get("status") == "superseded":
+            raise RuntimeError(f"task was retired as superseded: {task_id}")
         if existing.get("status") in {"active", "queued", "ready"} and Path(existing["worktree"]).exists():
             if existing.get("status") == "active":
                 existing["heartbeat_at"] = _iso_now()
@@ -395,24 +397,69 @@ def heartbeat_task(repo: Path, task_id: str) -> dict[str, Any]:
     return payload
 
 
+def retire_superseded_task(repo: Path, task_id: str, terminal_evidence: str) -> dict[str, Any]:
+    """Retire an obsolete task record without publishing or deleting its branch."""
+    if not terminal_evidence.strip():
+        raise RuntimeError("canonical terminal evidence required")
+    repo = repo.expanduser().resolve()
+    record_path = _task_record(repo, task_id)
+    if not record_path.is_file():
+        raise RuntimeError(f"unknown task: {task_id}")
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    if payload.get("status") == "superseded":
+        return payload
+    if payload.get("status") not in {"active", "blocked"} or payload.get("pr_number"):
+        raise RuntimeError("task has integration state; cannot retire without review")
+    if payload.get("repo") != _repo_slug(repo):
+        raise RuntimeError("task repository identity mismatch")
+    worktree = Path(str(payload.get("worktree") or ""))
+    if not worktree.is_dir() or _ok(worktree, "branch", "--show-current") != payload.get("branch"):
+        raise RuntimeError("task worktree or branch mismatch")
+    if _ok(worktree, "status", "--porcelain"):
+        raise RuntimeError("task worktree is dirty")
+    canonical = str(payload["canonical_branch"])
+    fetched = _git(worktree, "fetch", "--no-tags", "origin",
+                   f"+refs/heads/{canonical}:refs/remotes/origin/{canonical}", timeout=180)
+    if fetched.returncode:
+        raise RuntimeError(fetched.stderr.strip() or "canonical fetch failed")
+    if _ok(worktree, "rev-list", "--count", f"origin/{canonical}..HEAD") != "0":
+        raise RuntimeError("task branch has unintegrated commits")
+    prs = run(["gh", "pr", "list", "--repo", payload["repo"], "--head",
+               str(payload["branch"]), "--state", "all", "--json", "number"], timeout=120)
+    if prs.returncode:
+        raise RuntimeError(prs.stderr.strip() or "task PR lookup failed")
+    if json.loads(prs.stdout):
+        raise RuntimeError("task branch has a PR; review integration state")
+    payload.update({"status": "superseded", "retired_at": _iso_now(),
+                    "terminal_evidence": terminal_evidence.strip(), "lease_expires_at": None})
+    _atomic_json(record_path, payload)
+    return payload
+
+
 def _task_dir_for_slug(slug: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", slug)
     return STATE_ROOT / safe / "tasks"
 
 
-def _find_task_record_any(task_id: str) -> tuple[Path, dict[str, Any]] | None:
+def _find_task_record_any(task_id: str, repo: str | None = None) -> tuple[Path, dict[str, Any]] | None:
     safe_id = _safe_task_id(task_id)
     if not STATE_ROOT.is_dir():
         return None
     matches = sorted(STATE_ROOT.glob(f"*/tasks/{safe_id}.json"))
+    valid = []
     for path in matches:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if str(payload.get("task_id") or "") == safe_id:
-            return path, payload
-    return None
+        if str(payload.get("task_id") or "") != safe_id:
+            continue
+        if repo is not None and str(payload.get("repo") or "").lower() != repo.lower():
+            continue
+        valid.append((path, payload))
+    if len(valid) > 1:
+        raise RuntimeError(f"ambiguous task id: {safe_id}; specify repository")
+    return valid[0] if valid else None
 
 
 def _task_by_branch(repo_slug: str, branch: str) -> tuple[Path, dict[str, Any]] | None:
@@ -484,8 +531,8 @@ def _pipeline_state(payload: dict[str, Any]) -> str:
     return status or "unknown"
 
 
-def task_status_any(task_id: str) -> dict[str, Any]:
-    found = _find_task_record_any(task_id)
+def task_status_any(task_id: str, repo: str | None = None) -> dict[str, Any]:
+    found = _find_task_record_any(task_id, repo)
     if found is None:
         return {"task_id": _safe_task_id(task_id), "status": "no-task-record", "pipeline_state": "unknown"}
     _, payload = found
@@ -529,7 +576,7 @@ def all_task_statuses(*, roadmap_only: bool = False) -> list[dict[str, Any]]:
             or (re.fullmatch(r"\d{6}", task_id) and str(payload.get("actor") or "") == "codex")
         ):
             continue
-        items.append(task_status_any(task_id))
+        items.append(task_status_any(task_id, repo=str(payload.get("repo") or "")))
     return sorted(items, key=lambda item: str(item.get("task_id") or ""))
 
 
@@ -1126,16 +1173,16 @@ def mark_roadmap_completion_queued(task_id: str) -> dict[str, Any]:
     return payload
 
 
-def finish_task_any(task_id: str) -> dict[str, Any]:
-    found = _find_task_record_any(task_id)
+def finish_task_any(task_id: str, repo: str | None = None) -> dict[str, Any]:
+    found = _find_task_record_any(task_id, repo)
     if found is None:
         return {"status": "no-task-record", "task_id": _safe_task_id(task_id)}
     _, payload = found
     return finish_task(Path(str(payload["repo_path"])), task_id)
 
 
-def wait_task_any(task_id: str, *, timeout: float = 900.0) -> dict[str, Any]:
-    found = _find_task_record_any(task_id)
+def wait_task_any(task_id: str, *, timeout: float = 900.0, repo: str | None = None) -> dict[str, Any]:
+    found = _find_task_record_any(task_id, repo)
     if found is None:
         return {"status": "no-task-record", "task_id": _safe_task_id(task_id)}
     _, payload = found
@@ -1163,8 +1210,14 @@ def build_parser() -> argparse.ArgumentParser:
     finish.add_argument("--task-id", required=True)
     finish_any = sub.add_parser("finish-any")
     finish_any.add_argument("--task-id", required=True)
+    finish_any.add_argument("--repo")
     status_any = sub.add_parser("status-any")
     status_any.add_argument("--task-id", required=True)
+    status_any.add_argument("--repo")
+    retire = sub.add_parser("retire-superseded")
+    retire.add_argument("--repo", type=Path, required=True)
+    retire.add_argument("--task-id", required=True)
+    retire.add_argument("--terminal-evidence", required=True)
     defer_completion = sub.add_parser("defer-roadmap-completion")
     defer_completion.add_argument("--task-id", required=True)
     defer_completion.add_argument("--reason")
@@ -1181,6 +1234,7 @@ def build_parser() -> argparse.ArgumentParser:
     wait.add_argument("--timeout", type=float, default=900.0)
     wait_any = sub.add_parser("wait-any")
     wait_any.add_argument("--task-id", required=True)
+    wait_any.add_argument("--repo")
     wait_any.add_argument("--timeout", type=float, default=900.0)
     guard = sub.add_parser("guard")
     guard.add_argument("--repo", type=Path, required=True)
@@ -1208,10 +1262,13 @@ def main(argv: list[str] | None = None) -> int:
             payload = finish_task(args.repo, args.task_id)
             print(payload.get("pr_url") or f"PR #{payload.get('pr_number')}")
         elif args.command == "finish-any":
-            payload = finish_task_any(args.task_id)
+            payload = finish_task_any(args.task_id, args.repo)
             print(json.dumps(payload, sort_keys=True))
         elif args.command == "status-any":
-            print(json.dumps(task_status_any(args.task_id), sort_keys=True))
+            print(json.dumps(task_status_any(args.task_id, args.repo), sort_keys=True))
+        elif args.command == "retire-superseded":
+            print(json.dumps(retire_superseded_task(args.repo, args.task_id,
+                                                    args.terminal_evidence), sort_keys=True))
         elif args.command == "defer-roadmap-completion":
             print(json.dumps(defer_roadmap_completion(args.task_id, args.reason), sort_keys=True))
         elif args.command == "release-roadmap-completion":
@@ -1225,7 +1282,7 @@ def main(argv: list[str] | None = None) -> int:
             payload = wait_task_merged(args.repo, args.task_id, timeout=args.timeout)
             print(payload.get("sha") or "merged")
         elif args.command == "wait-any":
-            payload = wait_task_any(args.task_id, timeout=args.timeout)
+            payload = wait_task_any(args.task_id, timeout=args.timeout, repo=args.repo)
             print(payload.get("sha") or payload.get("status") or "merged")
         elif args.command == "guard":
             print(json.dumps(ensure_guard(args.repo, args.branch), sort_keys=True))

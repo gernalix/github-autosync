@@ -90,6 +90,8 @@ Use one bulk call:
 repo-task status-all --roadmap-only
 ```
 
+When looking up one task ID, pass `--repo gernalix/name` to `status-any`, `finish-any`, or `wait-any`. An unscoped lookup fails if multiple repositories use the same task ID. For a canonically superseded task with a clean historical branch and no PR, `repo-task retire-superseded --repo PATH --task-id ID --terminal-evidence 'canonical receipt'` retires only the local task record; it preserves the branch and worktree.
+
 Each task exposes `pipeline_state` plus the concrete integration observation, PR URL/number and FIFO queue position. Typical values are:
 
 - `running`: worker worktree active;

@@ -26,6 +26,70 @@ def cp(code: int = 0, stdout: str = "", stderr: str = "") -> subprocess.Complete
 
 
 class SingleWriterTests(unittest.TestCase):
+    def test_same_task_id_requires_repository_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            for slug in ("gernalix_MegaVault", "gernalix_activity-watch-uploader"):
+                path = state / slug / "tasks" / "620949.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({
+                    "task_id": "620949", "repo": slug.replace("_", "/", 1),
+                    "status": "merged" if slug.endswith("MegaVault") else "active",
+                    "repo_path": str(Path(tmp) / slug),
+                }), encoding="utf-8")
+            with mock.patch.object(writer, "STATE_ROOT", state):
+                with self.assertRaisesRegex(RuntimeError, "ambiguous task id"):
+                    writer.task_status_any("620949")
+                with self.assertRaisesRegex(RuntimeError, "ambiguous task id"):
+                    writer.finish_task_any("620949")
+                selected = writer.task_status_any("620949", "gernalix/activity-watch-uploader")
+                self.assertEqual("gernalix/activity-watch-uploader", selected["repo"])
+                self.assertEqual("active", selected["status"])
+                self.assertEqual(2, len(writer.all_task_statuses()))
+
+    def test_retire_superseded_preserves_clean_historical_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, _ = self.make_repo(root / "git")
+            state, worktrees = root / "state", root / "worktrees"
+            with (mock.patch.object(writer, "STATE_ROOT", state),
+                  mock.patch.object(writer, "WORKTREE_ROOT", worktrees)):
+                payload = writer.start_task(repo, "125435")
+                task = Path(payload["worktree"])
+                original_run = writer.run
+
+                def no_pr(cmd, cwd=None, timeout=300):
+                    if cmd[:3] == ["gh", "pr", "list"]:
+                        return cp(stdout="[]")
+                    return original_run(cmd, cwd, timeout)
+
+                with mock.patch.object(writer, "run", side_effect=no_pr):
+                    with self.assertRaisesRegex(RuntimeError, "canonical terminal evidence"):
+                        writer.retire_superseded_task(repo, "125435", "")
+                    (task / "local.txt").write_text("preserve\n", encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "worktree is dirty"):
+                        writer.retire_superseded_task(repo, "125435", "prompt:125435 superseded")
+                    (task / "local.txt").unlink()
+                    retired = writer.retire_superseded_task(repo, "125435", "prompt:125435 superseded")
+                    self.assertEqual("superseded", retired["status"])
+                    self.assertTrue(task.is_dir())
+                    with self.assertRaisesRegex(RuntimeError, "retired as superseded"):
+                        writer.start_task(repo, "125435")
+
+    def test_retire_superseded_rejects_unintegrated_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, _ = self.make_repo(root / "git")
+            with (mock.patch.object(writer, "STATE_ROOT", root / "state"),
+                  mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees")):
+                payload = writer.start_task(repo, "125435")
+                task = Path(payload["worktree"])
+                (task / "change.txt").write_text("unmerged\n", encoding="utf-8")
+                self.assertEqual(0, git(["add", "change.txt"], task).returncode)
+                self.assertEqual(0, git(["commit", "-m", "unmerged"], task).returncode)
+                with self.assertRaisesRegex(RuntimeError, "unintegrated commits"):
+                    writer.retire_superseded_task(repo, "125435", "prompt:125435 superseded")
+
     def make_repo(self, root: Path) -> tuple[Path, Path]:
         bare = root / "origin.git"
         seed = root / "seed"

@@ -76,7 +76,7 @@ references:
   megavault: /home/daniele/MegaVault/megavault.sqlite
   c2: /home/daniele/projects/codex-roadmap/roadmap.sqlite
 freshness:
-  reviewed_commit: d01a4e131d4d240d61893f93780c916232151747
+  reviewed_commit: 262bae15cd8f5a0fa067de2c8f13b150273ac53f
   watch_paths:
     - README.md
     - github_autosync.py

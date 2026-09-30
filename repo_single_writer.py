@@ -1053,7 +1053,10 @@ def process_ready_prs(owner: str) -> dict[str, Any]:
                 expected_head=str(result.get("head_sha") or "") or None,
                 merge_sha=str(result.get("sha") or "") or None,
             )
-        else:
+        elif result.get("status") != "delegated-roadmap":
+            # codex-roadmap owns its own integration lane. Delegating one PR is
+            # not a repository conflict and must not head-of-line block later
+            # roadmap PRs from being delegated as well.
             blocked_repos.add(repo_key)
         results.append(result)
     return {

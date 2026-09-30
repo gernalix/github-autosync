@@ -424,6 +424,23 @@ class SingleWriterTests(unittest.TestCase):
         self.assertEqual("queue-behind-earlier", result["results"][1]["reason"])
         self.assertEqual("merged", result["results"][2]["status"])
 
+    def test_delegated_roadmap_pr_does_not_block_later_roadmap_prs(self) -> None:
+        discovered = [
+            {"repo": writer.ROADMAP_REPOSITORY, "number": 10, "url": "one"},
+            {"repo": writer.ROADMAP_REPOSITORY, "number": 11, "url": "two"},
+        ]
+        with (
+            mock.patch.object(writer, "discover_ready_prs", return_value=discovered),
+            mock.patch.object(writer, "integrate_pr", wraps=writer.integrate_pr) as integrate,
+            mock.patch.object(writer, "_task_by_pr", return_value=None),
+        ):
+            result = writer.process_ready_prs("gernalix")
+        self.assertEqual(["delegated-roadmap", "delegated-roadmap"],
+                         [item["status"] for item in result["results"]])
+        self.assertEqual(2, integrate.call_count)
+        self.assertNotIn("queue-behind-earlier",
+                         [item.get("reason") for item in result["results"]])
+
     def test_status_contract_exposes_pipeline_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

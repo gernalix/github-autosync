@@ -94,7 +94,7 @@ def resolve_repo_path(
     megavault: Path | None = None,
 ) -> Path | None:
     repo_slug = repo_slug.strip()
-    if not repo_slug or repo_slug.lower() == ROADMAP_REPOSITORY.lower():
+    if not repo_slug:
         return None
     target_url = _normalize_repo_url("https://github.com/" + repo_slug)
     mv = (megavault or (Path.home() / "MegaVault")).expanduser()
@@ -240,8 +240,6 @@ raise SystemExit(0)
 def ensure_guard(repo: Path, canonical_branch: str | None = None) -> dict[str, Any]:
     repo = repo.expanduser().resolve()
     slug = _repo_slug(repo)
-    if slug.lower() == ROADMAP_REPOSITORY.lower():
-        return {"repo": slug, "status": "delegated-roadmap"}
     if slug.lower() in INDEPENDENT_CANONICAL_WRITER_REPOSITORIES:
         return {"repo": slug, "status": "delegated-independent-writer"}
     branch = canonical_branch or _canonical_branch(repo)
@@ -266,8 +264,6 @@ def remove_guard(repo: Path) -> dict[str, Any]:
     """Remove only this tool's canonical-branch guard, restoring a prior hook."""
     repo = repo.expanduser().resolve()
     slug = _repo_slug(repo)
-    if slug.lower() == ROADMAP_REPOSITORY.lower():
-        return {"repo": slug, "status": "delegated-roadmap"}
     hooks = _effective_hooks_dir(repo)
     target = hooks / "reference-transaction"
     prior = hooks / "reference-transaction.pre-single-writer"
@@ -329,8 +325,6 @@ def _start_task_unlocked(repo: Path, task_id: str, actor: str = "agent") -> dict
     if not (repo / ".git").exists() and _git(repo, "rev-parse", "--is-inside-work-tree").returncode != 0:
         raise RuntimeError(f"not a git repository: {repo}")
     slug = _repo_slug(repo)
-    if slug.lower() == ROADMAP_REPOSITORY.lower():
-        raise RuntimeError("codex-roadmap keeps its dedicated single-writer workflow")
     canonical = _canonical_branch(repo)
     ensure_guard(repo, canonical)
     # Worker isolation must not depend on the state of the canonical checkout.
@@ -347,7 +341,10 @@ def _start_task_unlocked(repo: Path, task_id: str, actor: str = "agent") -> dict
                 _atomic_json(record_path, existing)
             return existing
 
-    _git(repo, "fetch", "--prune", "origin", timeout=180)
+    fetched = _git(repo, "fetch", "--no-tags", "origin",
+                   f"refs/heads/{canonical}:refs/remotes/origin/{canonical}", timeout=180)
+    if fetched.returncode:
+        raise RuntimeError(fetched.stderr.strip() or "canonical fetch failed")
     branch = TASK_PREFIX + task_id
     safe_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", slug)
     worktree = WORKTREE_ROOT / safe_slug / task_id
@@ -922,8 +919,6 @@ def _refresh_task_branch_to_latest_base(
 
 
 def integrate_pr(repo: str, number: int) -> dict[str, Any]:
-    if repo.lower() == ROADMAP_REPOSITORY.lower():
-        return {"repo": repo, "number": number, "status": "delegated-roadmap"}
     with RepoLock(repo):
         view = run(
             ["gh", "pr", "view", str(number), "--repo", repo,
@@ -1041,10 +1036,7 @@ def process_ready_prs(owner: str) -> dict[str, Any]:
                 expected_head=str(result.get("head_sha") or "") or None,
                 merge_sha=str(result.get("sha") or "") or None,
             )
-        elif result.get("status") != "delegated-roadmap":
-            # codex-roadmap owns its own integration lane. Delegating one PR is
-            # not a repository conflict and must not head-of-line block later
-            # roadmap PRs from being delegated as well.
+        else:
             blocked_repos.add(repo_key)
         results.append(result)
     return {

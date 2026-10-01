@@ -176,7 +176,10 @@ def periodic():
     if stamp.exists() and time.time() - stamp.stat().st_mtime < 3600:
         return {'status': 'not-due'}
     result = sweep()
-    result['legacy_c3'] = sweep_legacy_c3()
+    try:
+        result['legacy_c3'] = sweep_legacy_c3()
+    except (OSError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
+        result['legacy_c3'] = {'reason': 'gc-operation-failed:' + type(exc).__name__}
     stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.touch()
     return result

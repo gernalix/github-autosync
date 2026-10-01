@@ -26,6 +26,24 @@ def cp(code: int = 0, stdout: str = "", stderr: str = "") -> subprocess.Complete
 
 
 class SingleWriterTests(unittest.TestCase):
+    def test_roadmap_code_uses_generic_allocation_and_retires_old_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            repo,_=self.make_repo(root/'git')
+            hooks=repo/'.git/hooks'
+            old=hooks/'reference-transaction'
+            old.write_text('#!/usr/bin/env python3\n# roadmap-pull-authorization.json\nraise SystemExit(1)\n')
+            old.chmod(0o755)
+            with (mock.patch.object(writer,'_repo_slug',return_value=writer.ROADMAP_REPOSITORY),
+                  mock.patch.object(writer,'STATE_ROOT',root/'state'),
+                  mock.patch.object(writer,'WORKTREE_ROOT',root/'worktrees')):
+                task=writer.start_task(repo,'code-test')
+                self.assertTrue(Path(task['worktree']).is_dir())
+                prior=hooks/'reference-transaction.pre-single-writer'
+                self.assertTrue(prior.is_file())
+                self.assertNotIn(str(prior),old.read_text())
+                self.assertIn(writer.HOOK_MARKER,old.read_text())
+
     def test_same_task_id_requires_repository_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "state"

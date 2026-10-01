@@ -319,6 +319,11 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def start_task(repo: Path, task_id: str, actor: str = "agent") -> dict[str, Any]:
+    with RepoLock(_repo_slug(repo.expanduser().resolve())):
+        return _start_task_unlocked(repo, task_id, actor)
+
+
+def _start_task_unlocked(repo: Path, task_id: str, actor: str = "agent") -> dict[str, Any]:
     repo = repo.expanduser().resolve()
     task_id = _safe_task_id(task_id)
     if not (repo / ".git").exists() and _git(repo, "rev-parse", "--is-inside-work-tree").returncode != 0:
@@ -629,32 +634,15 @@ def cleanup_task_after_merge(
     payload["integration_reason"] = None
     payload["integration_observed_at"] = _iso_now()
 
-    cleanup: list[str] = []
-    if worktree.exists():
-        dirty = _git(worktree, "status", "--porcelain")
-        if dirty.returncode == 0 and not dirty.stdout.strip() and not _operation_in_progress(worktree):
-            removed = _git(repo, "worktree", "remove", str(worktree), timeout=180)
-            if removed.returncode == 0:
-                cleanup.append("worktree")
-
-    if expected_head:
-        remote = _git(repo, "ls-remote", "--heads", "origin", f"refs/heads/{branch}", timeout=120)
-        if remote.returncode == 0:
-            fields = remote.stdout.split()
-            if fields and fields[0] == expected_head:
-                deleted = _git(repo, "push", "origin", "--delete", branch, timeout=180)
-                if deleted.returncode == 0:
-                    cleanup.append("remote-branch")
-
-    local_ref = _git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
-    if local_ref.returncode == 0 and not worktree.exists():
-        deleted_local = _git(repo, "branch", "-d", branch, timeout=60)
-        if deleted_local.returncode == 0:
-            cleanup.append("local-branch")
-
-    payload["cleanup"] = cleanup
+    payload["integrated_head"] = expected_head or payload.get("integrated_head")
     _atomic_json(record_path, payload)
-    return {"status": "merged", "cleanup": cleanup, "task_id": payload.get("task_id")}
+    from repo_gc import collect_record
+    with RepoLock(repo_slug):
+        result = collect_record(payload)
+        payload["cleanup"] = sorted(set(payload.get("cleanup", [])) | set(result["removed"]))
+        _atomic_json(record_path, payload)
+    return {"status": "merged", "cleanup": payload["cleanup"],
+            "cleanup_deferred": result.get("reason"), "task_id": payload.get("task_id")}
 
 
 def _checkpoint_task(worktree: Path, task_id: str) -> None:

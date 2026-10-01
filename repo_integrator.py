@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 import autosync_core
 import repo_single_writer
+import repo_gc
 
 DEFAULT_STATE_ROOT = Path.home() / ".local/state/codex-github-autosync"
 
@@ -28,13 +29,14 @@ class IntegratorLock:
 def run_once(owner: str) -> dict[str, Any]:
     queue = repo_single_writer.process_ready_prs(owner)
     roadmap = autosync_core.queue_merged_roadmap_completions()
+    garbage_collection = repo_gc.periodic()
     transient = {"draft","checks-pending","mergeable-unknown","branch-refreshed","queue-behind-earlier","pr-read-failed"}
     hard = [
         {"repo": i.get("repo"), "number": i.get("number"), "reason": i.get("reason")}
         for i in queue.get("results", [])
         if i.get("status") == "deferred" and str(i.get("reason") or "deferred") not in transient
     ]
-    return {"status": "partial" if hard else "ok", "queue": queue, "roadmap_finalization": roadmap, "hard_blockers": hard}
+    return {"status": "partial" if hard else "ok", "queue": queue, "roadmap_finalization": roadmap, "hard_blockers": hard, "garbage_collection": garbage_collection}
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Integrate queued task PRs FIFO per repository.")

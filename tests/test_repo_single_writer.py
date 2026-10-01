@@ -186,7 +186,7 @@ class SingleWriterTests(unittest.TestCase):
     def test_start_task_creates_isolated_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            repo, _ = self.make_repo(root / "git")
+            repo, remote = self.make_repo(root / "git")
             state = root / "state"
             worktrees = root / "worktrees"
             with (
@@ -258,11 +258,14 @@ class SingleWriterTests(unittest.TestCase):
                 self.assertEqual(0, git(["commit", "-m", "feature"], task).returncode)
                 head = git(["rev-parse", "HEAD"], task).stdout.strip()
                 self.assertEqual(0, git(["push", "-u", "origin", payload["branch"]], task).returncode)
+                self.assertEqual(0, git(["push", "origin", "HEAD:main"], task).returncode)
+                self.assertEqual(0, git(["fetch", "origin", "main"], repo).returncode)
+                self.assertEqual(0, git(["merge", "--ff-only", "origin/main"], repo).returncode)
                 result = writer.cleanup_task_after_merge(
                     payload["repo"],
                     payload["branch"],
                     expected_head=head,
-                    merge_sha="merged123",
+                    merge_sha=head,
                 )
                 self.assertEqual("merged", result["status"])
                 self.assertFalse(task.exists())

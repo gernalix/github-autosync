@@ -86,11 +86,13 @@ Dirty, conflicted, active, referenced, unknown or unintegrated work is preserved
 Scans rotate so preserved tasks cannot starve later candidates. Git object maintenance
 uses normal grace periods, never immediate pruning. No extra service or timer is used.
 
-### Roadmap cockpit contract
+### C3 integration projection
+
+AI operations: [/home/daniele/MegaVault/ai/META_INFRASTRUCTURE.md](/home/daniele/MegaVault/ai/META_INFRASTRUCTURE.md). The implementation details below are not an additional cross-project protocol.
 
 Only task records carrying an explicit `roadmap_prompt_id` created by `roadmap_start.py` may feed a completion back to `codex-roadmap`. A historical `actor=codex` record is not enough. After merge, `repo-integrator` calls the canonical `roadmap_finish.py --result PASS`; it never writes roadmap state itself.
 
-`github-autosync` is also the authoritative local source for **repository integration state** shown by the Workflowy roadmap cockpit. It does not decide the canonical roadmap status; it reports the real Git pipeline for each roadmap `PROMPT_ID`.
+`github-autosync` owns **repository integration state** shown by the C3 web application. It does not decide canonical roadmap lifecycle; it reports the real Git pipeline for each roadmap `PROMPT_ID`.
 
 Use one bulk call:
 
@@ -107,7 +109,7 @@ Each task exposes `pipeline_state` plus the concrete integration observation, PR
 - `needs-fix`: a real integration blocker such as semantic conflict or failed checks;
 - `done`: merge completed.
 
-The integrator persists observations such as `queued`, `checks-pending`, `rebasing`, `integrating`, `semantic-conflict` and `merged` in the task record. Workflowy consumes this contract instead of inferring state from Markdown, branch names or PR titles.
+The integrator persists observations such as `queued`, `checks-pending`, `rebasing`, `integrating`, `semantic-conflict` and `merged` in the task record. C3 consumes this contract instead of inferring state from Markdown, branch names or PR titles.
 
 ## Responsibilities
 
@@ -136,7 +138,7 @@ Repositories that have a local runtime may opt into a narrow, explicit post-sync
 
 Current deploy contracts:
 
-- `gernalix/workflowy-importer` → `python3 deploy_runtime.py`; this refreshes the user-systemd units, restarts the Workflowy bridge, and immediately runs one roadmap sync.
+- `gernalix/workflowy-importer` → `python3 deploy_runtime.py`; personal Workflowy bridge only. No roadmap sync or C3 control units are installed or started.
 - `gernalix/chrome-codex-switcher` → `bash install.sh`; this refreshes the installed host/extension files and restarts the local switcher service.
 - `gernalix/PersonalHub` → `python3 deploy_runtime.py`; this installs the consolidation watcher. Once every non-`main` remote branch is already contained in `origin/main`, the watcher builds one signed/minified release APK from that exact main SHA, retries if the physical Pixel is unavailable, installs the exact artifact, verifies the installed version, and only then sends the Telegram completion notification. State is keyed by main SHA so build/install/notification phases are not repeated after success.
 

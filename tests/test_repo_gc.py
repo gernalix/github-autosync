@@ -21,8 +21,8 @@ class SafeGcTests(unittest.TestCase):
                 payload={'status':'merged','task_id':'example','repo_path':str(root/'absent'),
                          'branch':'task/example','worktree':str(root/'worktrees'/'example')}
                 self.assertEqual('repository-unavailable',gc.collect_record(payload)['reason'])
-                with patch.object(gc,'sweep',return_value={'checked':0}) as sweep, patch.object(gc,'sweep_legacy_c3',return_value={'checked':0}):
-                    self.assertEqual({'checked':0,'legacy_c3':{'checked':0}},gc.periodic())
+                with patch.object(gc,'sweep',return_value={'checked':0}) as sweep, patch.object(gc,'sweep_legacy_c3',return_value={'checked':0}), patch.object(gc,'sweep_orphan_c3',return_value={'checked':0}):
+                    self.assertEqual({'checked':0,'legacy_c3':{'checked':0},'orphan_c3':{'checked':0}},gc.periodic())
                     self.assertEqual({'status':'not-due'},gc.periodic())
                     sweep.assert_called_once_with()
 
@@ -136,3 +136,31 @@ class SafeGcTests(unittest.TestCase):
         self.assertFalse(gc._legacy_path(Path.home()/'.codex/worktrees/1234/codex-roadmap'))
         self.assertFalse(gc._legacy_path(Path.home()/'.local/share/chatgpt-rdc-supervisor/source'))
         self.assertTrue(gc._legacy_path(Path.home()/'.local/share/c2-supervisor/worktrees/123456'))
+
+    def test_orphan_gc_requires_positive_terminal_owner_and_preserves_unknown_refs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'), patch.object(writer,'WORKTREE_ROOT',root/'worktrees'), patch.object(gc,'C3_DB',root/'c3.sqlite'):
+                repo,remote,worktree,payload=self.fixture(root)
+                fixtures.git(['worktree','remove',str(worktree)],repo)
+                fixtures.git(['branch','task/123456',payload['branch']],repo)
+                fixtures.git(['push','origin','task/123456'],repo)
+                with closing(sqlite3.connect(gc.C3_DB)) as db:
+                    db.executescript("CREATE TABLE meta(key,value); CREATE TABLE work_items(work_item_id,status,prompt_id); CREATE TABLE work_item_execution_specs(work_item_id,worktree); CREATE TABLE work_item_checkpoints(work_item_id,next_action,source_commit); CREATE TABLE work_item_runs(work_item_id,worker_ref,metadata_json,state);")
+                    db.execute("INSERT INTO meta VALUES('pre_migration_execution_retired','yes')")
+                    db.execute("INSERT INTO work_items VALUES('prompt:123456','pending','123456')")
+                    db.commit()
+                    with patch.object(gc,'C3_REPO',repo):
+                        self.assertFalse(any(x['removed'] for x in gc.sweep_orphan_c3(dry_run=True)['results']))
+                        db.execute("UPDATE work_items SET status='completed'")
+                        db.execute("INSERT INTO work_item_checkpoints VALUES('prompt:123456','recover',NULL)")
+                        db.commit()
+                        self.assertFalse(any(x['removed'] for x in gc.sweep_orphan_c3(dry_run=True)['results']))
+                        db.execute('DELETE FROM work_item_checkpoints'); db.commit()
+                        planned=gc.sweep_orphan_c3(dry_run=True)
+                        eligible=[x for x in planned['results'] if x['removed']]
+                        self.assertEqual(['task/123456'],[x['branch'] for x in eligible])
+                        self.assertEqual(['remote-branch','local-branch'],eligible[0]['removed'])
+                        result=gc.sweep_orphan_c3()
+                        self.assertEqual(planned,result)
+                        self.assertEqual(0,fixtures.git(['show-ref','--verify','refs/heads/'+payload['branch']],repo).returncode)

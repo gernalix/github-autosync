@@ -105,7 +105,12 @@ def collect_record(payload, *, dry_run=False):
 def sweep(*, dry_run=False, batch_limit=25):
     results = []
     repos = set()
-    for path in sorted(writer.STATE_ROOT.glob('*/tasks/*.json')):
+    paths = sorted(writer.STATE_ROOT.glob('*/tasks/*.json'))
+    # Rotate bounded scans: a preserved dirty task cannot starve later records.
+    if paths:
+        offset = (int(time.time()) // 3600 * batch_limit) % len(paths)
+        paths = paths[offset:] + paths[:offset]
+    for path in paths:
         try:
             payload = json.loads(path.read_text())
         except (OSError, ValueError):

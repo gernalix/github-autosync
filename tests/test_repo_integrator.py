@@ -5,6 +5,11 @@ from unittest import mock
 import repo_integrator
 
 class RepoIntegratorTests(unittest.TestCase):
+    def setUp(self):
+        self.gc = mock.patch.object(repo_integrator.repo_gc, 'periodic', return_value={'checked': 0})
+        self.gc.start()
+        self.addCleanup(self.gc.stop)
+
     def test_pending_checks_are_not_hard_blockers(self) -> None:
         queue={"found":1,"merged":0,"deferred":1,"results":[{"repo":"gernalix/example","number":1,"status":"deferred","reason":"checks-pending"}]}
         with (

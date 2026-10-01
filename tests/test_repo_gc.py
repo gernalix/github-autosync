@@ -12,6 +12,18 @@ import test_repo_single_writer as fixtures
 
 
 class SafeGcTests(unittest.TestCase):
+    def test_missing_repository_is_preserved_and_periodic_runs_are_coalesced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer, 'STATE_ROOT', root/'state'), patch.object(writer, 'WORKTREE_ROOT', root/'worktrees'), patch.object(gc, 'C3_DB', root/'missing.sqlite'):
+                payload={'status':'merged','task_id':'example','repo_path':str(root/'absent'),
+                         'branch':'task/example','worktree':str(root/'worktrees'/'example')}
+                self.assertEqual('repository-unavailable',gc.collect_record(payload)['reason'])
+                with patch.object(gc,'sweep',return_value={'checked':0}) as sweep:
+                    self.assertEqual({'checked':0},gc.periodic())
+                    self.assertEqual({'status':'not-due'},gc.periodic())
+                    sweep.assert_called_once_with()
+
     def fixture(self, root):
         repo, remote = fixtures.SingleWriterTests().make_repo(root / 'git')
         payload = writer.start_task(repo, 'gc-example')
@@ -75,3 +87,13 @@ class SafeGcTests(unittest.TestCase):
                 payload.pop('integrated_head')
                 self.assertEqual('unintegrated-tip',gc.collect_record(payload)['reason'])
                 self.assertTrue(worktree.exists())
+
+    def test_remote_only_merged_branch_is_collected_with_expected_tip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer, 'STATE_ROOT', root/'state'), patch.object(writer, 'WORKTREE_ROOT', root/'worktrees'), patch.object(gc, 'C3_DB', root/'missing.sqlite'):
+                repo, remote, worktree, payload=self.fixture(root)
+                self.assertEqual(0,fixtures.git(['worktree','remove',str(worktree)],repo).returncode)
+                self.assertEqual(0,fixtures.git(['branch','-d',payload['branch']],repo).returncode)
+                self.assertEqual({'removed':['remote-branch']},gc.collect_record(payload))
+                self.assertNotEqual(0,fixtures.git(['show-ref','--verify','refs/heads/'+payload['branch']],remote).returncode)

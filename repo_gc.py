@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 import time
 
 import repo_single_writer as writer
@@ -44,15 +45,21 @@ def collect_record(payload, *, dry_run=False):
     path = Path(str(payload.get('worktree') or '')).expanduser().resolve()
     if not branch.startswith('task/') or path == repo or not payload.get('worktree'):
         return {'removed': [], 'reason': 'invalid-target'}
+    if not path.is_relative_to(writer.WORKTREE_ROOT.resolve()):
+        return {'removed': [], 'reason': 'unmanaged-worktree'}
     if not repo.is_dir() or writer._git(repo, 'rev-parse', '--is-inside-work-tree').returncode:
         return {'removed': [], 'reason': 'repository-unavailable'}
     canonical = str(payload.get('canonical_branch') or 'main')
     base = 'refs/remotes/origin/' + canonical
     head = writer._git(repo, 'rev-parse', '--verify', 'refs/heads/' + branch)
-    if head.returncode:
-        return {'removed': [], 'reason': 'branch-missing'}
-    tip = head.stdout.strip()
     expected = payload.get('integrated_head') or payload.get('head_sha')
+    has_local = head.returncode == 0
+    if head.returncode:
+        if not expected or not re.fullmatch(r'[0-9a-f]{40}', expected):
+            return {'removed': [], 'reason': 'branch-missing'}
+        tip = expected
+    else:
+        tip = head.stdout.strip()
     if expected and tip != expected:
         return {'removed': [], 'reason': 'changed-after-merge'}
     if writer._git(repo, 'merge-base', '--is-ancestor', tip, base).returncode:
@@ -78,7 +85,7 @@ def collect_record(payload, *, dry_run=False):
             return {'removed': [], 'reason': 'active-at-delete'}
         if dry_run:
             removed.append('worktree')
-        elif writer._git(repo, 'worktree', 'remove', str(path), timeout=180).returncode == 0:
+        elif writer._git(repo, 'worktree', 'remove', str(path), timeout=30).returncode == 0:
             removed.append('worktree')
         else:
             return {'removed': [], 'reason': 'worktree-preserved'}
@@ -86,7 +93,7 @@ def collect_record(payload, *, dry_run=False):
         checked = writer._git(repo, 'worktree', 'list', '--porcelain')
         if checked.returncode or 'branch refs/heads/' + branch + '\n' in checked.stdout:
             return {'removed': removed, 'reason': 'checked-out-branch'}
-    remote = writer._git(repo, 'ls-remote', '--heads', 'origin', 'refs/heads/' + branch)
+    remote = writer._git(repo, 'ls-remote', '--heads', 'origin', 'refs/heads/' + branch, timeout=20)
     if remote.returncode:
         return {'removed': removed, 'reason': 'remote-read-failed'}
     fields = remote.stdout.split()
@@ -95,24 +102,38 @@ def collect_record(payload, *, dry_run=False):
             return {'removed': removed, 'reason': 'remote-changed-or-active'}
         if dry_run or writer._git(repo, 'push', 'origin',
                 '--force-with-lease=refs/heads/' + branch + ':' + tip,
-                ':refs/heads/' + branch, timeout=180).returncode == 0:
+                ':refs/heads/' + branch, timeout=30).returncode == 0:
             removed.append('remote-branch')
         else:
             return {'removed': removed, 'reason': 'remote-delete-refused'}
-    if dry_run or writer._git(repo, 'branch', '-d', branch).returncode == 0:
-        removed.append('local-branch')
+    if not c3_allows(payload):
+        return {'removed': removed, 'reason': 'active-at-local-delete'}
+    if has_local:
+        if not dry_run:
+            checked = writer._git(repo, 'worktree', 'list', '--porcelain')
+            if checked.returncode or 'branch refs/heads/' + branch + '\n' in checked.stdout:
+                return {'removed': removed, 'reason': 'checked-out-at-delete'}
+        # Ancestry was proved against fetched canonical, not a stale local HEAD.
+        # Compare-and-delete cannot remove a concurrently changed branch tip.
+        if dry_run or writer._git(repo, 'update-ref', '-d', 'refs/heads/' + branch, tip).returncode == 0:
+            removed.append('local-branch')
+        else:
+            return {'removed': removed, 'reason': 'local-delete-refused'}
     return {'removed': removed}
 
 
 def sweep(*, dry_run=False, batch_limit=25):
     results = []
     repos = set()
+    deadline = time.monotonic() + 60
     paths = sorted(writer.STATE_ROOT.glob('*/tasks/*.json'))
     # Rotate bounded scans: a preserved dirty task cannot starve later records.
     if paths:
         offset = (int(time.time()) // 3600 * batch_limit) % len(paths)
         paths = paths[offset:] + paths[:offset]
     for path in paths:
+        if time.monotonic() >= deadline:
+            break
         try:
             payload = json.loads(path.read_text())
         except (OSError, ValueError):
@@ -122,7 +143,10 @@ def sweep(*, dry_run=False, batch_limit=25):
         if len(results) >= batch_limit:
             break
         with writer.RepoLock(str(payload.get('repo') or '')):
-            result = collect_record(payload, dry_run=dry_run)
+            try:
+                result = collect_record(payload, dry_run=dry_run)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                result = {'removed': [], 'reason': 'gc-operation-failed:' + type(exc).__name__}
             if result['removed'] and not dry_run:
                 payload['cleanup'] = sorted(set(payload.get('cleanup', [])) | set(result['removed']))
                 writer._atomic_json(path, payload)
@@ -130,7 +154,10 @@ def sweep(*, dry_run=False, batch_limit=25):
         results.append({'task_id': payload.get('task_id'), **result})
     for repo in repos:
         # Git's default grace periods preserve recent/reflog recovery objects.
-        writer._git(repo, '-c', 'gc.autoDetach=false', 'gc', '--auto', timeout=300)
+        try:
+            writer._git(repo, '-c', 'gc.autoDetach=false', 'gc', '--auto', timeout=30)
+        except subprocess.TimeoutExpired:
+            pass  # Ordinary grace-period maintenance can resume on a later run.
     return {'checked': len(results), 'results': results}
 
 

@@ -78,6 +78,14 @@ github-reconcile --dry-run
 
 Two periodic timers have separate responsibilities: `github-autosync.timer` synchronizes/audits repositories, while `repo-integrator.timer` owns the queued PR integration path.
 
+The integrator also performs bounded hourly terminal-aware Git maintenance using
+existing task records. C3-linked tasks must be terminal with no active execution or
+recovery pointer. Only unchanged, clean managed worktrees and tips proved contained
+in fetched canonical are removed; remote deletion is compare-and-delete fenced.
+Dirty, conflicted, active, referenced, unknown or unintegrated work is preserved.
+Scans rotate so preserved tasks cannot starve later candidates. Git object maintenance
+uses normal grace periods, never immediate pruning. No extra service or timer is used.
+
 ### Roadmap cockpit contract
 
 Only task records carrying an explicit `roadmap_prompt_id` created by `roadmap_start.py` may feed a completion back to `codex-roadmap`. A historical `actor=codex` record is not enough. After merge, `repo-integrator` calls the canonical `roadmap_finish.py --result PASS`; it never writes roadmap state itself.

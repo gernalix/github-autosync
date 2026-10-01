@@ -194,6 +194,13 @@ def _legacy_path(path):
 
 
 def _legacy_allowed(branch, path, tip):
+    try:
+        return _legacy_proof(branch, path, tip)
+    except (ValueError, OSError, sqlite3.Error):
+        return False
+
+
+def _legacy_proof(branch, path, tip):
     if branch.startswith(('checkpoint/', 'archive/', 'recovery/')):
         return False
     with closing(sqlite3.connect(C3_DB.resolve().as_uri() + '?mode=ro', uri=True)) as db:
@@ -247,7 +254,7 @@ def sweep_legacy_c3(*, dry_run=False, batch_limit=25):
             if not branch or not _legacy_allowed(branch, path, tip):
                 result['reason'] = 'nonterminal-active-or-recovery'
                 continue
-            if writer._git(C3_REPO, 'merge-base', '--is-ancestor', tip, 'refs/heads/main').returncode:
+            if writer._git(C3_REPO, 'merge-base', '--is-ancestor', tip, 'refs/remotes/origin/main').returncode:
                 result['reason'] = 'unintegrated-tip'
                 continue
             dirty = writer._git(path, 'status', '--porcelain', '--untracked-files=all')
@@ -272,7 +279,7 @@ def sweep_legacy_c3(*, dry_run=False, batch_limit=25):
                 continue
             fields = remote.stdout.split()
             if fields:
-                if len(fields) != 2 or fields[0] != tip:
+                if len(fields) != 2 or fields[0] != tip or not _legacy_allowed(branch, path, tip):
                     result['reason'] = 'remote-changed'
                     continue
                 if dry_run or writer._git(C3_REPO, 'push', 'origin', '--force-with-lease=refs/heads/' + branch + ':' + tip,
@@ -281,6 +288,13 @@ def sweep_legacy_c3(*, dry_run=False, batch_limit=25):
                 else:
                     result['reason'] = 'remote-delete-refused'
                     continue
+            checked = writer._git(C3_REPO, 'worktree', 'list', '--porcelain')
+            if not dry_run and (checked.returncode or 'branch refs/heads/' + branch + '\n' in checked.stdout):
+                result['reason'] = 'checked-out-at-delete'
+                continue
+            if not _legacy_allowed(branch, path, tip):
+                result['reason'] = 'active-at-local-delete'
+                continue
             if dry_run or writer._git(C3_REPO, 'update-ref', '-d', 'refs/heads/' + branch, tip).returncode == 0:
                 result['removed'].append('local-branch')
     return {'checked': len(results), 'results': results}

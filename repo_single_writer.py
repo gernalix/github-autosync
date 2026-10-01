@@ -251,7 +251,12 @@ def ensure_guard(repo: Path, canonical_branch: str | None = None) -> dict[str, A
         current = target.read_text(encoding="utf-8", errors="replace")
         if HOOK_MARKER not in current and not prior.exists():
             target.replace(prior)
-    script = _writer_hook(f"refs/heads/{branch}", _auth_path(repo), prior if prior.exists() else None)
+    # The retired roadmap-specific hook used a different authorization file.
+    # Keep its source as recoverable evidence, not a second active authority.
+    legacy_roadmap = (slug.lower() == ROADMAP_REPOSITORY.lower() and prior.exists()
+                      and 'roadmap-pull-authorization.json' in prior.read_text(encoding="utf-8", errors="replace"))
+    script = _writer_hook(f"refs/heads/{branch}", _auth_path(repo),
+                         prior if prior.exists() and not legacy_roadmap else None)
     if not target.exists() or target.read_text(encoding="utf-8", errors="replace") != script:
         tmp = target.with_suffix(".tmp")
         tmp.write_text(script, encoding="utf-8")

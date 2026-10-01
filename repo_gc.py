@@ -262,7 +262,10 @@ def sweep_legacy_c3(*, dry_run=False, batch_limit=25):
             if dirty.returncode or dirty.stdout.strip() or writer._operation_in_progress(path):
                 result['reason'] = 'dirty-or-conflicted'
                 continue
-            if metadata.returncode or Path(metadata.stdout.strip()).stat().st_mtime >= cutoff:
+            # status refreshes the metadata directory mtime. The gitdir link
+            # identifies worktree creation without changing on ordinary reads.
+            allocation = Path(metadata.stdout.strip()) / 'gitdir'
+            if metadata.returncode or not allocation.is_file() or allocation.stat().st_mtime >= cutoff:
                 result['reason'] = 'post-retirement-or-unknown'
                 continue
             if not _legacy_allowed(branch, path, tip):

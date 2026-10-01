@@ -178,6 +178,7 @@ def periodic():
     result = sweep()
     try:
         result['legacy_c3'] = sweep_legacy_c3()
+        result['orphan_c3'] = sweep_orphan_c3()
     except (OSError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
         result['legacy_c3'] = {'reason': 'gc-operation-failed:' + type(exc).__name__}
     stamp.parent.mkdir(parents=True, exist_ok=True)
@@ -218,6 +219,83 @@ def _legacy_proof(branch, path, tip):
         if db.execute('SELECT 1 FROM work_item_checkpoints WHERE source_commit=? AND next_action IS NOT NULL LIMIT 1', (tip,)).fetchone():
             return False
     return c3_allows({'worktree': str(path), 'branch': branch})
+
+
+def _terminal_branch(branch, tip):
+    """Orphan refs need positive terminal ownership, not a legacy name."""
+    if any(word in branch.lower() for word in ('checkpoint', 'archive', 'recovery')):
+        return False
+    try:
+        with closing(sqlite3.connect(C3_DB.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+            short = re.search(r'wi-([0-9a-f]{4,32})(?:[^0-9a-f]|$)', branch)
+            matches = [row for row in db.execute('SELECT work_item_id,prompt_id,status FROM work_items')
+                       if (row[1] and re.search(r'(?<!\d)' + re.escape(row[1]) + r'(?!\d)', branch))
+                       or (short and row[0].startswith('wi:' + short[1]))]
+            if not matches or any(row[2] not in ('completed','cancelled','superseded') for row in matches):
+                return False
+            for item, _, _ in matches:
+                if db.execute('SELECT 1 FROM work_item_checkpoints WHERE work_item_id=? AND next_action IS NOT NULL LIMIT 1', (item,)).fetchone():
+                    return False
+        return _legacy_allowed(branch, Path('/nonexistent-gc-target'), tip)
+    except (ValueError, OSError, sqlite3.Error):
+        return False
+
+
+def sweep_orphan_c3(*, dry_run=False, batch_limit=25):
+    if not C3_DB.is_file() or not C3_REPO.is_dir():
+        return {'checked': 0, 'reason': 'authority-unavailable'}
+    results = []
+    deadline = time.monotonic() + 60
+    with writer.RepoLock(writer.ROADMAP_REPOSITORY):
+        listing = writer._git(C3_REPO, 'worktree', 'list', '--porcelain')
+        refs = writer._git(C3_REPO, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads')
+        remote = writer._git(C3_REPO, 'ls-remote', '--heads', 'origin', timeout=20)
+        if listing.returncode or refs.returncode or remote.returncode:
+            return {'checked': 0, 'reason': 'inventory-unavailable'}
+        checked_out = {line.removeprefix('branch refs/heads/') for line in listing.stdout.splitlines() if line.startswith('branch refs/heads/')}
+        local = {line.split()[0].removeprefix('refs/heads/'): line.split()[1] for line in refs.stdout.splitlines()}
+        remote_refs = {line.split()[1].removeprefix('refs/heads/'): line.split()[0] for line in remote.stdout.splitlines()}
+        owned = set()
+        for record in writer.STATE_ROOT.glob('*/tasks/*.json'):
+            try:
+                payload = json.loads(record.read_text())
+            except (OSError, ValueError):
+                return {'checked': 0, 'reason': 'unreadable-ownership'}
+            if payload.get('repo') == writer.ROADMAP_REPOSITORY and payload.get('status') != 'merged':
+                owned.add(payload.get('branch'))
+        candidates = sorted((set(local) | set(remote_refs)) - checked_out - owned - {'main','master'})
+        if candidates:
+            offset = (int(time.time()) // 3600 * batch_limit) % len(candidates)
+            candidates = candidates[offset:] + candidates[:offset]
+        for branch in candidates[:batch_limit]:
+            if time.monotonic() >= deadline:
+                break
+            tip = local.get(branch) or remote_refs[branch]
+            result = {'branch': branch, 'removed': []}
+            results.append(result)
+            if remote_refs.get(branch, tip) != tip or not _terminal_branch(branch, tip):
+                result['reason'] = 'unknown-nonterminal-or-changed'
+                continue
+            if writer._git(C3_REPO, 'merge-base', '--is-ancestor', tip, 'refs/remotes/origin/main').returncode:
+                result['reason'] = 'unintegrated-tip'
+                continue
+            current = writer._git(C3_REPO, 'worktree', 'list', '--porcelain')
+            if current.returncode or 'branch refs/heads/' + branch + '\n' in current.stdout or not _terminal_branch(branch, tip):
+                result['reason'] = 'referenced-at-delete'
+                continue
+            if branch in remote_refs:
+                if not dry_run and writer._git(C3_REPO, 'push', 'origin', '--force-with-lease=refs/heads/' + branch + ':' + tip,
+                                               ':refs/heads/' + branch, timeout=30).returncode:
+                    result['reason'] = 'remote-delete-refused'
+                    continue
+                result['removed'].append('remote-branch')
+            current = writer._git(C3_REPO, 'worktree', 'list', '--porcelain')
+            if current.returncode or 'branch refs/heads/' + branch + '\n' in current.stdout or not _terminal_branch(branch, tip):
+                result['reason'] = 'referenced-at-local-delete'
+                continue
+            if branch in local and (dry_run or writer._git(C3_REPO, 'update-ref', '-d', 'refs/heads/' + branch, tip).returncode == 0):
+                result['removed'].append('local-branch')
+    return {'checked': len(results), 'results': results}
 
 
 def sweep_legacy_c3(*, dry_run=False, batch_limit=25):

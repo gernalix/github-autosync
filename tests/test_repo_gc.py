@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+import os
+import time
 import unittest
 from unittest.mock import patch
 
@@ -19,8 +21,8 @@ class SafeGcTests(unittest.TestCase):
                 payload={'status':'merged','task_id':'example','repo_path':str(root/'absent'),
                          'branch':'task/example','worktree':str(root/'worktrees'/'example')}
                 self.assertEqual('repository-unavailable',gc.collect_record(payload)['reason'])
-                with patch.object(gc,'sweep',return_value={'checked':0}) as sweep:
-                    self.assertEqual({'checked':0},gc.periodic())
+                with patch.object(gc,'sweep',return_value={'checked':0}) as sweep, patch.object(gc,'sweep_legacy_c3',return_value={'checked':0}):
+                    self.assertEqual({'checked':0,'legacy_c3':{'checked':0}},gc.periodic())
                     self.assertEqual({'status':'not-due'},gc.periodic())
                     sweep.assert_called_once_with()
 
@@ -97,3 +99,38 @@ class SafeGcTests(unittest.TestCase):
                 self.assertEqual(0,fixtures.git(['branch','-d',payload['branch']],repo).returncode)
                 self.assertEqual({'removed':['remote-branch']},gc.collect_record(payload))
                 self.assertNotEqual(0,fixtures.git(['show-ref','--verify','refs/heads/'+payload['branch']],remote).returncode)
+
+    def test_legacy_c3_requires_retirement_terminal_ownership_clean_and_integrated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            marker=root/'retired.json'
+            marker.write_text('{}')
+            os.utime(marker,(time.time()+1000,time.time()+1000))
+            with patch.object(writer,'STATE_ROOT',root/'state'), patch.object(writer,'WORKTREE_ROOT',root/'worktrees'), patch.object(gc,'C3_DB',root/'c3.sqlite'), patch.object(gc,'RETIREMENT_MARKER',marker), patch.object(gc,'_legacy_path',return_value=True):
+                repo,remote,worktree,payload=self.fixture(root)
+                with closing(sqlite3.connect(gc.C3_DB)) as db:
+                    db.executescript("CREATE TABLE meta(key,value); INSERT INTO meta VALUES('pre_migration_execution_retired','yes'); CREATE TABLE work_items(work_item_id,status,prompt_id); CREATE TABLE work_item_execution_specs(work_item_id,worktree); CREATE TABLE work_item_checkpoints(work_item_id,next_action,source_commit); CREATE TABLE work_item_runs(work_item_id,worker_ref,metadata_json,state);")
+                    db.commit()
+                    with patch.object(gc,'C3_REPO',repo):
+                        (worktree/'dirty.txt').write_text('preserve')
+                        self.assertEqual('dirty-or-conflicted',gc.sweep_legacy_c3(dry_run=True)['results'][0]['reason'])
+                        (worktree/'dirty.txt').unlink()
+                        db.execute("INSERT INTO work_items VALUES('wi:prepared','pending',NULL)")
+                        db.execute('INSERT INTO work_item_execution_specs VALUES(?,?)',('wi:prepared',str(worktree)))
+                        db.commit()
+                        self.assertEqual('nonterminal-active-or-recovery',gc.sweep_legacy_c3(dry_run=True)['results'][0]['reason'])
+                        db.execute("UPDATE work_items SET status='completed'")
+                        db.commit()
+                        before=db.total_changes
+                        planned=gc.sweep_legacy_c3(dry_run=True)['results'][0]
+                        self.assertEqual(['worktree','remote-branch','local-branch'],planned['removed'])
+                        self.assertTrue(worktree.exists())
+                        result=gc.sweep_legacy_c3()['results'][0]
+                        self.assertEqual(planned,result)
+                        self.assertEqual(before,db.total_changes)
+                        self.assertFalse(worktree.exists())
+
+    def test_app_managed_paths_are_never_legacy_gc_targets(self):
+        self.assertFalse(gc._legacy_path(Path.home()/'.codex/worktrees/1234/codex-roadmap'))
+        self.assertFalse(gc._legacy_path(Path.home()/'.local/share/chatgpt-rdc-supervisor/source'))
+        self.assertTrue(gc._legacy_path(Path.home()/'.local/share/c2-supervisor/worktrees/123456'))

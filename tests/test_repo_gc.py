@@ -109,7 +109,9 @@ class SafeGcTests(unittest.TestCase):
             with patch.object(writer,'STATE_ROOT',root/'state'), patch.object(writer,'WORKTREE_ROOT',root/'worktrees'), patch.object(gc,'C3_DB',root/'c3.sqlite'), patch.object(gc,'RETIREMENT_MARKER',marker), patch.object(gc,'_legacy_path',return_value=True):
                 repo,remote,worktree,payload=self.fixture(root)
                 with closing(sqlite3.connect(gc.C3_DB)) as db:
-                    db.executescript("CREATE TABLE meta(key,value); INSERT INTO meta VALUES('pre_migration_execution_retired','yes'); CREATE TABLE work_items(work_item_id,status,prompt_id); CREATE TABLE work_item_execution_specs(work_item_id,worktree); CREATE TABLE work_item_checkpoints(work_item_id,next_action,source_commit); CREATE TABLE work_item_runs(work_item_id,worker_ref,metadata_json,state);")
+                    db.executescript("CREATE TABLE meta(key,value); CREATE TABLE work_items(work_item_id,status,prompt_id); CREATE TABLE work_item_execution_specs(work_item_id,worktree); CREATE TABLE work_item_checkpoints(work_item_id,next_action,source_commit); CREATE TABLE work_item_runs(work_item_id,worker_ref,metadata_json,state);")
+                    from datetime import datetime,timezone
+                    db.execute('INSERT INTO meta VALUES(?,?)',('pre_migration_execution_retired',datetime.fromtimestamp(time.time()+1000,timezone.utc).isoformat()))
                     db.commit()
                     with patch.object(gc,'C3_REPO',repo):
                         (worktree/'dirty.txt').write_text('preserve')

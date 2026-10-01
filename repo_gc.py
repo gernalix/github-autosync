@@ -1,5 +1,6 @@
 """Terminal-aware Git maintenance in the existing integrator, not a lifecycle."""
 from contextlib import closing
+from datetime import datetime
 import json
 from pathlib import Path
 import re
@@ -214,6 +215,14 @@ def sweep_legacy_c3(*, dry_run=False, batch_limit=25):
         return {'checked': 0, 'reason': 'retirement-evidence-unavailable'}
     results = []
     deadline = time.monotonic() + 60
+    try:
+        with closing(sqlite3.connect(C3_DB.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+            retirement = db.execute("SELECT value FROM meta WHERE key='pre_migration_execution_retired'").fetchone()
+        if not retirement:
+            return {'checked': 0, 'reason': 'retirement-evidence-unavailable'}
+        cutoff = datetime.fromisoformat(retirement[0].replace('Z', '+00:00')).timestamp()
+    except (ValueError, OSError, sqlite3.Error):
+        return {'checked': 0, 'reason': 'retirement-evidence-invalid'}
     with writer.RepoLock(writer.ROADMAP_REPOSITORY):
         listing = writer._git(C3_REPO, 'worktree', 'list', '--porcelain')
         if listing.returncode:
@@ -246,7 +255,7 @@ def sweep_legacy_c3(*, dry_run=False, batch_limit=25):
             if dirty.returncode or dirty.stdout.strip() or writer._operation_in_progress(path):
                 result['reason'] = 'dirty-or-conflicted'
                 continue
-            if metadata.returncode or Path(metadata.stdout.strip()).stat().st_mtime >= RETIREMENT_MARKER.stat().st_mtime:
+            if metadata.returncode or Path(metadata.stdout.strip()).stat().st_mtime >= cutoff:
                 result['reason'] = 'post-retirement-or-unknown'
                 continue
             if not _legacy_allowed(branch, path, tip):

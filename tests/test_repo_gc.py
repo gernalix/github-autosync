@@ -65,7 +65,7 @@ class SafeGcTests(unittest.TestCase):
                 repo, remote, worktree, payload=self.fixture(root)
                 payload['roadmap_prompt_id']='123456'
                 with closing(sqlite3.connect(gc.C3_DB)) as db:
-                    db.executescript("CREATE TABLE work_items(work_item_id,status,prompt_id); CREATE TABLE work_item_runs(work_item_id,worker_ref,metadata_json,state); CREATE TABLE work_item_checkpoints(work_item_id,next_action);")
+                    db.executescript("CREATE TABLE work_items(work_item_id,status,prompt_id); CREATE TABLE work_item_runs(work_item_id,worker_ref,metadata_json,state); CREATE TABLE work_item_checkpoints(work_item_id,next_action); CREATE TABLE work_item_execution_specs(work_item_id,worktree);")
                     db.execute("INSERT INTO work_items VALUES('prompt:123456','running','123456')")
                     db.commit()
                     self.assertFalse(gc.c3_allows(payload))

@@ -10,6 +10,8 @@ import time
 import repo_single_writer as writer
 
 C3_DB = Path.home() / '.local/state/c3-control/roadmap.sqlite'
+C3_REPO = Path.home() / 'projects/codex-roadmap'
+RETIREMENT_MARKER = Path.home() / '.local/state/c3-control/c2-retired.json'
 
 
 def c3_allows(payload):
@@ -20,6 +22,11 @@ def c3_allows(payload):
         return not prompt
     try:
         with closing(sqlite3.connect(C3_DB.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+            path = str(payload.get('worktree') or '')
+            if path and db.execute("""SELECT 1 FROM work_item_execution_specs s
+                JOIN work_items w ON w.work_item_id=s.work_item_id
+                WHERE s.worktree=? AND w.status NOT IN ('completed','cancelled','superseded') LIMIT 1""", (path,)).fetchone():
+                return False
             if prompt:
                 item = db.execute('SELECT work_item_id,status FROM work_items WHERE prompt_id=?', (prompt,)).fetchone()
                 if not item or item[1] not in ('completed', 'cancelled', 'superseded'):
@@ -153,6 +160,8 @@ def sweep(*, dry_run=False, batch_limit=25):
                 repos.add(Path(payload['repo_path']))
         results.append({'task_id': payload.get('task_id'), **result})
     for repo in repos:
+        if time.monotonic() >= deadline:
+            break
         # Git's default grace periods preserve recent/reflog recovery objects.
         try:
             writer._git(repo, '-c', 'gc.autoDetach=false', 'gc', '--auto', timeout=30)
@@ -166,6 +175,103 @@ def periodic():
     if stamp.exists() and time.time() - stamp.stat().st_mtime < 3600:
         return {'status': 'not-due'}
     result = sweep()
+    result['legacy_c3'] = sweep_legacy_c3()
     stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.touch()
     return result
+
+
+def _legacy_path(path):
+    """Only retired C2 namespaces; app-managed and arbitrary user trees excluded."""
+    home = Path.home()
+    try:
+        relative = path.relative_to(home / '.local/share')
+        return relative.parts[0].startswith('c2-')
+    except ValueError:
+        return path.parent == Path('/tmp') and (
+            path.name.startswith('c2-') or path.name.startswith('codex-roadmap-'))
+
+
+def _legacy_allowed(branch, path, tip):
+    if branch.startswith(('checkpoint/', 'archive/', 'recovery/')):
+        return False
+    with closing(sqlite3.connect(C3_DB.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+        if not db.execute("SELECT 1 FROM meta WHERE key='pre_migration_execution_retired'").fetchone():
+            return False
+        for item in db.execute('SELECT work_item_id,prompt_id,status FROM work_items'):
+            prompt_match = item[1] and re.search(r'(?<!\d)' + re.escape(item[1]) + r'(?!\d)', branch + '/' + path.name)
+            short = re.search(r'wi-([0-9a-f]{4,32})(?:[^0-9a-f]|$)', branch)
+            wi_match = short and item[0].startswith('wi:' + short[1])
+            if (prompt_match or wi_match) and item[2] not in ('completed','cancelled','superseded'):
+                return False
+        if db.execute('SELECT 1 FROM work_item_checkpoints WHERE source_commit=? AND next_action IS NOT NULL LIMIT 1', (tip,)).fetchone():
+            return False
+    return c3_allows({'worktree': str(path), 'branch': branch})
+
+
+def sweep_legacy_c3(*, dry_run=False, batch_limit=25):
+    if not C3_DB.is_file() or not RETIREMENT_MARKER.is_file() or not C3_REPO.is_dir():
+        return {'checked': 0, 'reason': 'retirement-evidence-unavailable'}
+    results = []
+    deadline = time.monotonic() + 60
+    with writer.RepoLock(writer.ROADMAP_REPOSITORY):
+        listing = writer._git(C3_REPO, 'worktree', 'list', '--porcelain')
+        if listing.returncode:
+            return {'checked': 0, 'reason': 'worktree-inventory-unavailable'}
+        candidates = []
+        for block in listing.stdout.strip().split('\n\n'):
+            fields = dict(line.split(' ', 1) for line in block.splitlines() if ' ' in line)
+            path = Path(fields.get('worktree', '')).resolve()
+            if path != C3_REPO.resolve() and _legacy_path(path):
+                candidates.append((path, fields.get('branch', '').removeprefix('refs/heads/'), fields.get('HEAD', '')))
+        if candidates:
+            offset = (int(time.time()) // 3600 * batch_limit) % len(candidates)
+            candidates = candidates[offset:] + candidates[:offset]
+        for path, branch, tip in candidates[:batch_limit]:
+            if time.monotonic() >= deadline:
+                break
+            result = {'worktree': str(path), 'removed': []}
+            results.append(result)
+            if not path.is_dir():
+                result['reason'] = 'missing-worktree-preserved'
+                continue
+            if not branch or not _legacy_allowed(branch, path, tip):
+                result['reason'] = 'nonterminal-active-or-recovery'
+                continue
+            if writer._git(C3_REPO, 'merge-base', '--is-ancestor', tip, 'refs/heads/main').returncode:
+                result['reason'] = 'unintegrated-tip'
+                continue
+            dirty = writer._git(path, 'status', '--porcelain', '--untracked-files=all')
+            metadata = writer._git(path, 'rev-parse', '--absolute-git-dir')
+            if dirty.returncode or dirty.stdout.strip() or writer._operation_in_progress(path):
+                result['reason'] = 'dirty-or-conflicted'
+                continue
+            if metadata.returncode or Path(metadata.stdout.strip()).stat().st_mtime >= RETIREMENT_MARKER.stat().st_mtime:
+                result['reason'] = 'post-retirement-or-unknown'
+                continue
+            if not _legacy_allowed(branch, path, tip):
+                result['reason'] = 'active-at-delete'
+                continue
+            if not dry_run and writer._git(C3_REPO, 'worktree', 'remove', str(path), timeout=30).returncode:
+                result['reason'] = 'worktree-preserved'
+                continue
+            result['removed'].append('worktree')
+            # Remote cleanup is limited to this proven integrated exact tip.
+            remote = writer._git(C3_REPO, 'ls-remote', '--heads', 'origin', 'refs/heads/' + branch, timeout=20)
+            if remote.returncode:
+                result['reason'] = 'remote-read-failed'
+                continue
+            fields = remote.stdout.split()
+            if fields:
+                if len(fields) != 2 or fields[0] != tip:
+                    result['reason'] = 'remote-changed'
+                    continue
+                if dry_run or writer._git(C3_REPO, 'push', 'origin', '--force-with-lease=refs/heads/' + branch + ':' + tip,
+                                         ':refs/heads/' + branch, timeout=30).returncode == 0:
+                    result['removed'].append('remote-branch')
+                else:
+                    result['reason'] = 'remote-delete-refused'
+                    continue
+            if dry_run or writer._git(C3_REPO, 'update-ref', '-d', 'refs/heads/' + branch, tip).returncode == 0:
+                result['removed'].append('local-branch')
+    return {'checked': len(results), 'results': results}

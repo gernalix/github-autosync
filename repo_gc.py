@@ -44,6 +44,8 @@ def collect_record(payload, *, dry_run=False):
     path = Path(str(payload.get('worktree') or '')).expanduser().resolve()
     if not branch.startswith('task/') or path == repo or not payload.get('worktree'):
         return {'removed': [], 'reason': 'invalid-target'}
+    if not repo.is_dir() or writer._git(repo, 'rev-parse', '--is-inside-work-tree').returncode:
+        return {'removed': [], 'reason': 'repository-unavailable'}
     canonical = str(payload.get('canonical_branch') or 'main')
     base = 'refs/remotes/origin/' + canonical
     head = writer._git(repo, 'rev-parse', '--verify', 'refs/heads/' + branch)

@@ -215,25 +215,11 @@ class AutosyncTests(unittest.TestCase):
             projects = Path(tmp)
             worktree = projects / "codex-roadmap"
             worktree.mkdir()
-            repo = {
-                "name": "codex-roadmap",
-                "url": "https://github.com/gernalix/codex-roadmap",
-                "default_branch": "main",
-                "pushed_at": "A",
-                "archived": "0",
-            }
-            with (
-                mock.patch.object(autosync, "git_repo_matches_remote", return_value=True),
-                mock.patch.object(
-                    autosync,
-                    "sync_roadmap_repo",
-                    return_value=("up_to_date", None),
-                ) as reconcile,
-            ):
+            repo = {"name":"codex-roadmap", "url":"https://github.com/gernalix/codex-roadmap", "default_branch":"main", "pushed_at":"A", "archived":"0"}
+            with mock.patch.object(autosync, "git_repo_matches_remote", return_value=True), mock.patch.object(autosync, "sync_roadmap_repo", side_effect=AssertionError("retired C3 reconciler called")), mock.patch.object(autosync, "_git_operation", return_value="rebase_in_progress"):
                 result = autosync.sync_changed_repo(repo, projects, dry_run=False)
-            self.assertEqual(("up_to_date", None), result)
-            reconcile.assert_called_once()
-            self.assertEqual(worktree, reconcile.call_args.args[1])
+            self.assertEqual("deferred", result[0])
+            self.assertIn("rebase_in_progress", str(result[1]))
 
     def test_reconcile_all_checkpoints_dirty_generic_repo_and_pushes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -357,29 +343,10 @@ class AutosyncTests(unittest.TestCase):
         self.assertNotIn("repo_single_writer.process_ready_prs(args.owner)", source)
 
     def test_queue_merged_roadmap_completions_marks_only_successful_submission(self) -> None:
-        pending = [{"task_id": "123456"}, {"task_id": "654321"}]
-        calls: list[str] = []
-
-        def fake_run(cmd: list[str], cwd: Path | None = None, **kwargs: object) -> subprocess.CompletedProcess[str]:
-            prompt_id = cmd[cmd.index("--prompt-id") + 1]
-            calls.append(prompt_id)
-            return ok("{}\n") if prompt_id == "123456" else subprocess.CompletedProcess(cmd, 2, "", "failed")
-
-        with (
-            mock.patch.object(repo_single_writer, "pending_roadmap_completions", return_value=pending),
-            mock.patch.object(repo_single_writer, "mark_roadmap_completion_queued") as mark,
-            mock.patch.object(autosync, "ROADMAP_FINISH_SCRIPT", Path("/tmp/roadmap_finish.py")),
-            mock.patch.object(Path, "is_file", return_value=True),
-            mock.patch.object(autosync, "run", side_effect=fake_run),
-        ):
+        with mock.patch.object(repo_single_writer, "pending_roadmap_completions", side_effect=AssertionError("C3 metadata queried")), mock.patch.object(autosync, "run", side_effect=AssertionError("C3 callback executed")):
             result = autosync.queue_merged_roadmap_completions()
-
-        self.assertEqual(["123456", "654321"], calls)
-        self.assertEqual(1, result["queued"])
-        self.assertEqual(1, result["deferred"])
-        self.assertEqual(["123456"], result["prompt_ids"])
-        self.assertEqual(["654321"], result["failed"])
-        mark.assert_called_once_with("123456")
+        self.assertEqual(0, result["queued"])
+        self.assertTrue(result["retired"])
 
     def test_runtime_deploy_contract_covers_managed_local_runtimes(self) -> None:
         self.assertIn("gernalix/workflowy-importer", autosync.ALLOWED_REPOSITORIES)

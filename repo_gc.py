@@ -16,6 +16,12 @@ RETIREMENT_MARKER = Path.home() / '.local/state/c3-control/c2-retired.json'
 
 
 def c3_allows(payload):
+    # Frozen historical workers/worktrees are retained. Ordinary Git GC needs no
+    # roadmap database, lifecycle lease or C3 service.
+    if payload.get('roadmap_prompt_id') or re.fullmatch(r'\d{6}', str(payload.get('task_id') or '')):
+        return False
+    path = str(payload.get('worktree') or '')
+    return not any(part in path for part in ('c2-supervisor', 'c3-symphony', 'c3-control'))
     prompt = str(payload.get('roadmap_prompt_id') or '')
     if not prompt and re.fullmatch(r'\d{6}', str(payload.get('task_id') or '')):
         prompt = str(payload['task_id'])
@@ -242,6 +248,7 @@ def _terminal_branch(branch, tip):
 
 
 def sweep_orphan_c3(*, dry_run=False, batch_limit=25):
+    return {"reason": "C3 archive frozen; historical worktrees preserved"}
     if not C3_DB.is_file() or not C3_REPO.is_dir():
         return {'checked': 0, 'reason': 'authority-unavailable'}
     results = []
@@ -299,6 +306,7 @@ def sweep_orphan_c3(*, dry_run=False, batch_limit=25):
 
 
 def sweep_legacy_c3(*, dry_run=False, batch_limit=25):
+    return {"reason": "C3 archive frozen; historical worktrees preserved"}
     if not C3_DB.is_file() or not RETIREMENT_MARKER.is_file() or not C3_REPO.is_dir():
         return {'checked': 0, 'reason': 'retirement-evidence-unavailable'}
     results = []

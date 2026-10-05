@@ -6,6 +6,6 @@ Read `project-capsule.yaml` for repository identity, scope, verification command
 
 - `github-autosync` synchronizes only its explicit managed repository allowlist. Do not expand it implicitly.
 - Keep canonical branches protected. Use isolated `task/*` worktrees and `repo-task` for repository changes; `repo-integrator` owns queued PR integration.
-- `codex-roadmap` keeps its dedicated guarded pull and single-writer lifecycle. Do not mutate its database or materialized state directly.
+- C3 is a frozen archive; ordinary project Git operations have no C3 lifecycle dependency. Preserve its historical database and worktrees.
 - Preserve user work and external state. Do not stash, reset, force-pull, or force-push.
 - Treat systemd installation, deployment, and forced network reconciliation as operational actions; use the documented commands only when explicitly required.

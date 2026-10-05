@@ -1418,8 +1418,6 @@ def sync_changed_repo(
         return clone_repo(repo, projects_dir, dry_run=dry_run, target_worktree=worktree), None
     if not git_repo_matches_remote(worktree, repo["url"]):
         return "deferred", issue(entry, "origin_mismatch")
-    if github_remote_key(repo["url"]) == ROADMAP_REPOSITORY:
-        return sync_roadmap_repo(repo, worktree, entry, dry_run=dry_run)
     operation = _git_operation(worktree)
     if operation:
         return "deferred", issue(entry, operation)
@@ -1648,6 +1646,7 @@ def _status_for(issues: list[dict[str, Any]], work_done: int) -> str:
 
 def queue_merged_roadmap_completions() -> dict[str, Any]:
     """Queue terminal PASS only after the repository single writer has merged the task."""
+    return {"queued": 0, "deferred": 0, "prompt_ids": [], "failed": [], "retired": True}
     pending = repo_single_writer.pending_roadmap_completions()
     result: dict[str, Any] = {"queued": 0, "deferred": 0, "prompt_ids": [], "failed": []}
     for task in pending:

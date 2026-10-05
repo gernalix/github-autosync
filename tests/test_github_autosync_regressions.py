@@ -192,6 +192,8 @@ class AutosyncRegressionTests(unittest.TestCase):
             }
 
             def fake_run(cmd: list[str], cwd: Path | None = None, **_: object) -> subprocess.CompletedProcess[str]:
+                if cmd == ["git", "rev-parse", "--verify", "HEAD"]:
+                    return ok("abc\n")
                 if cmd[:3] == ["git", "status", "--porcelain"]:
                     return ok()
                 if cmd[:3] == ["git", "branch", "--show-current"]:
@@ -208,6 +210,8 @@ class AutosyncRegressionTests(unittest.TestCase):
 
             with (
                 mock.patch.object(autosync, "git_repo_matches_remote", return_value=True),
+                mock.patch.object(autosync, "_git_operation", return_value=None),
+                mock.patch.object(autosync, "_matching_remote", return_value="origin"),
                 mock.patch.object(autosync, "run", side_effect=fake_run),
             ):
                 result, problem = autosync.sync_changed_repo(repo, root, dry_run=True)

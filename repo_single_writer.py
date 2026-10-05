@@ -1085,6 +1085,7 @@ def start_roadmap_task(
     *,
     actor: str = "codex",
 ) -> dict[str, Any]:
+    raise RuntimeError("C3 is retired; start the project issue with repo-task start")
     repo = resolve_repo_path(repo_slug, project_id)
     if repo is None:
         raise RuntimeError(f"canonical worktree not found for {repo_slug}")

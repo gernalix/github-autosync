@@ -61,34 +61,10 @@ class SafeGcTests(unittest.TestCase):
                 self.assertNotEqual(0, fixtures.git(['show-ref', '--verify', 'refs/heads/'+payload['branch']], repo).returncode)
 
     def test_active_recovery_and_unintegrated_are_fail_closed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp)
-            with patch.object(writer, 'STATE_ROOT', root/'state'), patch.object(writer, 'WORKTREE_ROOT', root/'worktrees'), patch.object(gc, 'C3_DB', root/'c3.sqlite'):
-                repo, remote, worktree, payload=self.fixture(root)
-                payload['roadmap_prompt_id']='123456'
-                with closing(sqlite3.connect(gc.C3_DB)) as db:
-                    db.executescript("CREATE TABLE work_items(work_item_id,status,prompt_id); CREATE TABLE work_item_runs(work_item_id,worker_ref,metadata_json,state); CREATE TABLE work_item_checkpoints(work_item_id,next_action); CREATE TABLE work_item_execution_specs(work_item_id,worktree);")
-                    db.execute("INSERT INTO work_items VALUES('prompt:123456','running','123456')")
-                    db.commit()
-                    self.assertFalse(gc.c3_allows(payload))
-                    db.execute("UPDATE work_items SET status='completed'")
-                    db.execute("INSERT INTO work_item_runs VALUES('prompt:123456','worker','{}','recovering')")
-                    db.commit()
-                    self.assertFalse(gc.c3_allows(payload))
-                    db.execute('DELETE FROM work_item_runs')
-                    db.execute("INSERT INTO work_item_checkpoints VALUES('prompt:123456','recover')")
-                    db.commit()
-                    self.assertFalse(gc.c3_allows(payload))
-                    db.execute('DELETE FROM work_item_checkpoints')
-                    db.commit()
-                    self.assertTrue(gc.c3_allows(payload))
-                (worktree/'new.txt').write_text('unintegrated')
-                fixtures.git(['add','new.txt'],worktree)
-                fixtures.git(['commit','-m','unintegrated'],worktree)
-                self.assertEqual('changed-after-merge',gc.collect_record(payload)['reason'])
-                payload.pop('integrated_head')
-                self.assertEqual('unintegrated-tip',gc.collect_record(payload)['reason'])
-                self.assertTrue(worktree.exists())
+        with patch.object(gc.sqlite3, "connect", side_effect=AssertionError("C3 database opened")):
+            self.assertFalse(gc.c3_allows({"task_id":"123456", "roadmap_prompt_id":"123456"}))
+            self.assertFalse(gc.c3_allows({"task_id":"new", "worktree":"/home/daniele/.local/share/c3-symphony/workspaces/GH-4"}))
+            self.assertTrue(gc.c3_allows({"task_id":"new-project-issue", "worktree":"/tmp/project-task"}))
 
     def test_remote_only_merged_branch_is_collected_with_expected_tip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -101,36 +77,8 @@ class SafeGcTests(unittest.TestCase):
                 self.assertNotEqual(0,fixtures.git(['show-ref','--verify','refs/heads/'+payload['branch']],remote).returncode)
 
     def test_legacy_c3_requires_retirement_terminal_ownership_clean_and_integrated(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp)
-            marker=root/'retired.json'
-            marker.write_text('{}')
-            os.utime(marker,(time.time()+1000,time.time()+1000))
-            with patch.object(writer,'STATE_ROOT',root/'state'), patch.object(writer,'WORKTREE_ROOT',root/'worktrees'), patch.object(gc,'C3_DB',root/'c3.sqlite'), patch.object(gc,'RETIREMENT_MARKER',marker), patch.object(gc,'_legacy_path',return_value=True):
-                repo,remote,worktree,payload=self.fixture(root)
-                with closing(sqlite3.connect(gc.C3_DB)) as db:
-                    db.executescript("CREATE TABLE meta(key,value); CREATE TABLE work_items(work_item_id,status,prompt_id); CREATE TABLE work_item_execution_specs(work_item_id,worktree); CREATE TABLE work_item_checkpoints(work_item_id,next_action,source_commit); CREATE TABLE work_item_runs(work_item_id,worker_ref,metadata_json,state);")
-                    from datetime import datetime,timezone
-                    db.execute('INSERT INTO meta VALUES(?,?)',('pre_migration_execution_retired',datetime.fromtimestamp(time.time()+1000,timezone.utc).isoformat()))
-                    db.commit()
-                    with patch.object(gc,'C3_REPO',repo):
-                        (worktree/'dirty.txt').write_text('preserve')
-                        self.assertEqual('dirty-or-conflicted',gc.sweep_legacy_c3(dry_run=True)['results'][0]['reason'])
-                        (worktree/'dirty.txt').unlink()
-                        db.execute("INSERT INTO work_items VALUES('wi:prepared','pending',NULL)")
-                        db.execute('INSERT INTO work_item_execution_specs VALUES(?,?)',('wi:prepared',str(worktree)))
-                        db.commit()
-                        self.assertEqual('nonterminal-active-or-recovery',gc.sweep_legacy_c3(dry_run=True)['results'][0]['reason'])
-                        db.execute("UPDATE work_items SET status='completed'")
-                        db.commit()
-                        before=db.total_changes
-                        planned=gc.sweep_legacy_c3(dry_run=True)['results'][0]
-                        self.assertEqual(['worktree','remote-branch','local-branch'],planned['removed'])
-                        self.assertTrue(worktree.exists())
-                        result=gc.sweep_legacy_c3()['results'][0]
-                        self.assertEqual(planned,result)
-                        self.assertEqual(before,db.total_changes)
-                        self.assertFalse(worktree.exists())
+        with patch.object(gc.sqlite3, "connect", side_effect=AssertionError("C3 archive opened")), patch.object(writer, "_git", side_effect=AssertionError("historical Git mutated")):
+            self.assertIn("frozen", gc.sweep_legacy_c3()["reason"])
 
     def test_app_managed_paths_are_never_legacy_gc_targets(self):
         self.assertFalse(gc._legacy_path(Path.home()/'.codex/worktrees/1234/codex-roadmap'))
@@ -138,29 +86,5 @@ class SafeGcTests(unittest.TestCase):
         self.assertTrue(gc._legacy_path(Path.home()/'.local/share/c2-supervisor/worktrees/123456'))
 
     def test_orphan_gc_requires_positive_terminal_owner_and_preserves_unknown_refs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp)
-            with patch.object(writer,'STATE_ROOT',root/'state'), patch.object(writer,'WORKTREE_ROOT',root/'worktrees'), patch.object(gc,'C3_DB',root/'c3.sqlite'):
-                repo,remote,worktree,payload=self.fixture(root)
-                fixtures.git(['worktree','remove',str(worktree)],repo)
-                fixtures.git(['branch','task/123456',payload['branch']],repo)
-                fixtures.git(['push','origin','task/123456'],repo)
-                with closing(sqlite3.connect(gc.C3_DB)) as db:
-                    db.executescript("CREATE TABLE meta(key,value); CREATE TABLE work_items(work_item_id,status,prompt_id); CREATE TABLE work_item_execution_specs(work_item_id,worktree); CREATE TABLE work_item_checkpoints(work_item_id,next_action,source_commit); CREATE TABLE work_item_runs(work_item_id,worker_ref,metadata_json,state);")
-                    db.execute("INSERT INTO meta VALUES('pre_migration_execution_retired','yes')")
-                    db.execute("INSERT INTO work_items VALUES('prompt:123456','pending','123456')")
-                    db.commit()
-                    with patch.object(gc,'C3_REPO',repo):
-                        self.assertFalse(any(x['removed'] for x in gc.sweep_orphan_c3(dry_run=True)['results']))
-                        db.execute("UPDATE work_items SET status='completed'")
-                        db.execute("INSERT INTO work_item_checkpoints VALUES('prompt:123456','recover',NULL)")
-                        db.commit()
-                        self.assertFalse(any(x['removed'] for x in gc.sweep_orphan_c3(dry_run=True)['results']))
-                        db.execute('DELETE FROM work_item_checkpoints'); db.commit()
-                        planned=gc.sweep_orphan_c3(dry_run=True)
-                        eligible=[x for x in planned['results'] if x['removed']]
-                        self.assertEqual(['task/123456'],[x['branch'] for x in eligible])
-                        self.assertEqual(['remote-branch','local-branch'],eligible[0]['removed'])
-                        result=gc.sweep_orphan_c3()
-                        self.assertEqual(planned,result)
-                        self.assertEqual(0,fixtures.git(['show-ref','--verify','refs/heads/'+payload['branch']],repo).returncode)
+        with patch.object(gc.sqlite3, "connect", side_effect=AssertionError("C3 archive opened")), patch.object(writer, "_git", side_effect=AssertionError("historical Git mutated")):
+            self.assertIn("frozen", gc.sweep_orphan_c3()["reason"])

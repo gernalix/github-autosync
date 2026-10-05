@@ -48,13 +48,13 @@ A failure in one repository does not abort the global pass: the remaining reposi
 
 ## Parallel ChatGPT/Codex work
 
-For every repository except `codex-roadmap`, use one isolated worktree per task:
+Use one isolated worktree per task:
 
 ```bash
 repo-task start --repo ~/projects/PersonalHub --task-id 123456 --actor codex
 ```
 
-The command prints the worktree path. Work only there. Worker coordination is branch/worktree isolation, not a repository lease: a dirty canonical checkout cannot block a fresh task worktree created from the fetched remote canonical tip. `repo-task heartbeat` is retained only as a compatibility activity marker. Roadmap-launched Codex tasks use `repo-task start-roadmap` automatically and receive the worktree path directly from `roadmap_start.py`.
+The command prints the worktree path. Work only there. Worker coordination is branch/worktree isolation, not a repository lease: a dirty canonical checkout cannot block a fresh task worktree created from the fetched remote canonical tip. `repo-task heartbeat` is retained only as a compatibility activity marker. Start from the project issue; no C3 registration or PROMPT_ID is required.
 
 When the task is complete:
 
@@ -66,7 +66,7 @@ This checkpoints the completed task, pushes its `task/123456` branch and creates
 
 Multiple ChatGPT/Codex sessions can therefore work on the same repository concurrently without sharing a checkout. The canonical checkout is never a worker workspace.
 
-The canonical branch is guarded locally: direct commits/merges to it are rejected. A local fast-forward to the exact fetched remote canonical tip is synchronization, not a new canonical write. This also applies to codex-roadmap code; its lifecycle DB has a separate local C3 writer outside Git.
+The canonical branch is guarded locally: direct commits/merges to it are rejected. A local fast-forward to the exact fetched remote canonical tip is synchronization, not a new canonical write. This also applies to codex-roadmap code; its historical lifecycle DB remains read-only and has no active writer.
 
 Repositories whose canonical branch is intentionally owned by a dedicated local service are excluded from the generic writer. Currently `gernalix/activity-watch-data` is owned by `activity-watch-uploader`, and `gernalix/codex-usage` is owned by the Fedora `codex-usage-publisher`: `github-reconcile` removes only its own generic reference hook (restoring any pre-existing hook) and leaves those checkouts untouched. This prevents the autosync writer from racing or blocking the service that is authoritative for each data repository.
 
@@ -79,37 +79,19 @@ github-reconcile --dry-run
 Two periodic timers have separate responsibilities: `github-autosync.timer` synchronizes/audits repositories, while `repo-integrator.timer` owns the queued PR integration path.
 
 The integrator also performs bounded hourly terminal-aware Git maintenance using
-existing task records. C3-linked tasks must be terminal with no active execution or
-recovery pointer. Only unchanged, clean managed worktrees and tips proved contained
+existing task records. Historical C3-linked worktrees are frozen and preserved.
+Only unchanged, clean managed project worktrees and tips proved contained
 in fetched canonical are removed; remote deletion is compare-and-delete fenced.
 Dirty, conflicted, active, referenced, unknown or unintegrated work is preserved.
 Scans rotate so preserved tasks cannot starve later candidates. Git object maintenance
 uses normal grace periods, never immediate pruning. No extra service or timer is used.
 
-### C3 integration projection
+### Project backlog and integration
 
-AI operations: [/home/daniele/MegaVault/ai/META_INFRASTRUCTURE.md](/home/daniele/MegaVault/ai/META_INFRASTRUCTURE.md). The implementation details below are not an additional cross-project protocol.
-
-Only task records carrying an explicit `roadmap_prompt_id` created by `roadmap_start.py` may feed a completion back to `codex-roadmap`. A historical `actor=codex` record is not enough. After merge, `repo-integrator` calls the canonical `roadmap_finish.py --result PASS`; it never writes roadmap state itself.
-
-`github-autosync` owns **repository integration state** shown by the C3 web application. It does not decide canonical roadmap lifecycle; it reports the real Git pipeline for each roadmap `PROMPT_ID`.
-
-Use one bulk call:
-
-```bash
-repo-task status-all --roadmap-only
-```
-
-When looking up one task ID, pass `--repo gernalix/name` to `status-any`, `finish-any`, or `wait-any`. An unscoped lookup fails if multiple repositories use the same task ID. For a canonically superseded task with a clean historical branch and no PR, `repo-task retire-superseded --repo PATH --task-id ID --terminal-evidence 'canonical receipt'` retires only the local task record; it preserves the branch and worktree.
-
-Each task exposes `pipeline_state` plus the concrete integration observation, PR URL/number and FIFO queue position. Typical values are:
-
-- `running`: worker worktree active;
-- `integration`: PR queued, checks pending, refreshed after rebase, or integrating;
-- `needs-fix`: a real integration blocker such as semantic conflict or failed checks;
-- `done`: merge completed.
-
-The integrator persists observations such as `queued`, `checks-pending`, `rebasing`, `integrating`, `semantic-conflict` and `merged` in the task record. C3 consumes this contract instead of inferring state from Markdown, branch names or PR titles.
+Project GitHub Issues (or the project's Git backlog) own pending work. Local
+task-state is created only when a task starts. C3 is a frozen archive: the integrator
+does not read its lifecycle, send terminal callbacks or clean historical C3 workers.
+`start-roadmap` rejects permanently; use ordinary `repo-task start`.
 
 ## Responsibilities
 
@@ -120,9 +102,8 @@ The integrator persists observations such as `queued`, `checks-pending`, `rebasi
 - perform a lightweight **local-only audit** even when the remote fingerprint is unchanged, so dirty worktrees and local commits are not hidden by the remote fast path;
 - protect canonical branches with a local reference guard while workers remain branch-isolated and integration is asynchronous;
 - recover a rejected clean push with one evidence-producing fetch, then retry or rebase-and-push only when the new relation makes that safe;
-- always reconcile `codex-roadmap` through its canonical `tools/roadmap_pull.py` path, even when the GitHub fingerprint is unchanged, so generated-view dirt, interrupted guarded fast-forwards, and stale/missing pull guards heal automatically;
 - append every successful automatic repository mutation (`clone`, fast-forward `pull`, `push`) to a durable JSONL activity ledger;
-- skip network reconciliation for unchanged, clean, synchronized repositories except `codex-roadmap`, whose guarded reconciler is intentionally checked every run;
+- skip network reconciliation for unchanged, clean, synchronized repositories;
 - never stash, hard-reset, force-pull or force-push user work; unresolved semantic conflicts remain deferred for review;
 - register genuinely new managed repositories in MegaVault when its worktree is clean and synchronized;
 - expose truthful machine-readable states: `ok`, `partial`, `deferred`, `error`, or `locked`;
@@ -269,7 +250,7 @@ prevent its own fix from being deployed.
 short Italian summary. `--json` emits the full machine-readable result; an unresolved
 repository returns exit code 2 after the other repositories have been processed.
 
-The canonical checkout is never a worker workspace. Agent changes belong in `repo-task` worktrees. Completed task PRs are serialized asynchronously by `repo-integrator`; pending checks remain queued, canonical advances are rebased automatically on clean task branches, and only real semantic conflicts require repair. The roadmap keeps its own guarded mutation writer.
+The canonical checkout is never a worker workspace. Agent changes belong in `repo-task` worktrees. Completed task PRs are serialized asynchronously by `repo-integrator`; pending checks remain queued, canonical advances are rebased automatically on clean task branches, and only real semantic conflicts require repair. C3 remains a frozen archive; no mutation writer is required.
 
 ## Verification
 

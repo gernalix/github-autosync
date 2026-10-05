@@ -292,42 +292,9 @@ class SingleWriterTests(unittest.TestCase):
                 self.assertIsNone(record["lease_expires_at"])
 
     def test_start_roadmap_task_resolves_canonical_repo_and_creates_worktree(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo, _ = self.make_repo(root / "git")
-            state = root / "state"
-            worktrees = root / "worktrees"
-            with (
-                mock.patch.object(writer, "STATE_ROOT", state),
-                mock.patch.object(writer, "WORKTREE_ROOT", worktrees),
-                mock.patch.object(writer, "resolve_repo_path", return_value=repo),
-            ):
-                payload = writer.start_roadmap_task("gernalix/example", "1", "654321")
-                self.assertEqual("task/654321", payload["branch"])
-                self.assertEqual("654321", payload["roadmap_prompt_id"])
-                self.assertTrue(Path(payload["worktree"]).exists())
-
-                record_path = writer._task_record(repo, "654321")
-                merged = json.loads(record_path.read_text(encoding="utf-8"))
-                merged["status"] = "merged"
-                writer._atomic_json(record_path, merged)
-                pending = writer.pending_roadmap_completions()
-                self.assertEqual(["654321"], [item["task_id"] for item in pending])
-                deferred = writer.defer_roadmap_completion("654321", "post-merge acceptance")
-                self.assertTrue(deferred["roadmap_completion_deferred"])
-                self.assertEqual("post-merge acceptance", deferred["roadmap_completion_defer_reason"])
-                self.assertEqual([], writer.pending_roadmap_completions())
-                self.assertTrue(writer.defer_roadmap_completion("654321", "post-merge acceptance")["roadmap_completion_deferred"])
-                status = writer.task_status_any("654321")
-                self.assertTrue(status["roadmap_completion_deferred"])
-                self.assertEqual("post-merge acceptance", status["roadmap_completion_defer_reason"])
-                released = writer.release_roadmap_completion("654321")
-                self.assertNotIn("roadmap_completion_deferred", released)
-                self.assertNotIn("roadmap_completion_queued_at", released)
-                self.assertEqual(["654321"], [item["task_id"] for item in writer.pending_roadmap_completions()])
-                writer.release_roadmap_completion("654321")
-                writer.mark_roadmap_completion_queued("654321")
-                self.assertEqual([], writer.pending_roadmap_completions())
+        with mock.patch.object(writer, "resolve_repo_path", side_effect=AssertionError("C3 preparation entered")):
+            with self.assertRaisesRegex(RuntimeError, "C3 is retired"):
+                writer.start_roadmap_task("gernalix/example", "1", "654321")
 
     def test_actor_only_legacy_task_is_not_a_roadmap_completion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

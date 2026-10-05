@@ -7,7 +7,7 @@ scope:
   purpose: Synchronize and integrate an explicit allowlist of gernalix GitHub repositories from Fedora.
   boundaries:
     - MegaVault owns project and repository identity and registry facts.
-    - codex-roadmap owns C2 work item lifecycle and its guarded roadmap state.
+    - Project Git/GitHub owns backlog; local task-state exists only during execution.
     - This repository does not manage repositories outside ALLOWED_REPOSITORIES.
 repository:
   canonical_workdir: /home/daniele/projects/github-autosync
@@ -27,9 +27,6 @@ dependencies:
   - name: MegaVault
     project_id: 23
     purpose: Canonical project and repository registry and external runtime state inventory.
-  - name: codex-roadmap
-    project_id: 51
-    purpose: C2 lifecycle and guarded roadmap integration.
 data:
   schema: No application database lives in this repository. Runtime state is external JSON; the mutation activity ledger is external JSONL under /home/daniele/.local/state/codex-github-autosync.
   migrations: Not applicable; there is no repository-local database schema.
@@ -59,7 +56,7 @@ safety:
   invariants:
     - Only repositories in ALLOWED_REPOSITORIES are synchronized by the service.
     - Canonical branches remain protected; repo-integrator serializes final repository integration.
-    - codex-roadmap writes use its dedicated guarded single-writer path.
+    - C3 is a frozen archive; no active Git operation depends on its runtime.
     - Git recovery preserves dirty or divergent user work.
   risky_operations:
     - install_systemd.py changes installed user commands and systemd units; use only for an explicitly requested install or deployment.
@@ -74,7 +71,6 @@ acceptance:
   - Repository integration and the resulting canonical head are read back before reporting completion.
 references:
   megavault: /home/daniele/MegaVault/megavault.sqlite
-  c2: /home/daniele/projects/codex-roadmap/roadmap.sqlite
 freshness:
   reviewed_commit: 262bae15cd8f5a0fa067de2c8f13b150273ac53f
   watch_paths:

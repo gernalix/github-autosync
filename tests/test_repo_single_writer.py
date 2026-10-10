@@ -392,13 +392,13 @@ class SingleWriterTests(unittest.TestCase):
                 payload = writer.start_task(repo, "dirty-canonical", "codex")
                 self.assertTrue(Path(payload["worktree"]).exists())
 
-    def test_process_ready_prs_is_fifo_per_repository(self) -> None:
+    def test_failed_pr_does_not_block_independent_pr(self) -> None:
         discovered = [
             {"repo": "gernalix/example", "number": 1, "url": "one"},
             {"repo": "gernalix/example", "number": 2, "url": "two"},
             {"repo": "gernalix/other", "number": 3, "url": "three"},
         ]
-        def fake_integrate(repo: str, number: int):
+        def fake_integrate(repo: str, number: int, **kwargs):
             if number == 1:
                 return {"repo": repo, "number": number, "status": "deferred", "reason": "checks-pending"}
             return {"repo": repo, "number": number, "status": "merged"}
@@ -409,7 +409,7 @@ class SingleWriterTests(unittest.TestCase):
         ):
             result = writer.process_ready_prs("gernalix")
         self.assertEqual("checks-pending", result["results"][0]["reason"])
-        self.assertEqual("queue-behind-earlier", result["results"][1]["reason"])
+        self.assertEqual("merged", result["results"][1]["status"])
         self.assertEqual("merged", result["results"][2]["status"])
 
     def test_roadmap_uses_the_same_integration_lane_as_other_repositories(self) -> None:
@@ -425,8 +425,8 @@ class SingleWriterTests(unittest.TestCase):
             result = writer.process_ready_prs("gernalix")
         self.assertEqual(["deferred", "deferred"],
                          [item["status"] for item in result["results"]])
-        self.assertEqual(1, integrate.call_count)
-        self.assertEqual("queue-behind-earlier", result["results"][1]["reason"])
+        self.assertEqual(2, integrate.call_count)
+        self.assertEqual("checks-pending", result["results"][1]["reason"])
 
     def test_status_contract_exposes_pipeline_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -484,6 +484,7 @@ class SingleWriterTests(unittest.TestCase):
 
         with (
             mock.patch.object(writer, "run", side_effect=fake_run),
+            mock.patch.object(writer, "_refresh_task_branch_to_latest_base", return_value={"status": "current"}),
             mock.patch.object(writer, "STATE_ROOT", Path("/tmp/single-writer-test-state")),
         ):
             result = writer.integrate_pr("gernalix/example", 4)
@@ -550,6 +551,7 @@ class SingleWriterTests(unittest.TestCase):
 
         with (
             mock.patch.object(writer, "run", side_effect=fake_run),
+            mock.patch.object(writer, "_refresh_task_branch_to_latest_base", return_value={"status": "current"}),
             mock.patch.object(writer, "STATE_ROOT", Path("/tmp/single-writer-test-state")),
         ):
             result = writer.integrate_pr("gernalix/example", 4)

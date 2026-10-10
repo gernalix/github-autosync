@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Asynchronous FIFO integrator for queued task pull requests."""
+"""Asynchronous dependency-aware integrator for queued task pull requests."""
 from __future__ import annotations
 import argparse
 import fcntl
@@ -39,7 +39,7 @@ def run_once(owner: str) -> dict[str, Any]:
     return {"status": "partial" if hard else "ok", "queue": queue, "roadmap_finalization": roadmap, "hard_blockers": hard, "garbage_collection": garbage_collection}
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Integrate queued task PRs FIFO per repository.")
+    p = argparse.ArgumentParser(description="Integrate independent queued task PRs serially per repository.")
     p.add_argument("--owner", default="gernalix")
     p.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     p.add_argument("--json", action="store_true")

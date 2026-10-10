@@ -850,7 +850,7 @@ def discover_ready_prs(owner: str) -> list[dict[str, Any]]:
 
 class RepoLock:
     def __init__(self, repo: str):
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", repo)
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", repo.lower())
         self.path = STATE_ROOT / "locks" / f"{safe}.lock"
         self.handle: Any = None
 
@@ -875,7 +875,7 @@ def _refresh_task_branch_to_latest_base(
     """Rebase a queued task branch when canonical advanced after queueing."""
     found = _task_by_branch(repo_slug, branch)
     if found is None:
-        return {"status": "untracked"}
+        return {"status": "deferred", "reason": "task-untracked"}
     record_path, payload = found
     worktree = Path(str(payload.get("worktree") or "")).expanduser()
     if not worktree.exists():
@@ -923,11 +923,76 @@ def _refresh_task_branch_to_latest_base(
     return {"status": "refreshed"}
 
 
-def integrate_pr(repo: str, number: int) -> dict[str, Any]:
+def _github_json(endpoint: str) -> Any:
+    response = run(["gh", "api", endpoint], timeout=120)
+    if response.returncode:
+        raise ValueError("GitHub evidence unavailable")
+    return json.loads(response.stdout)
+
+
+def _dependency_reason(repo: str, body: str) -> str | None:
+    # Dependencies are explicit, never inferred from issue-closing references.
+    for declaration in re.findall(r"(?im)^\s*depends[- ]on\s*:\s*(.+)$", body):
+        refs = re.findall(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)|([\w.-]+/[\w.-]+)?#(\d+)", declaration)
+        if not refs:
+            return "dependency-invalid"
+        for url_repo, url_number, short_repo, short_number in refs:
+            dependency_repo = url_repo or short_repo or repo
+            dependency_number = url_number or short_number
+            try:
+                dependency = _github_json(f"repos/{dependency_repo}/pulls/{dependency_number}")
+            except (ValueError, TypeError):
+                return "dependency-unverified"
+            if not dependency.get("merged_at"):
+                return "dependency-unmerged"
+    return None
+
+
+def _patch_ranges(patch: str) -> list[tuple[int, int]]:
+    return [(int(start), int(start) + max(1, int(count or "1")))
+            for start, count in re.findall(r"(?m)^@@ -(\d+)(?:,(\d+))? \+", patch)]
+
+
+def _independence_reason(repo: str, head: str, canonical: str, blocked_prs: list[int]) -> str | None:
+    if not blocked_prs:
+        return None
+    try:
+        # All comparisons share a live canonical SHA. Context overlap fails closed;
+        # non-overlapping edits still have to rebase and pass CI on current main.
+        base = _github_json(f"repos/{repo}/commits/{quote(canonical, safe='')}")["sha"]
+        candidate = _github_json(f"repos/{repo}/compare/{base}...{head}")
+        for number in blocked_prs:
+            prior = _github_json(f"repos/{repo}/pulls/{number}")
+            if prior.get("merged_at") or prior.get("state") != "open":
+                continue
+            earlier = _github_json(f"repos/{repo}/compare/{base}...{prior['head']['sha']}")
+            for comparison in (candidate, earlier):
+                if comparison.get("total_commits", 0) > len(comparison["commits"]) or len(comparison["files"]) >= 300:
+                    return "independence-unverified"
+            if {c["sha"] for c in candidate["commits"]} & {c["sha"] for c in earlier["commits"]}:
+                return "dependency-unmerged"
+            for a in candidate["files"]:
+                for b in earlier["files"]:
+                    if {a["filename"], a.get("previous_filename", a["filename"])}.isdisjoint(
+                        {b["filename"], b.get("previous_filename", b["filename"])}):
+                        continue
+                    if a.get("status") != "modified" or b.get("status") != "modified":
+                        return "queue-overlapping-change"
+                    ar, br = _patch_ranges(a.get("patch", "")), _patch_ranges(b.get("patch", ""))
+                    if not ar or not br:
+                        return "independence-unverified"
+                    if any(x <= v and u <= y for x, y in ar for u, v in br):
+                        return "queue-overlapping-change"
+    except (ValueError, KeyError, TypeError):
+        return "independence-unverified"
+    return None
+
+
+def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None) -> dict[str, Any]:
     with RepoLock(repo):
         view = run(
             ["gh", "pr", "view", str(number), "--repo", repo,
-             "--json", "title,state,isDraft,mergeable,baseRefName,headRefName,headRefOid,statusCheckRollup,mergeCommit"],
+             "--json", "title,body,state,isDraft,mergeable,baseRefName,headRefName,headRefOid,statusCheckRollup,mergeCommit"],
             timeout=120,
         )
         if view.returncode:
@@ -966,12 +1031,19 @@ def integrate_pr(repo: str, number: int) -> dict[str, Any]:
             return {"repo": repo, "number": number, "status": "deferred", "reason": "draft"}
         if not head_branch.startswith(TASK_PREFIX):
             return {"repo": repo, "number": number, "status": "deferred", "reason": "non-task-branch"}
+        dependency_reason = _dependency_reason(repo, str(info.get("body") or ""))
+        if dependency_reason:
+            return {"repo": repo, "number": number, "status": "deferred", "reason": dependency_reason}
         allowed, check_reason = _check_rollup_allows_merge(info.get("statusCheckRollup"))
         if not allowed:
             _observe_task(repo, head_branch, check_reason, reason=check_reason, pr_number=number)
             return {"repo": repo, "number": number, "status": "deferred", "reason": check_reason}
         if not head:
             return {"repo": repo, "number": number, "status": "deferred", "reason": "head-missing"}
+        independence_reason = _independence_reason(repo, head, default_branch, blocked_prs or [])
+        if independence_reason:
+            _observe_task(repo, head_branch, independence_reason, reason=independence_reason, pr_number=number)
+            return {"repo": repo, "number": number, "status": "deferred", "reason": independence_reason}
         refreshed = _refresh_task_branch_to_latest_base(repo, head_branch, default_branch, head)
         if refreshed.get("status") == "refreshed":
             _observe_task(repo, head_branch, "rebasing", reason="branch-refreshed", pr_number=number)
@@ -1012,7 +1084,7 @@ def integrate_pr(repo: str, number: int) -> dict[str, Any]:
 
 def process_ready_prs(owner: str) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
-    blocked_repos: set[str] = set()
+    blocked_prs: dict[str, list[int]] = {}
     discovered = discover_ready_prs(owner)
     repo_sizes: dict[str, int] = {}
     repo_positions: dict[str, int] = {}
@@ -1028,12 +1100,7 @@ def process_ready_prs(owner: str) -> dict[str, Any]:
         branch = str(found[1].get("branch") or "") if found else ""
         if branch:
             _observe_task(item["repo"], branch, "queued", pr_number=item["number"], pr_url=str(item.get("url") or ""), queue_position=position, queue_size=size)
-        if repo_key in blocked_repos:
-            if branch:
-                _observe_task(item["repo"], branch, "queued-behind-earlier", reason="queue-behind-earlier", pr_number=item["number"], queue_position=position, queue_size=size)
-            results.append({"repo": item["repo"], "number": item["number"], "status": "deferred", "reason": "queue-behind-earlier"})
-            continue
-        result = integrate_pr(item["repo"], item["number"])
+        result = integrate_pr(item["repo"], item["number"], blocked_prs=blocked_prs.get(repo_key, []))
         if result.get("status") == "merged" and result.get("head_branch"):
             result["cleanup"] = cleanup_task_after_merge(
                 str(result["repo"]),
@@ -1042,7 +1109,7 @@ def process_ready_prs(owner: str) -> dict[str, Any]:
                 merge_sha=str(result.get("sha") or "") or None,
             )
         else:
-            blocked_repos.add(repo_key)
+            blocked_prs.setdefault(repo_key, []).append(int(item["number"]))
         results.append(result)
     return {
         "found": len(results),

@@ -262,3 +262,11 @@ systemctl --user list-timers github-autosync.timer --all --no-pager
 ```
 
 Regression coverage verifies that unchanged repositories are still locally audited, local ahead-only commits can reach the auto-push path, dirty unchanged worktrees are not silently skipped, a missing canonical worktree is cloned at the canonical path, dry-run upstream probing avoids fetch/mutation, upstream repair does not immediately duplicate its fetch, unmanaged repositories remain ignored, and the existing dirty/diverged safety rules remain intact.
+
+## Project release number
+
+Root `NV.txt` owns the project release number. Interactive CLI invocations show
+its NV before human output; `--json`, redirected output and services retain their
+output contract. Missing or inconsistent source shows `NV unavailable`. Ordinary
+commits retain NV; deliberate releases increment once and reconcile the integrated
+SHA with MegaVault. Initial adoption preserves the existing registry version 1.

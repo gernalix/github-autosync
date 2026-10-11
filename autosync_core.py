@@ -2167,6 +2167,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from project_nv import banner
+    banner(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(argv)
     args.human_output = args.full_reconcile and not args.json
     try:

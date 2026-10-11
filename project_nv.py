@@ -5,7 +5,7 @@ import sys
 
 
 def banner(args):
-    if not sys.stdout.isatty() or '--json' in args:
+    if not sys.stdout.isatty() or not sys.stderr.isatty() or '--json' in args:
         return
     root=Path(__file__).resolve().parent
     try:
@@ -15,4 +15,4 @@ def banner(args):
         label='NV '+raw[:-1].decode('ascii')
     except (OSError,ValueError):
         label='NV unavailable'
-    print(label)
+    print(label,file=sys.stderr)

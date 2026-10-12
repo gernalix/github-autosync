@@ -37,7 +37,7 @@ class AutosyncTests(unittest.TestCase):
                     """
                     create table projects(project_id integer primary key,slug text,name text,status text,archived integer);
                     create table repositories(repository_id text primary key,project_id integer,worktree_path text,remote_url text,branch text,status text,canonical integer,repository_kind text,host_id text,runtime_path text);
-                    insert into projects values(94,'workflowy-import','Workflowy','active',0);
+                    insert into projects values(94,'workflowy-import','Workflowy','REMOTE_ONLY',0);
                     insert into repositories values('R0094',94,'/opt/workflowy_import','https://github.com/gernalix/workflowy-import','main','active',1,'git','H0002','/opt/workflowy_import');
                     """
                 )

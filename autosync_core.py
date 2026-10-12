@@ -731,7 +731,7 @@ def megavault_runtime_sources_missing(megavault: Path) -> dict[str, int]:
             from repositories r
             join projects p on p.project_id=r.project_id
             where coalesce(p.archived,0)=0
-              and coalesce(p.status,'active')='active'
+              and lower(coalesce(p.status,'active')) in ('active','remote_only')
               and r.remote_url is not null and trim(r.remote_url)<>''
               and r.runtime_path is not null and trim(r.runtime_path)<>''
               and coalesce(r.host_id,'')<>'H0001'

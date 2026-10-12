@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, task/P118-host-aware-source]
+    branches: [main, task/P118-host-aware-source, task/P118-remote-only-source]
     paths-ignore:
       - '**/*.md'
   pull_request:
@@ -23,6 +23,9 @@ jobs:
         github.repository == 'gernalix/github-autosync' &&
         (github.ref == 'refs/heads/task/P118-host-aware-source' || github.head_ref == 'task/P118-host-aware-source') &&
         'p118-github-autosync-source' ||
+        github.repository == 'gernalix/github-autosync' &&
+        (github.ref == 'refs/heads/task/P118-remote-only-source' || github.head_ref == 'task/P118-remote-only-source') &&
+        'p118-github-autosync-remote-only' ||
         'ubuntu-latest'
       }}
     timeout-minutes: 10

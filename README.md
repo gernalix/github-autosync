@@ -19,6 +19,7 @@ The service manages **only** these repositories:
 - `gernalix/fedora-t7-backup`
 - `gernalix/amici_fb`
 - `gernalix/salute`
+- `gernalix/workflowy-import`
 
 All other current or future GitHub repositories are ignored completely until explicitly added to `ALLOWED_REPOSITORIES`. They are not cloned, fetched, pulled, pushed, audited, registered in MegaVault, or persisted in repo state.
 

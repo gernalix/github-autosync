@@ -1,0 +1,40 @@
+{
+  "action": "upsert",
+  "contract_version": "megavault.command/v1",
+  "event_id": "CE-8ea98665a10ebf47f58b3b595555bf9e",
+  "occurred_at": "2026-10-12T21:32:25.745770+00:00",
+  "operation_key": "discovered_repo_single_writer_py",
+  "payload": {
+    "argv": [
+      "repo_single_writer.py",
+      "status-all"
+    ],
+    "contract_version": "megavault.command/v1",
+    "description": "Read the existing single-writer task and integration states without changing repositories.",
+    "entrypoint": "python3",
+    "host_scope": "H0001",
+    "idempotency": "read_only",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "key": "discovered_repo_single_writer_py",
+    "owner": "github-autosync",
+    "prerequisites": [
+      "GitHub CLI authentication and readable single-writer state"
+    ],
+    "project_id": 92,
+    "risk": "low",
+    "source_digest": "bf319c79b41baecc7048caa5e9cb94c14f87913bf0c021a6c15d87a3c610ff2f",
+    "source_ref": ".megavault/commands-v1.json",
+    "state": "enabled",
+    "timeout_seconds": 60,
+    "working_directory": "."
+  },
+  "payload_sha256": "bf319c79b41baecc7048caa5e9cb94c14f87913bf0c021a6c15d87a3c610ff2f",
+  "project_id": 92,
+  "source_commit": "1b51420671f71e867a4ec19954b99d619ae1c17d",
+  "source_ref": ".megavault/commands-v1.json"
+}

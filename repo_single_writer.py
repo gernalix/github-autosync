@@ -21,6 +21,8 @@ import sys
 from typing import Any
 from urllib.parse import quote
 
+import command_catalog_bridge
+
 TASK_PREFIX = "task/"
 PR_PREFIX = "[single-writer]"
 STATE_ROOT = Path.home() / ".local/state/codex-github-autosync/single-writer"
@@ -1082,8 +1084,39 @@ def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None
         }
 
 
-def process_ready_prs(owner: str) -> dict[str, Any]:
+def _retry_pending_catalog_publications() -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    if not STATE_ROOT.is_dir():
+        return results
+    for path in sorted(STATE_ROOT.glob("*/tasks/*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        prepared = payload.get("catalog_prepared")
+        if payload.get("status") != "catalog-pending" or not isinstance(prepared, dict):
+            continue
+        publication = command_catalog_bridge.publish(prepared)
+        item = {
+            "repo": payload.get("repo"),
+            "number": payload.get("pr_number"),
+            "status": "catalog-retry",
+            "command_catalog": publication,
+        }
+        if publication.get("status") in {"pass", "not-applicable"}:
+            item["cleanup"] = cleanup_task_after_merge(
+                str(payload.get("repo") or ""),
+                str(payload.get("branch") or ""),
+                expected_head=str(payload.get("integrated_head") or "") or None,
+                merge_sha=str(payload.get("merge_sha") or "") or None,
+            )
+            item["status"] = "merged"
+        results.append(item)
+    return results
+
+
+def process_ready_prs(owner: str) -> dict[str, Any]:
+    results: list[dict[str, Any]] = _retry_pending_catalog_publications()
     blocked_prs: dict[str, list[int]] = {}
     discovered = discover_ready_prs(owner)
     repo_sizes: dict[str, int] = {}
@@ -1098,10 +1131,44 @@ def process_ready_prs(owner: str) -> dict[str, Any]:
         size = repo_sizes[repo_key]
         found = _task_by_pr(str(item["repo"]), int(item["number"]))
         branch = str(found[1].get("branch") or "") if found else ""
+        catalog: dict[str, Any] | None = None
+        if found:
+            worktree = Path(str(found[1].get("worktree") or ""))
+            try:
+                source_commit = _ok(worktree, "rev-parse", "HEAD")
+                catalog = command_catalog_bridge.prepare(worktree, str(item["repo"]), source_commit)
+            except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+                catalog = {"status": "blocked", "reason": "catalog-prepare-error"}
+            if catalog.get("status") == "blocked":
+                reason = str(catalog.get("reason") or "catalog-prepare-failed")
+                if branch:
+                    _observe_task(item["repo"], branch, "catalog-blocked", reason=reason, pr_number=item["number"])
+                blocked_prs.setdefault(repo_key, []).append(int(item["number"]))
+                results.append({"repo": item["repo"], "number": item["number"], "status": "deferred", "reason": reason})
+                continue
         if branch:
             _observe_task(item["repo"], branch, "queued", pr_number=item["number"], pr_url=str(item.get("url") or ""), queue_position=position, queue_size=size)
         result = integrate_pr(item["repo"], item["number"], blocked_prs=blocked_prs.get(repo_key, []))
         if result.get("status") == "merged" and result.get("head_branch"):
+            publication = command_catalog_bridge.publish(catalog or {"status": "not-applicable"})
+            result["command_catalog"] = publication
+            if publication.get("status") not in {"pass", "not-applicable"}:
+                if branch:
+                    _observe_task(item["repo"], branch, "catalog-pending", reason=str(publication.get("reason") or "catalog-pending"), pr_number=item["number"])
+                if found:
+                    pending_payload = json.loads(found[0].read_text(encoding="utf-8"))
+                    pending_payload["status"] = "catalog-pending"
+                    pending_payload["catalog_prepared"] = catalog
+                    pending_payload["merge_sha"] = result.get("sha")
+                    pending_payload["integrated_head"] = result.get("head_sha")
+                    pending_payload["integration_state"] = "catalog-pending"
+                    pending_payload["integration_reason"] = str(publication.get("reason") or "catalog-pending")
+                    pending_payload["integration_observed_at"] = _iso_now()
+                    _atomic_json(found[0], pending_payload)
+                result["catalog_pending"] = True
+                blocked_prs.setdefault(repo_key, []).append(int(item["number"]))
+                results.append(result)
+                continue
             result["cleanup"] = cleanup_task_after_merge(
                 str(result["repo"]),
                 str(result["head_branch"]),

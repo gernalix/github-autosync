@@ -1,0 +1,26 @@
+{
+  "contract_version": "megavault.command/v1",
+  "project_id": 92,
+  "owner": "github-autosync",
+  "commands": [
+    {
+      "key": "discovered_repo_single_writer_py",
+      "host_scope": "H0001",
+      "entrypoint": "python3",
+      "argv": ["repo_single_writer.py", "status-all"],
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "working_directory": ".",
+      "prerequisites": ["GitHub CLI authentication and readable single-writer state"],
+      "timeout_seconds": 60,
+      "idempotency": "read_only",
+      "risk": "low",
+      "state": "enabled",
+      "description": "Read the existing single-writer task and integration states without changing repositories."
+    }
+  ]
+}

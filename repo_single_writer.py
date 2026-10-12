@@ -1150,6 +1150,8 @@ def process_ready_prs(owner: str) -> dict[str, Any]:
             _observe_task(item["repo"], branch, "queued", pr_number=item["number"], pr_url=str(item.get("url") or ""), queue_position=position, queue_size=size)
         result = integrate_pr(item["repo"], item["number"], blocked_prs=blocked_prs.get(repo_key, []))
         if result.get("status") == "merged" and result.get("head_branch"):
+            if catalog is not None:
+                catalog["merge_sha"] = result.get("sha")
             publication = command_catalog_bridge.publish(catalog or {"status": "not-applicable"})
             result["command_catalog"] = publication
             if publication.get("status") not in {"pass", "not-applicable"}:

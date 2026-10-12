@@ -75,6 +75,7 @@ ALLOWED_REPOSITORIES = frozenset(
         "gernalix/amici_fb",
         "gernalix/salute",
         "gernalix/oracle-uptime-kuma",
+        "gernalix/workflowy-import",
     }
 )
 
@@ -670,7 +671,7 @@ def megavault_inventory(megavault: Path) -> list[dict[str, Any]]:
         rows = con.execute(
             """
             select p.project_id, p.slug, p.name,
-                   r.repository_id, r.worktree_path, r.remote_url, r.branch
+                   r.repository_id, r.worktree_path, r.remote_url, r.branch, r.host_id
             from projects p
             join repositories r on r.project_id = p.project_id
             where coalesce(p.archived, 0) = 0
@@ -678,6 +679,7 @@ def megavault_inventory(megavault: Path) -> list[dict[str, Any]]:
               and coalesce(r.status, 'active') = 'active'
               and r.worktree_path is not null and trim(r.worktree_path) <> ''
               and r.remote_url is not null and trim(r.remote_url) <> ''
+              and (r.host_id is null or r.host_id = 'H0001')
               and (coalesce(r.canonical, 0) = 1 or r.repository_kind = 'local_worktree')
             order by p.project_id, r.repository_id
             """
@@ -714,6 +716,95 @@ def megavault_registered_remotes(megavault: Path) -> set[str]:
     except sqlite3.Error as exc:
         raise AutosyncError("megavault_registered_remotes_failed") from exc
     return {normalize_remote(str(row[0])) for row in rows}
+
+
+def megavault_runtime_sources_missing(megavault: Path) -> dict[str, int]:
+    """Return unambiguous remote-runtime projects lacking a Fedora source checkout."""
+    db = megavault / "megavault.sqlite"
+    if not db.is_file():
+        raise AutosyncError("megavault_db_missing")
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30)
+        rows = con.execute(
+            """
+            select r.project_id, r.remote_url
+            from repositories r
+            join projects p on p.project_id=r.project_id
+            where coalesce(p.archived,0)=0
+              and coalesce(p.status,'active')='active'
+              and r.remote_url is not null and trim(r.remote_url)<>''
+              and r.runtime_path is not null and trim(r.runtime_path)<>''
+              and coalesce(r.host_id,'')<>'H0001'
+              and not exists (
+                select 1 from repositories s
+                where s.project_id=r.project_id and s.repository_kind='local_worktree'
+                  and s.canonical=1 and s.host_id='H0001'
+              )
+            order by r.project_id,r.repository_id
+            """
+        ).fetchall()
+        con.close()
+    except sqlite3.Error as exc:
+        raise AutosyncError("megavault_runtime_sources_query_failed") from exc
+    grouped: dict[str, set[int]] = {}
+    for project_id, remote_url in rows:
+        grouped.setdefault(normalize_remote(str(remote_url)), set()).add(int(project_id))
+    return {remote: next(iter(ids)) for remote, ids in grouped.items() if len(ids) == 1}
+
+
+def link_runtime_sources_in_megavault(
+    megavault: Path,
+    projects_dir: Path,
+    repos: list[dict[str, str]],
+    missing: dict[str, int],
+    *,
+    dry_run: bool,
+) -> dict[str, int | str]:
+    candidates = [repo for repo in repos if normalize_remote(repo["url"]) in missing]
+    if not candidates:
+        return {"source_linked": 0, "source_deferred": 0, "source_validation": "not_needed"}
+    if dry_run:
+        return {"source_linked": 0, "source_deferred": 0, "source_validation": "dry_run"}
+    linked = deferred = 0
+    for repo in candidates:
+        worktree = projects_dir / repo["name"]
+        if not git_repo_matches_remote(worktree, repo["url"]):
+            deferred += 1
+            continue
+        result = run(
+            [
+                "python3", str(megavault / "megavault.py"), "register-local-repo",
+                "--worktree", str(worktree), "--link-runtime-project",
+                str(missing[normalize_remote(repo["url"])]),
+            ],
+            cwd=megavault,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            deferred += 1
+            continue
+        try:
+            con = sqlite3.connect(f"file:{megavault / 'megavault.sqlite'}?mode=ro", uri=True, timeout=30)
+            row = con.execute(
+                """
+                select 1 from repositories
+                where project_id=? and repository_kind='local_worktree' and canonical=1
+                  and host_id='H0001' and worktree_path=? and remote_url is not null
+                """,
+                (missing[normalize_remote(repo["url"])], str(worktree)),
+            ).fetchone()
+            con.close()
+        except sqlite3.Error:
+            row = None
+        if row is None:
+            deferred += 1
+            continue
+        linked += int("status=source_registered" in result.stdout)
+    return {
+        "source_linked": linked,
+        "source_deferred": deferred,
+        "source_validation": "PASS" if deferred == 0 else "deferred",
+    }
 
 
 def issue(entry: dict[str, Any] | None, kind: str, detail: str = "") -> dict[str, Any]:
@@ -2045,6 +2136,18 @@ def command_run(args: argparse.Namespace) -> int:
                 save_runtime_deploy_state(state_dir, next_deployed_state)
 
             registered = megavault_registered_remotes(megavault)
+            runtime_sources = (
+                megavault_runtime_sources_missing(megavault)
+                if (megavault / "megavault.sqlite").is_file()
+                else {}
+            )
+            source_registration = link_runtime_sources_in_megavault(
+                megavault,
+                projects_dir,
+                repos,
+                runtime_sources,
+                dry_run=args.dry_run,
+            )
             missing_reg = [repo for repo in repos if normalize_remote(repo["url"]) not in registered]
             registration = register_in_megavault(
                 megavault,
@@ -2069,6 +2172,10 @@ def command_run(args: argparse.Namespace) -> int:
             deferred_reg = int(registration.get("deferred") or 0)
             if deferred_reg:
                 issues.append(issue(None, "megavault_registration_deferred", f"count={deferred_reg}"))
+            source_deferred = int(source_registration.get("source_deferred") or 0)
+            if source_deferred:
+                issues.append(issue(None, "megavault_runtime_source_deferred", f"count={source_deferred}"))
+            registration.update(source_registration)
 
             activity_data = mirror_pending_activity(state_dir, enabled=activity_data_enabled)
     except BlockingIOError:

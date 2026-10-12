@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -24,6 +25,41 @@ class AutosyncTests(unittest.TestCase):
         bootstrap = mock.patch.object(autosync, "bootstrap_repo_integrator_runtime")
         bootstrap.start()
         self.addCleanup(bootstrap.stop)
+
+    def test_host_aware_inventory_excludes_remote_runtime_and_links_h0001_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mv = root / "mv"
+            mv.mkdir()
+            db = mv / "megavault.sqlite"
+            with sqlite3.connect(db) as con:
+                con.executescript(
+                    """
+                    create table projects(project_id integer primary key,slug text,name text,status text,archived integer);
+                    create table repositories(repository_id text primary key,project_id integer,worktree_path text,remote_url text,branch text,status text,canonical integer,repository_kind text,host_id text,runtime_path text);
+                    insert into projects values(94,'workflowy-import','Workflowy','active',0);
+                    insert into repositories values('R0094',94,'/opt/workflowy_import','https://github.com/gernalix/workflowy-import','main','active',1,'git','H0002','/opt/workflowy_import');
+                    """
+                )
+            self.assertEqual([], autosync.megavault_inventory(mv))
+            self.assertEqual(
+                {"https://github.com/gernalix/workflowy-import": 94},
+                autosync.megavault_runtime_sources_missing(mv),
+            )
+            repo = {"owner": "gernalix", "name": "workflowy-import", "url": "https://github.com/gernalix/workflowy-import", "default_branch": "main"}
+            with sqlite3.connect(db) as con:
+                con.execute(
+                    "insert into repositories values('R0095',94,?,'https://github.com/gernalix/workflowy-import','main','active',1,'local_worktree','H0001',null)",
+                    (str(root / "projects" / "workflowy-import"),),
+                )
+            with mock.patch.object(autosync, "git_repo_matches_remote", return_value=True), mock.patch.object(autosync, "run", return_value=ok("status=source_registered\n")) as runner:
+                result = autosync.link_runtime_sources_in_megavault(
+                    mv, root / "projects", [repo], {repo["url"]: 94}, dry_run=False
+                )
+            self.assertEqual("PASS", result["source_validation"])
+            self.assertEqual(1, result["source_linked"])
+            self.assertIn("--link-runtime-project", runner.call_args.args[0])
+            self.assertNotIn("/opt/workflowy_import", runner.call_args.args[0])
 
     def test_git_failure_issue_classifies_corrupt_object_and_keeps_evidence(self) -> None:
         result = subprocess.CompletedProcess(
@@ -353,6 +389,7 @@ class AutosyncTests(unittest.TestCase):
         self.assertIn("gernalix/chrome-codex-switcher", autosync.ALLOWED_REPOSITORIES)
         self.assertIn("gernalix/PersonalHub", autosync.ALLOWED_REPOSITORIES)
         self.assertIn("gernalix/oracle-uptime-kuma", autosync.ALLOWED_REPOSITORIES)
+        self.assertIn("gernalix/workflowy-import", autosync.ALLOWED_REPOSITORIES)
         self.assertEqual(
             ("python3", "deploy_runtime.py"),
             autosync.RUNTIME_DEPLOYERS["gernalix/workflowy-importer"],
@@ -817,8 +854,8 @@ class AutosyncTests(unittest.TestCase):
 
 
     def test_real_github_failure_is_nonzero(self) -> None:
-        with mock.patch.object(autosync, "megavault_inventory", return_value=[]), mock.patch.object(autosync, "audit_inventory", return_value=([], 0)), mock.patch.object(autosync, "github_repos", side_effect=autosync.AutosyncError("github_repo_list_failed")):
-            self.assertEqual(75, autosync.main(["--no-telegram", "--no-data-mirror", "run"]))
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(autosync, "megavault_inventory", return_value=[]), mock.patch.object(autosync, "audit_inventory", return_value=([], 0)), mock.patch.object(autosync, "github_repos", side_effect=autosync.AutosyncError("github_repo_list_failed")):
+            self.assertEqual(75, autosync.main(["--state-dir", tmp, "--no-telegram", "--no-data-mirror", "run"]))
 
 
     def test_systemd_periodic_service_uses_lightweight_run(self) -> None:

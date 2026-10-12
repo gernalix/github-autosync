@@ -352,6 +352,7 @@ class AutosyncTests(unittest.TestCase):
         self.assertIn("gernalix/workflowy-importer", autosync.ALLOWED_REPOSITORIES)
         self.assertIn("gernalix/chrome-codex-switcher", autosync.ALLOWED_REPOSITORIES)
         self.assertIn("gernalix/PersonalHub", autosync.ALLOWED_REPOSITORIES)
+        self.assertIn("gernalix/oracle-uptime-kuma", autosync.ALLOWED_REPOSITORIES)
         self.assertEqual(
             ("python3", "deploy_runtime.py"),
             autosync.RUNTIME_DEPLOYERS["gernalix/workflowy-importer"],

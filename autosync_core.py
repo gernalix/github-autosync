@@ -74,6 +74,7 @@ ALLOWED_REPOSITORIES = frozenset(
         "gernalix/fedora-t7-backup",
         "gernalix/amici_fb",
         "gernalix/salute",
+        "gernalix/oracle-uptime-kuma",
     }
 )
 

@@ -34,6 +34,19 @@ def _run(cli: Path, worktree: Path, *args: str) -> subprocess.CompletedProcess[s
     )
 
 
+def _run_version(cli: Path, worktree: Path, project_id: int, merge_sha: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["python3", "-B", str(cli), "git-purity", "version-event", "--project-id", str(project_id), "--sha", merge_sha],
+        cwd=worktree,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=180,
+        check=False,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+
 def prepare(
     worktree: Path,
     repo: str,
@@ -51,6 +64,10 @@ def prepare(
     validate = _run(cli, worktree, "validate", "--manifest", str(MANIFEST))
     if validate.returncode:
         return {"status": "blocked", "reason": "manifest-validation-failed"}
+    try:
+        project_id = int(json.loads(manifest.read_text(encoding="utf-8"))["project_id"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return {"status": "blocked", "reason": "manifest-project-id-unreadable"}
     outbox = state_root / _safe_repo(repo) / source_commit
     outbox.mkdir(parents=True, exist_ok=True, mode=0o700)
     emit = _run(
@@ -73,6 +90,7 @@ def prepare(
         "worktree": str(worktree),
         "outbox": str(outbox),
         "events": len(list(outbox.glob("CE-*.json"))),
+        "project_id": project_id,
     }
 
 
@@ -97,4 +115,15 @@ def publish(prepared: dict[str, Any], *, cli: Path = DEFAULT_MEGAVAULT) -> dict[
         receipt = json.loads(reconcile.stdout)
     except json.JSONDecodeError:
         receipt = {"status": "PASS"}
-    return {"status": "pass", "outbox": str(outbox), "readback": receipt}
+    merge_sha = str(prepared.get("merge_sha") or "")
+    project_id = prepared.get("project_id")
+    if not re.fullmatch(r"[0-9a-f]{40}", merge_sha) or not isinstance(project_id, int):
+        return {"status": "pending", "reason": "version-evidence-incomplete", "outbox": str(outbox)}
+    version = _run_version(cli, worktree, project_id, merge_sha)
+    if version.returncode:
+        return {"status": "pending", "reason": "version-registration-failed", "outbox": str(outbox)}
+    try:
+        version_receipt = json.loads(version.stdout)
+    except json.JSONDecodeError:
+        version_receipt = {"status": "PASS"}
+    return {"status": "pass", "outbox": str(outbox), "readback": receipt, "version": version_receipt}

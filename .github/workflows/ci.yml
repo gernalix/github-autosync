@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, task/P118-host-aware-source]
     paths-ignore:
       - '**/*.md'
   pull_request:

@@ -60,6 +60,20 @@ class SafeGcTests(unittest.TestCase):
                 self.assertNotEqual(0, fixtures.git(['show-ref', '--verify', 'refs/heads/'+payload['branch']], remote).returncode)
                 self.assertNotEqual(0, fixtures.git(['show-ref', '--verify', 'refs/heads/'+payload['branch']], repo).returncode)
 
+    def test_ignored_artifact_is_preserved_even_on_merged_worktree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer, 'STATE_ROOT', root/'state'), patch.object(writer, 'WORKTREE_ROOT', root/'worktrees'):
+                repo, remote, worktree, payload=self.fixture(root)
+                # Git-private exclude configuration is not application work.
+                exclude=Path(fixtures.git(['rev-parse','--git-path','info/exclude'],repo).stdout.strip())
+                if not exclude.is_absolute():exclude=repo/exclude
+                with exclude.open('a') as stream:stream.write('only-copy.db\n')
+                artifact=worktree/'only-copy.db';artifact.write_bytes(b'unique recoverable data')
+                self.assertEqual('ignored-artifacts-preserved',gc.collect_record(payload)['reason'])
+                self.assertEqual(artifact.read_bytes(),b'unique recoverable data')
+                self.assertEqual(0,fixtures.git(['show-ref','--verify','refs/heads/'+payload['branch']],remote).returncode)
+
     def test_active_recovery_and_unintegrated_are_fail_closed(self):
         with patch.object(gc.sqlite3, "connect", side_effect=AssertionError("C3 database opened")):
             self.assertFalse(gc.c3_allows({"task_id":"123456", "roadmap_prompt_id":"123456"}))

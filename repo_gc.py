@@ -12,6 +12,7 @@ import repo_single_writer as writer
 
 C3_DB = Path.home() / '.local/state/c3-control/roadmap.sqlite'
 C3_REPO = Path.home() / 'projects/codex-roadmap'
+PURIFY_GC_CAPABILITY = 'ignored-artifacts-v1'
 RETIREMENT_MARKER = Path.home() / '.local/state/c3-control/c2-retired.json'
 
 
@@ -84,6 +85,18 @@ def collect_record(payload, *, dry_run=False):
         if (dirty.returncode or dirty.stdout.strip() or actual.returncode
                 or actual.stdout.strip() != tip or writer._operation_in_progress(path)):
             return {'removed': [], 'reason': 'dirty-changed-or-conflicted'}
+    if path.exists():
+        ignored = writer._git(path, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')
+        locked = writer._git(path, 'rev-parse', '--git-path', 'locked')
+        if ignored.returncode or ignored.stdout:
+            return {'removed': [], 'reason': 'ignored-artifacts-preserved'}
+        if locked.returncode:
+            return {'removed': [], 'reason': 'worktree-lock-unverifiable'}
+        lock_path = Path(locked.stdout.strip())
+        if not lock_path.is_absolute():
+            lock_path = path / lock_path
+        if lock_path.exists():
+            return {'removed': [], 'reason': 'locked-worktree'}
     # Another record or checked-out worktree can still reference this branch.
     for record in writer.STATE_ROOT.glob('*/tasks/*.json'):
         try:
@@ -99,6 +112,9 @@ def collect_record(payload, *, dry_run=False):
             return {'removed': [], 'reason': 'active-at-delete'}
         if dry_run:
             removed.append('worktree')
+        elif (writer._git(path, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z').returncode != 0
+              or writer._git(path, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z').stdout):
+            return {'removed': [], 'reason': 'ignored-artifacts-at-delete'}
         elif writer._git(repo, 'worktree', 'remove', str(path), timeout=30).returncode == 0:
             removed.append('worktree')
         else:

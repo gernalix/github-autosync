@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+from contextlib import closing
 import re
 import sqlite3
 import subprocess
@@ -990,6 +991,59 @@ def _independence_reason(repo: str, head: str, canonical: str, blocked_prs: list
     return None
 
 
+# This exact repository keeps commit contact metadata redacted. The existing
+# canonical registry activates this route; preparation does not rebind it.
+REDACTED_REPOSITORY = "gernalix/adb-device-keeper-public"
+REDACTED_REPOSITORY_ID = 1421472416
+
+
+def _redacted_source_active() -> bool:
+    database = Path.home() / "MegaVault/megavault.sqlite"
+    with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as conn:
+        rows = conn.execute("SELECT repository_id,remote_url FROM repositories WHERE project_id=95 AND canonical=1").fetchall()
+    return len(rows) == 1 and rows[0][0] == "R0096" and str(rows[0][1]).removesuffix(".git").rstrip("/") == "https://github.com/" + REDACTED_REPOSITORY
+
+
+def _redacted_fast_forward_pr(repo: str, number: int, branch: str, head: str, head_branch: str) -> dict[str, Any]:
+    """Owner-only FF of the tested bytes, never a GitHub-generated merge commit."""
+    def api(endpoint: str, *args: str) -> Any:
+        result = run(["gh", "api", endpoint, *args], timeout=120)
+        if result.returncode:
+            raise ValueError("redacted integration API failed")
+        return json.loads(result.stdout)
+    try:
+        if repo != REDACTED_REPOSITORY:
+            raise ValueError("wrong redacted repository")
+        metadata = api("repos/" + repo)
+        if metadata["id"] != REDACTED_REPOSITORY_ID:
+            raise ValueError("redacted repository identity changed")
+        base = api(f"repos/{repo}/branches/{branch}")["commit"]["sha"]
+        comparison = api(f"repos/{repo}/compare/{base}...{head}")
+        if comparison["status"] not in ("ahead", "identical") or comparison.get("behind_by", 0):
+            raise ValueError("redacted integration requires fast-forward")
+        commits = api(f"repos/{repo}/commits?sha={head}&per_page=100", "--paginate", "--slurp")
+        if not commits or not any(commits):
+            raise ValueError("redacted commit metadata unavailable")
+        for page in commits:
+            for commit in page:
+                for role in ("author", "committer"):
+                    identity = commit["commit"][role]
+                    if identity["name"] != "Redacted maintainer" or identity["email"] != "redacted@example.invalid":
+                        raise ValueError("redacted commit identity required")
+        if base != head:
+            # Non-forced update preserves every concurrent canonical commit.
+            # Public branch protection checks the actual tested head as well.
+            api(f"repos/{repo}/git/refs/heads/{branch}", "--method", "PATCH", "-f", "sha=" + head, "-F", "force=false")
+        if api(f"repos/{repo}/branches/{branch}")["commit"]["sha"] != head:
+            raise ValueError("redacted canonical readback mismatch")
+        pr = api(f"repos/{repo}/pulls/{number}")
+        if not pr.get("merged"):
+            return {"repo":repo,"number":number,"status":"deferred","reason":"fast-forward-applied-awaiting-pr-readback"}
+        return {"repo":repo,"number":number,"status":"merged","sha":head,"head_branch":head_branch,"head_sha":head,"redacted_fast_forward":True}
+    except (ValueError, KeyError, TypeError):
+        return {"repo":repo,"number":number,"status":"deferred","reason":"redacted-fast-forward-verification-failed"}
+
+
 def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None) -> dict[str, Any]:
     with RepoLock(repo):
         view = run(
@@ -1060,6 +1114,10 @@ def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None
             _observe_task(repo, head_branch, "merge-wait", reason=merge_reason, pr_number=number)
             return {"repo": repo, "number": number, "status": "deferred", "reason": merge_reason}
         _observe_task(repo, head_branch, "integrating", pr_number=number)
+        if repo == REDACTED_REPOSITORY:
+            if not _redacted_source_active():
+                return {"repo":repo,"number":number,"status":"deferred","reason":"canonical-cutover-not-activated"}
+            return _redacted_fast_forward_pr(repo, number, default_branch, head, head_branch)
         merged = run(
             ["gh", "api", "--method", "PUT", f"repos/{repo}/pulls/{number}/merge",
              "-f", f"sha={head}", "-f", "merge_method=merge"],

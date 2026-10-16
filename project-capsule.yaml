@@ -20,6 +20,7 @@ architecture:
     - repo_integrator.py
     - runtime_watchdog.py
   important_paths:
+    - private_bootstrap.py
     - systemd
     - tests
     - README.md
@@ -70,10 +71,12 @@ acceptance:
   - Targeted regression tests pass before the capsule is integrated.
   - Repository integration and the resulting canonical head are read back before reporting completion.
 references:
+  c2: c2.project-capsule.v1
   megavault: /home/daniele/MegaVault/megavault.sqlite
 freshness:
-  reviewed_commit: 262bae15cd8f5a0fa067de2c8f13b150273ac53f
+  reviewed_commit: 5fd70d5883f6b427156d09aefc2357414caccc76
   watch_paths:
+    - private_bootstrap.py
     - README.md
     - github_autosync.py
     - autosync_core.py

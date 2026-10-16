@@ -1,0 +1,47 @@
+{
+  "objective": "Sbloccare P238/MegaVault PR #236 senza bypassare il single-writer; recuperare un push leased fallito dopo rebase.",
+  "constraints": [
+    "Nessun merge, reset o force-push manuale sui branch canonici o task",
+    "Un solo owner per Git e DB; non ripristinare vecchi SQLite",
+    "Preservare PR 228, 229, 232, 235, 236 e ogni modifica esistente"
+  ],
+  "verified": {
+    "megavault_master_before": "fd66fae0bf09461e5df7390756261022f2de247b",
+    "github_autosync_main_before": "a9cef25718d7ac64c689d37fbe15192c23544593",
+    "P238_PR": 236,
+    "PR_229_original_head": "737582440b6dc177f9c15848e06facf7b82e6028",
+    "PR_229_local_rebased_head": "121cbd799f954b1d4a7621947b5f98728fa192e0",
+    "merge_tree_reproduction": "c0e6836b64afaa7c9b178cbbb8831fd0bac31843",
+    "ci": {
+      "PR229_push_and_PR": "PASS same original SHA on JIT",
+      "PR235_PR": "PASS JIT",
+      "PR232": "PASS original SHA",
+      "PR236": "PASS original SHA"
+    },
+    "test_rebased_head_cases": "2 PASS",
+    "test_repo_single_writer": "29 PASS",
+    "test_github_autosync_regressions": "5 PASS"
+  },
+  "completed": [
+    "Riprodotto branch-refresh-race: rebase locale pulito, fallimento push e successivo task-head-drift.",
+    "Confrontato il tree del candidato con il tree di replay privo di conflitti; coincidono.",
+    "Aggiunto al single-writer un recovery che verifica old base, old head, nuovo base, tree esatto e lease prima del push.",
+    "Aggiunti due test per recupero dopo push fallito e rifiuto di tree manomesso."
+  ],
+  "remaining": [
+    "Commit e push nel worktree owner e conclusione del task con PR single-writer.",
+    "Verificare integrazione della correzione in github-autosync/main e aggiornamento del runtime installato.",
+    "Lasciare al repo-integrator il recupero/incremental merge di #229, #232, #235, #236; rerun JIT isolato su ogni nuovo SHA se richiesta CI.",
+    "Solo dopo integrazione della PR #236, applicare migrazione P238 al DB canonico con backup/lock e verifiche FK/NV."
+  ],
+  "blockers": [
+    "Il runtime owner corrente non recupera task-head-drift dopo push fallito; fix non ancora integrato."
+  ],
+  "current_step": "Pubblicazione fix github-autosync via task worktree.",
+  "next_action": "Commit+push e finish task p238-queue-recovery-20261016; verificare PR/integration; non modificare i branch PR esistenti a mano.",
+  "acceptance": [
+    "Owner fix integrato/testato e runtime verificato",
+    "PR 236 integrata nel master corrente",
+    "Migrazione runtime P238 verificata senza perdita di dati"
+  ]
+}

@@ -77,6 +77,45 @@ Optional forms:
 github-reconcile --dry-run
 ```
 
+A future redacted repository that is still PRIVATE can opt in to a single
+bootstrap task before canonical cutover. After queuing the task and obtaining a
+successful approved Actions `push` or `workflow_dispatch` run on its exact head, use:
+
+```bash
+repo-task authorize-private-bootstrap --repo /tmp/example/clean-clone \
+  --task-id bootstrap --cutover-plan /tmp/example/private-plan.json \
+  --expected-head <40-character-tested-head> \
+  --ci-run-id <approved-run-id> --ci-workflow .github/workflows/ci.yml
+```
+
+This stores a mode-0600 authorization beside existing private task state. It is
+bound to the task/PR, repository identity, exact head, base, approved workflow/run,
+and private plan digest. The installed canonical cutover owner must validate the
+current project/repository CAS and private command bindings with `apply=False`;
+caller-supplied JSON alone grants no authority. The reviewed plan must include
+the pushed task ref and its complete reachable object set, while its target head
+still describes the unchanged default branch. The owner repeats its verification
+under its existing writer lock, which fences the final integration without
+updating registry rows. GitHub repository privacy/identity, PR provenance,
+exact-head workflow/checks/statuses, redacted history and unchanged main are
+checked before the nonforced fast-forward. Bootstrap uses a normal atomic Git
+push with a command-local pre-push expected-base check; receive-pack rejects a
+concurrent update after advertisement. Existing hooks are preserved. The REST
+fast-forward path for active redacted repositories is unchanged. Changed plans, public
+targets, missing proof and changed heads defer integration. Bootstrap never
+automatically rebases the approved task, publishes a command catalog, activates
+routing or cleans up the reviewed clone/worktree. The cutover owner must refresh
+the private plan after integration before any separately authorized publication.
+
+Revoke without changing refs or registry state:
+
+```bash
+repo-task revoke-private-bootstrap --repo /tmp/example/clean-clone --task-id bootstrap
+```
+
+Without opt-in, future targets retain the `canonical-cutover-not-activated` gate.
+The normal active-repository integration path remains unchanged.
+
 Two periodic timers have separate responsibilities: `github-autosync.timer` synchronizes/audits repositories, while `repo-integrator.timer` owns the queued PR integration path.
 
 The integrator also performs bounded hourly terminal-aware Git maintenance using

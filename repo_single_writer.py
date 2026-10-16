@@ -23,6 +23,7 @@ from typing import Any
 from urllib.parse import quote
 
 import command_catalog_bridge
+import private_bootstrap
 
 TASK_PREFIX = "task/"
 PR_PREFIX = "[single-writer]"
@@ -1009,7 +1010,7 @@ def _redacted_source_policy(repo: str, number: int) -> dict[str, Any] | None:
     return {"github_id":int(expected),"active":len(rows)==1 and Path(rows[0][0]).resolve()==root.resolve()}
 
 
-def _redacted_fast_forward_pr(repo: str, number: int, branch: str, head: str, head_branch: str, *, expected_repository_id: int) -> dict[str, Any]:
+def _redacted_fast_forward_pr(repo: str, number: int, branch: str, head: str, head_branch: str, *, expected_repository_id: int, before_update=None, update_ref=None) -> dict[str, Any]:
     """Owner-only FF of the tested bytes, never a GitHub-generated merge commit."""
     def api(endpoint: str, *args: str) -> Any:
         result = run(["gh", "api", endpoint, *args], timeout=120)
@@ -1033,10 +1034,15 @@ def _redacted_fast_forward_pr(repo: str, number: int, branch: str, head: str, he
                     identity = commit["commit"][role]
                     if identity["name"] != "Redacted maintainer" or identity["email"] != "redacted@example.invalid":
                         raise ValueError("redacted commit identity required")
+        if before_update is not None:
+            before_update(base)
         if base != head:
             # Non-forced update preserves every concurrent canonical commit.
             # Public branch protection checks the actual tested head as well.
-            api(f"repos/{repo}/git/refs/heads/{branch}", "--method", "PATCH", "-f", "sha=" + head, "-F", "force=false")
+            if update_ref is None:
+                api(f"repos/{repo}/git/refs/heads/{branch}", "--method", "PATCH", "-f", "sha=" + head, "-F", "force=false")
+            else:
+                update_ref()
         if api(f"repos/{repo}/branches/{branch}")["commit"]["sha"] != head:
             raise ValueError("redacted canonical readback mismatch")
         pr = api(f"repos/{repo}/pulls/{number}")
@@ -1103,6 +1109,18 @@ def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None
         if independence_reason:
             _observe_task(repo, head_branch, independence_reason, reason=independence_reason, pr_number=number)
             return {"repo": repo, "number": number, "status": "deferred", "reason": independence_reason}
+        redacted = _redacted_source_policy(repo, number)
+        bootstrap_task = _task_by_pr(repo, number)
+        bootstrap = bool(bootstrap_task and private_bootstrap.authorization_path(bootstrap_task[0]).exists())
+        if bootstrap and (not redacted or redacted["active"]):
+            return {"repo": repo, "number": number, "status": "deferred", "reason": "private-bootstrap-policy-changed"}
+        if redacted and not redacted["active"]:
+            # A future target is never rebased/refreshed outside its approved
+            # object inventory. Only this explicit task authorization can proceed.
+            if str(info.get("mergeable") or "").upper() != "MERGEABLE":
+                return {"repo": repo, "number": number, "status": "deferred", "reason": "mergeable-unknown"}
+            return private_bootstrap.integrate(sys.modules[__name__], repo, number, default_branch,
+                                               head, head_branch, redacted["github_id"])
         refreshed = _refresh_task_branch_to_latest_base(repo, head_branch, default_branch, head)
         if refreshed.get("status") == "refreshed":
             _observe_task(repo, head_branch, "rebasing", reason="branch-refreshed", pr_number=number)
@@ -1117,10 +1135,7 @@ def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None
             _observe_task(repo, head_branch, "merge-wait", reason=merge_reason, pr_number=number)
             return {"repo": repo, "number": number, "status": "deferred", "reason": merge_reason}
         _observe_task(repo, head_branch, "integrating", pr_number=number)
-        redacted = _redacted_source_policy(repo, number)
         if redacted:
-            if not redacted["active"]:
-                return {"repo":repo,"number":number,"status":"deferred","reason":"canonical-cutover-not-activated"}
             return _redacted_fast_forward_pr(repo, number, default_branch, head, head_branch, expected_repository_id=redacted["github_id"])
         merged = run(
             ["gh", "api", "--method", "PUT", f"repos/{repo}/pulls/{number}/merge",
@@ -1194,7 +1209,8 @@ def process_ready_prs(owner: str) -> dict[str, Any]:
         found = _task_by_pr(str(item["repo"]), int(item["number"]))
         branch = str(found[1].get("branch") or "") if found else ""
         catalog: dict[str, Any] | None = None
-        if found:
+        bootstrap = bool(found and private_bootstrap.authorization_path(found[0]).exists())
+        if found and not bootstrap:
             worktree = Path(str(found[1].get("worktree") or ""))
             try:
                 source_commit = _ok(worktree, "rev-parse", "HEAD")
@@ -1211,10 +1227,12 @@ def process_ready_prs(owner: str) -> dict[str, Any]:
         if branch:
             _observe_task(item["repo"], branch, "queued", pr_number=item["number"], pr_url=str(item.get("url") or ""), queue_position=position, queue_size=size)
         result = integrate_pr(item["repo"], item["number"], blocked_prs=blocked_prs.get(repo_key, []))
+        bootstrap = bootstrap or bool(result.get("private_bootstrap"))
         if result.get("status") == "merged" and result.get("head_branch"):
             if catalog is not None:
                 catalog["merge_sha"] = result.get("sha")
-            publication = command_catalog_bridge.publish(catalog or {"status": "not-applicable"})
+            publication = ({"status": "not-applicable", "reason": "private-bootstrap"} if bootstrap
+                           else command_catalog_bridge.publish(catalog or {"status": "not-applicable"}))
             result["command_catalog"] = publication
             if publication.get("status") not in {"pass", "not-applicable"}:
                 if branch:
@@ -1231,6 +1249,17 @@ def process_ready_prs(owner: str) -> dict[str, Any]:
                     _atomic_json(found[0], pending_payload)
                 result["catalog_pending"] = True
                 blocked_prs.setdefault(repo_key, []).append(int(item["number"]))
+                results.append(result)
+                continue
+            if bootstrap:
+                # Preserve the reviewed future checkout/task inventory for the
+                # cutover owner; do not resolve it through active canonical routing.
+                with RepoLock(str(item["repo"])):
+                    payload = json.loads(found[0].read_text(encoding="utf-8"))
+                    payload.update(status="merged", integration_state="merged",
+                                   merge_sha=result.get("sha"), integrated_head=result.get("head_sha"))
+                    _atomic_json(found[0], payload)
+                result["cleanup"] = {"status": "preserved", "reason": "private-bootstrap"}
                 results.append(result)
                 continue
             result["cleanup"] = cleanup_task_after_merge(
@@ -1426,6 +1455,16 @@ def build_parser() -> argparse.ArgumentParser:
     guard = sub.add_parser("guard")
     guard.add_argument("--repo", type=Path, required=True)
     guard.add_argument("--branch")
+    authorize = sub.add_parser("authorize-private-bootstrap")
+    authorize.add_argument("--repo", type=Path, required=True)
+    authorize.add_argument("--task-id", required=True)
+    authorize.add_argument("--cutover-plan", type=Path, required=True)
+    authorize.add_argument("--expected-head", required=True)
+    authorize.add_argument("--ci-run-id", type=int, required=True)
+    authorize.add_argument("--ci-workflow", required=True)
+    revoke = sub.add_parser("revoke-private-bootstrap")
+    revoke.add_argument("--repo", type=Path, required=True)
+    revoke.add_argument("--task-id", required=True)
     process = sub.add_parser("process")
     process.add_argument("--owner", default="gernalix")
     return parser
@@ -1473,6 +1512,17 @@ def main(argv: list[str] | None = None) -> int:
             print(payload.get("sha") or payload.get("status") or "merged")
         elif args.command == "guard":
             print(json.dumps(ensure_guard(args.repo, args.branch), sort_keys=True))
+        elif args.command == "authorize-private-bootstrap":
+            try:
+                payload = private_bootstrap.authorize(sys.modules[__name__], args.repo, args.task_id,
+                    args.cutover_plan, args.expected_head, args.ci_run_id, args.ci_workflow)
+            except Exception:
+                raise ValueError("private bootstrap authorization failed") from None
+            print(json.dumps(payload, sort_keys=True))
+        elif args.command == "revoke-private-bootstrap":
+            with RepoLock(_repo_slug(args.repo)):
+                private_bootstrap.authorization_path(_task_record(args.repo, args.task_id)).unlink(missing_ok=True)
+            print('{"status": "revoked"}')
         elif args.command == "process":
             print(json.dumps(process_ready_prs(args.owner), sort_keys=True))
         return 0

@@ -1,0 +1,41 @@
+{
+  "objective": "Recuperare il rebase della PR MegaVault #229 anche se master avanza mentre la pubblicazione del branch precedente è fallita, senza bypass dei controlli Git.",
+  "verified": {
+    "owner_PR60_merged": "https://github.com/gernalix/github-autosync/pull/60",
+    "megavault_PR235_merged": "954cde25c0ab13bb6acddad0977a1d3456b9a0f8",
+    "stranded_original_head": "737582440b6dc177f9c15848e06facf7b82e6028",
+    "stranded_rebased_local_head": "121cbd799f954b1d4a7621947b5f98728fa192e0",
+    "canonical_latest_at_start": "954cde25c0ab13bb6acddad0977a1d3456b9a0f8",
+    "original_replay_against_current_canonical": "8f587c05701d52c8c114dce4d08676fa563b8f7a",
+    "test_new_advanced_case": "PASS",
+    "test_repo_single_writer": "30 PASS",
+    "test_github_autosync_regressions": "5 PASS"
+  },
+  "constraints": [
+    "Usare soltanto task/* e owner repo-integrator; nessun merge/reset/force-push manuale",
+    "Sicurezza: prova di equivalenza dell'albero, verifica ancestry e lease esatta sul branch PR",
+    "Preservare tutte le modifiche PR 228,229,232,235,236"
+  ],
+  "completed": [
+    "Confermato PR #60 e PR #235 integrate",
+    "Risoluzione avviata su task branch github-autosync",
+    "Esteso il recupero affinché riconosca base precedente, riproduca il tree e possa ribasare sul nuovo master",
+    "Test end-to-end su repository Git temporanei con due avanzamenti di master PASS",
+    "Suite pertinente 30 single-writer + 5 autosync PASS"
+  ],
+  "remaining": [
+    "Pubblicare commit e PR via single-writer, attendere integration",
+    "Verificare refresh runtime owner, recupero PR #229, nuova CI sulle revisioni ribasate",
+    "Integrare #232 e #236 (e verificare #235), migrare SQLite solo dopo merge #236 e backup"
+  ],
+  "blockers": [
+    "Correzione non ancora pubblicata; PR #229 in task-head-drift finché owner runtime non include il nuovo recupero"
+  ],
+  "current_step": "Commit e push nel branch task mediante repo_single_writer finish",
+  "next_action": "Verificare PR pubblicata, integrazione su github-autosync/main e aggiornamento owner runtime; quindi recuperare il branch MegaVault #229 dal single-writer e riavviare CI solo sugli SHA effettivamente aggiornati.",
+  "acceptance": [
+    "Fix owner integrato e attivo",
+    "PR #229 recuperata senza perdita di file né push manuale",
+    "PR #236 integrata e migrazione P238 verificata"
+  ]
+}

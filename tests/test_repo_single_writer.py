@@ -646,5 +646,54 @@ class SingleWriterTests(unittest.TestCase):
                 self.assertEqual(old_head, remote_head)
 
 
+    def test_rebase_retry_handles_advanced_canonical_with_exact_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, _ = self.make_repo(root / "git")
+            with (mock.patch.object(writer, "STATE_ROOT", root / "state"),
+                  mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees")):
+                task = writer.start_task(repo, "advanced-retry")
+                worktree = Path(task["worktree"])
+                branch = task["branch"]
+                old_base = git(["rev-parse", "HEAD"], worktree).stdout.strip()
+                (worktree / "feature.txt").write_text("original feature\n")
+                self.assertEqual(0, git(["add", "feature.txt"], worktree).returncode)
+                self.assertEqual(0, git(["commit", "-m", "original feature"], worktree).returncode)
+                old_head = git(["rev-parse", "HEAD"], worktree).stdout.strip()
+                self.assertEqual(0, git(["push", "-u", "origin", branch], worktree).returncode)
+                seed = root / "git" / "seed"
+                (seed / "main1.txt").write_text("main1\n")
+                self.assertEqual(0, git(["add", "main1.txt"], seed).returncode)
+                self.assertEqual(0, git(["commit", "-m", "main1"], seed).returncode)
+                self.assertEqual(0, git(["push", "origin", "main"], seed).returncode)
+                self.assertEqual(0, git(["fetch", "origin"], worktree).returncode)
+                self.assertEqual(0, git(["rebase", "origin/main"], worktree).returncode)
+                stranded_head = git(["rev-parse", "HEAD"], worktree).stdout.strip()
+                # Simulate another independent PR being merged while the
+                # original leased task-branch push remained unsuccessful.
+                (seed / "main2.txt").write_text("main2\n")
+                self.assertEqual(0, git(["add", "main2.txt"], seed).returncode)
+                self.assertEqual(0, git(["commit", "-m", "main2"], seed).returncode)
+                self.assertEqual(0, git(["push", "origin", "main"], seed).returncode)
+                record = writer._task_record(repo, "advanced-retry")
+                state = json.loads(record.read_text())
+                state.update(status="queued", base_sha=old_base, head_sha=old_head)
+                record.write_text(json.dumps(state))
+                result = writer._refresh_task_branch_to_latest_base(
+                    task["repo"], branch, "main", old_head)
+                self.assertEqual("refreshed", result.get("status"), result)
+                repaired_head = git(["rev-parse", "HEAD"], worktree).stdout.strip()
+                self.assertNotEqual(stranded_head, repaired_head)
+                self.assertEqual(repaired_head, json.loads(record.read_text())["head_sha"])
+                remote = git(["ls-remote", "origin", "refs/heads/" + branch], worktree)
+                self.assertEqual(repaired_head, remote.stdout.split()[0])
+                tree = git(["rev-parse", "HEAD^{tree}"], worktree).stdout.strip()
+                main2 = git(["rev-parse", "origin/main"], worktree).stdout.strip()
+                replay = git(["merge-tree", "--write-tree", "--merge-base",
+                              old_base, old_head, main2], worktree)
+                self.assertEqual(0, replay.returncode, replay.stderr)
+                self.assertEqual(tree, replay.stdout.strip())
+
+
 if __name__ == "__main__":
     unittest.main()

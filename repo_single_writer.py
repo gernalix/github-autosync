@@ -924,13 +924,33 @@ def _refresh_task_branch_to_latest_base(
         original_base = str(payload.get("base_sha") or "")
         if not re.fullmatch(r"[0-9a-f]{40}", original_base):
             return {"status": "deferred", "reason": "task-head-drift"}
-        if (_git(worktree, "merge-base", "--is-ancestor", original_base, expected_head).returncode
-                or _git(worktree, "merge-base", "--is-ancestor", remote_base, local_head).returncode):
+        if _git(worktree, "merge-base", "--is-ancestor", original_base, expected_head).returncode:
+            return {"status": "deferred", "reason": "task-head-drift"}
+        # The canonical branch can advance again while a failed push is being
+        # retried. Prove the stranded head was an exact replay on its *previous*
+        # canonical base before ever rebasing it onto the newest canonical tip.
+        shared = _git(worktree, "merge-base", local_head, remote_base)
+        if shared.returncode or not re.fullmatch(r"[0-9a-f]{40}", shared.stdout.strip()):
+            return {"status": "deferred", "reason": "task-head-drift"}
+        candidate_base = shared.stdout.strip()
+        if _git(worktree, "merge-base", "--is-ancestor", original_base, candidate_base).returncode:
             return {"status": "deferred", "reason": "task-head-drift"}
         replay = _git(worktree, "merge-tree", "--write-tree", "--merge-base",
-                      original_base, expected_head, remote_base, timeout=120)
+                      original_base, expected_head, candidate_base, timeout=120)
         if replay.returncode or replay.stdout.strip() != _ok(worktree, "rev-parse", "HEAD^{tree}"):
             return {"status": "deferred", "reason": "task-head-drift"}
+        if candidate_base != remote_base:
+            updated = _git(worktree, "merge-tree", "--write-tree", "--merge-base",
+                           original_base, expected_head, remote_base, timeout=120)
+            if updated.returncode:
+                return {"status": "deferred", "reason": "semantic-conflict"}
+            advanced = _git(worktree, "rebase", f"refs/remotes/origin/{canonical}", timeout=300)
+            if advanced.returncode:
+                _git(worktree, "rebase", "--abort", timeout=120)
+                return {"status": "deferred", "reason": "semantic-conflict"}
+            local_head = _ok(worktree, "rev-parse", "HEAD")
+            if updated.stdout.strip() != _ok(worktree, "rev-parse", "HEAD^{tree}"):
+                return {"status": "deferred", "reason": "task-head-drift"}
         pushed = _git(
             worktree, "push",
             f"--force-with-lease=refs/heads/{branch}:{expected_head}",

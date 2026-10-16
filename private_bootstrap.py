@@ -195,13 +195,14 @@ if previous and os.access(previous, os.X_OK):
 """
 
 
-def _push_exact_base(owner, root, branch, base, head):
+def _push_exact_base(owner, root, branch, base, head, expected_remote):
     """Nonforced FF with an expected-old-OID gate, only inside integration."""
     if owner._git(root, 'merge-base', '--is-ancestor', base, head).returncode:
         raise ValueError('private bootstrap is not a local fast-forward')
     push_urls = owner._ok(root, 'remote', 'get-url', '--push', '--all', 'origin').splitlines()
-    if len(push_urls) != 1:
-        raise ValueError('private bootstrap requires one push destination')
+    if (len(push_urls) != 1 or owner._normalize_repo_url(push_urls[0])
+            != owner._normalize_repo_url(expected_remote)):
+        raise ValueError('private bootstrap push destination changed')
     hooks = Path(owner._ok(root, 'rev-parse', '--git-path', 'hooks'))
     hooks = (root / hooks).resolve() if not hooks.is_absolute() else hooks.resolve()
     with tempfile.TemporaryDirectory(prefix='private-bootstrap-') as directory:
@@ -244,7 +245,7 @@ def integrate(owner, repo, number, branch, head, head_branch, repository_id):
                 revalidate()
             result = owner._redacted_fast_forward_pr(repo, number, branch, head, head_branch,
                          expected_repository_id=repository_id, before_update=recheck,
-                         update_ref=lambda: _push_exact_base(owner, Path(task['repo_path']), branch, auth['base'], head))
+                         update_ref=lambda: _push_exact_base(owner, Path(task['repo_path']), branch, auth['base'], head, plan['after']['remote_url']))
         result['private_bootstrap'] = True
         return result
     except Exception:

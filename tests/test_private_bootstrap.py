@@ -119,7 +119,7 @@ class PrivateBootstrapTests(unittest.TestCase):
         if '/actions/workflows/' in endpoint: return dict(path='.github/workflows/ci.yml', state='active')
         raise AssertionError(endpoint)
 
-    def push(self, integrator, root, branch, base, head):
+    def push(self, integrator, root, branch, base, head, expected_remote):
         self.assertTrue(self.fenced)
         self.assertEqual((base, head), (BASE, HEAD))
         self.writes.append(('nonforced-git-push', branch, head))
@@ -335,7 +335,7 @@ class ExactBaseGitTests(unittest.TestCase):
         marker = self.root / 'hook-called'
         hook.write_text('#!/usr/bin/env python3\nfrom pathlib import Path\nPath(' + repr(str(marker)) + ').write_text("called")\n')
         hook.chmod(0o700)
-        bootstrap._push_exact_base(owner, self.client, 'main', self.base, self.head)
+        bootstrap._push_exact_base(owner, self.client, 'main', self.base, self.head, str(self.remote))
         self.assertEqual(self.remote_head(), self.head)
         self.assertTrue(marker.is_file())
         self.assertEqual(self.git(self.client, 'config', '--get-regexp', '^remote.origin.url$'), 'remote.origin.url ' + str(self.remote))
@@ -343,7 +343,7 @@ class ExactBaseGitTests(unittest.TestCase):
     def test_concurrent_ancestor_before_advertisement_is_rejected(self):
         self.git(self.remote, 'update-ref', 'refs/heads/main', self.middle, self.base)
         with self.assertRaises(ValueError):
-            bootstrap._push_exact_base(owner, self.client, 'main', self.base, self.head)
+            bootstrap._push_exact_base(owner, self.client, 'main', self.base, self.head, str(self.remote))
         self.assertEqual(self.remote_head(), self.middle)
 
     def test_concurrent_ancestor_after_advertisement_is_rejected_by_server(self):
@@ -352,14 +352,21 @@ class ExactBaseGitTests(unittest.TestCase):
         hook.write_text('#!/usr/bin/env python3\nimport subprocess\nsubprocess.run(' + repr(args) + ', check=True)\n')
         hook.chmod(0o700)
         with self.assertRaises(ValueError):
-            bootstrap._push_exact_base(owner, self.client, 'main', self.base, self.head)
+            bootstrap._push_exact_base(owner, self.client, 'main', self.base, self.head, str(self.remote))
         self.assertEqual(self.remote_head(), self.middle)
+
+    def test_push_url_changed_after_owner_preflight_is_rejected_before_transport(self):
+        self.git(self.client, 'remote', 'set-url', '--push', 'origin', str(self.root / 'other.git'))
+        with self.assertRaisesRegex(ValueError, 'push destination changed'):
+            bootstrap._push_exact_base(owner, self.client, 'main', self.base, self.head, str(self.remote))
+        self.assertEqual(self.remote_head(), self.base)
+        self.assertFalse((self.root / 'other.git').exists())
 
     def test_existing_hook_rejection_is_not_bypassed(self):
         hook = self.client / '.git/hooks/pre-push'
         hook.write_text('#!/bin/sh\nexit 1\n'); hook.chmod(0o700)
         with self.assertRaises(ValueError):
-            bootstrap._push_exact_base(owner, self.client, 'main', self.base, self.head)
+            bootstrap._push_exact_base(owner, self.client, 'main', self.base, self.head, str(self.remote))
         self.assertEqual(self.remote_head(), self.base)
 
 

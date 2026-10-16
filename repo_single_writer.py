@@ -916,9 +916,32 @@ def _refresh_task_branch_to_latest_base(
     if fetched.returncode:
         return {"status": "deferred", "reason": "base-fetch-failed"}
     local_head = _ok(worktree, "rev-parse", "HEAD")
-    if local_head != expected_head:
-        return {"status": "deferred", "reason": "task-head-drift"}
     remote_base = _ok(worktree, "rev-parse", f"refs/remotes/origin/{canonical}")
+    if local_head != expected_head:
+        # A successful rebase followed by a failed leased push leaves a clean
+        # local candidate and the original remote PR head. Recover only when
+        # a fresh, conflict-free replay reproduces the candidate's exact tree.
+        original_base = str(payload.get("base_sha") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", original_base):
+            return {"status": "deferred", "reason": "task-head-drift"}
+        if (_git(worktree, "merge-base", "--is-ancestor", original_base, expected_head).returncode
+                or _git(worktree, "merge-base", "--is-ancestor", remote_base, local_head).returncode):
+            return {"status": "deferred", "reason": "task-head-drift"}
+        replay = _git(worktree, "merge-tree", "--write-tree", "--merge-base",
+                      original_base, expected_head, remote_base, timeout=120)
+        if replay.returncode or replay.stdout.strip() != _ok(worktree, "rev-parse", "HEAD^{tree}"):
+            return {"status": "deferred", "reason": "task-head-drift"}
+        pushed = _git(
+            worktree, "push",
+            f"--force-with-lease=refs/heads/{branch}:{expected_head}",
+            "origin", f"HEAD:refs/heads/{branch}", timeout=300,
+        )
+        if pushed.returncode:
+            return {"status": "deferred", "reason": "branch-refresh-race"}
+        payload.update(status="queued", base_sha=remote_base, head_sha=local_head,
+                       refreshed_at=_iso_now())
+        _atomic_json(record_path, payload)
+        return {"status": "refreshed"}
     contains = _git(worktree, "merge-base", "--is-ancestor", remote_base, local_head)
     if contains.returncode == 0:
         payload["base_sha"] = remote_base

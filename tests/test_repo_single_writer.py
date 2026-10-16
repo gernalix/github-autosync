@@ -559,5 +559,92 @@ class SingleWriterTests(unittest.TestCase):
         self.assertEqual("checks-pending", result["reason"])
 
 
+    def test_clean_rebased_head_recovers_after_leased_push_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            repo, _ = self.make_repo(temp / "git")
+            with (mock.patch.object(writer, "STATE_ROOT", temp / "state"),
+                  mock.patch.object(writer, "WORKTREE_ROOT", temp / "worktrees")):
+                task = writer.start_task(repo, "refresh-retry")
+                worktree = Path(task["worktree"])
+                branch = task["branch"]
+                base_sha = git(["rev-parse", "HEAD"], worktree).stdout.strip()
+                (worktree / "feature.txt").write_text("feature\n", encoding="utf-8")
+                self.assertEqual(0, git(["add", "feature.txt"], worktree).returncode)
+                self.assertEqual(0, git(["commit", "-m", "feature"], worktree).returncode)
+                old_head = git(["rev-parse", "HEAD"], worktree).stdout.strip()
+                self.assertEqual(0, git(["push", "-u", "origin", branch], worktree).returncode)
+                seed = temp / "git" / "seed"
+                (seed / "upstream.txt").write_text("upstream\n", encoding="utf-8")
+                self.assertEqual(0, git(["add", "upstream.txt"], seed).returncode)
+                self.assertEqual(0, git(["commit", "-m", "upstream"], seed).returncode)
+                self.assertEqual(0, git(["push", "origin", "main"], seed).returncode)
+                self.assertEqual(0, git(["fetch", "origin"], worktree).returncode)
+                self.assertEqual(0, git(["rebase", "origin/main"], worktree).returncode)
+                rebased_head = git(["rev-parse", "HEAD"], worktree).stdout.strip()
+                self.assertNotEqual(old_head, rebased_head)
+                record = writer._task_record(repo, "refresh-retry")
+                recorded = json.loads(record.read_text(encoding="utf-8"))
+                recorded.update(status="queued", base_sha=base_sha, head_sha=old_head)
+                record.write_text(json.dumps(recorded), encoding="utf-8")
+                original_git = writer._git
+                attempts = [0]
+
+                def fail_first_push(path, *args, **kwargs):
+                    if args and args[0] == "push" and attempts[0] == 0:
+                        attempts[0] += 1
+                        return cp(code=1, stderr="transient connection failure")
+                    return original_git(path, *args, **kwargs)
+
+                with mock.patch.object(writer, "_git", side_effect=fail_first_push):
+                    first = writer._refresh_task_branch_to_latest_base(
+                        task["repo"], branch, "main", old_head)
+                self.assertEqual("branch-refresh-race", first.get("reason"))
+                resumed = writer._refresh_task_branch_to_latest_base(
+                    task["repo"], branch, "main", old_head)
+                self.assertEqual("refreshed", resumed.get("status"), resumed)
+                self.assertEqual(rebased_head, json.loads(record.read_text())["head_sha"])
+                remote_head = git(["ls-remote", "origin", "refs/heads/" + branch], worktree).stdout.split()[0]
+                self.assertEqual(rebased_head, remote_head)
+                current = writer._refresh_task_branch_to_latest_base(
+                    task["repo"], branch, "main", rebased_head)
+                self.assertEqual("current", current.get("status"))
+
+    def test_rebased_head_recovery_rejects_tampered_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            repo, _ = self.make_repo(temp / "git")
+            with (mock.patch.object(writer, "STATE_ROOT", temp / "state"),
+                  mock.patch.object(writer, "WORKTREE_ROOT", temp / "worktrees")):
+                task = writer.start_task(repo, "refresh-check")
+                worktree = Path(task["worktree"])
+                branch = task["branch"]
+                original_base = git(["rev-parse", "HEAD"], worktree).stdout.strip()
+                (worktree / "feature.txt").write_text("feature\n", encoding="utf-8")
+                self.assertEqual(0, git(["add", "feature.txt"], worktree).returncode)
+                self.assertEqual(0, git(["commit", "-m", "feature"], worktree).returncode)
+                old_head = git(["rev-parse", "HEAD"], worktree).stdout.strip()
+                self.assertEqual(0, git(["push", "-u", "origin", branch], worktree).returncode)
+                seed = temp / "git" / "seed"
+                (seed / "upstream.txt").write_text("upstream\n", encoding="utf-8")
+                self.assertEqual(0, git(["add", "upstream.txt"], seed).returncode)
+                self.assertEqual(0, git(["commit", "-m", "upstream"], seed).returncode)
+                self.assertEqual(0, git(["push", "origin", "main"], seed).returncode)
+                self.assertEqual(0, git(["fetch", "origin"], worktree).returncode)
+                self.assertEqual(0, git(["rebase", "origin/main"], worktree).returncode)
+                (worktree / "unexpected.txt").write_text("unreviewed\n", encoding="utf-8")
+                self.assertEqual(0, git(["add", "unexpected.txt"], worktree).returncode)
+                self.assertEqual(0, git(["commit", "-m", "unreviewed"], worktree).returncode)
+                record = writer._task_record(repo, "refresh-check")
+                state = json.loads(record.read_text())
+                state.update(status="queued", base_sha=original_base, head_sha=old_head)
+                record.write_text(json.dumps(state), encoding="utf-8")
+                result = writer._refresh_task_branch_to_latest_base(
+                    task["repo"], branch, "main", old_head)
+                self.assertEqual("task-head-drift", result.get("reason"))
+                remote_head = git(["ls-remote", "origin", "refs/heads/" + branch], worktree).stdout.split()[0]
+                self.assertEqual(old_head, remote_head)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -651,6 +651,26 @@ def cleanup_task_after_merge(
             "cleanup_deferred": result.get("reason"), "task_id": payload.get("task_id")}
 
 
+def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, canonical_sha: str) -> dict[str, Any]:
+    """Collect only an already terminal record; never manufacture merged status."""
+    with RepoLock(repo_slug):
+        found=_task_by_branch(repo_slug,branch)
+        if found is None:return {"status":"preserved","reason":"no-task-record"}
+        record,payload=found;repo=Path(payload['repo_path'])
+        if payload.get('status') not in {'merged','superseded'}:
+            return {"status":"preserved","reason":"nonterminal"}
+        tip=_git(repo,'rev-parse','--verify','refs/heads/'+branch)
+        if tip.returncode==0 and tip.stdout.strip()!=expected_head:
+            return {"status":"preserved","reason":"changed-tip"}
+        live=_ok(repo,'ls-remote','origin','refs/heads/'+payload['canonical_branch']).split()[0]
+        if live!=canonical_sha:return {"status":"preserved","reason":"remote-advanced"}
+        from repo_gc import collect_record
+        result=collect_record(payload)
+        payload['cleanup']=sorted(set(payload.get('cleanup',[]))|set(result['removed']))
+        _atomic_json(record,payload)
+        return result
+
+
 def _checkpoint_task(worktree: Path, task_id: str) -> None:
     if _operation_in_progress(worktree):
         raise RuntimeError("task has an unfinished Git operation/conflict")
@@ -1465,6 +1485,9 @@ def build_parser() -> argparse.ArgumentParser:
     revoke = sub.add_parser("revoke-private-bootstrap")
     revoke.add_argument("--repo", type=Path, required=True)
     revoke.add_argument("--task-id", required=True)
+    archive = sub.add_parser("archive-worktree", help="privately preserve and retire an explicitly reviewed inactive checkout")
+    archive.add_argument("--repo", type=Path, required=True)
+    archive.add_argument("--review-file", type=Path, required=True)
     process = sub.add_parser("process")
     process.add_argument("--owner", default="gernalix")
     return parser
@@ -1523,6 +1546,9 @@ def main(argv: list[str] | None = None) -> int:
             with RepoLock(_repo_slug(args.repo)):
                 private_bootstrap.authorization_path(_task_record(args.repo, args.task_id)).unlink(missing_ok=True)
             print('{"status": "revoked"}')
+        elif args.command == "archive-worktree":
+            from repo_gc import archive_reviewed_worktree
+            print(json.dumps(archive_reviewed_worktree(args.repo,args.review_file),sort_keys=True))
         elif args.command == "process":
             print(json.dumps(process_ready_prs(args.owner), sort_keys=True))
         return 0

@@ -12,15 +12,23 @@ import repo_single_writer as writer
 
 C3_DB = Path.home() / '.local/state/c3-control/roadmap.sqlite'
 C3_REPO = Path.home() / 'projects/codex-roadmap'
-PURIFY_GC_CAPABILITY = 'ignored-artifacts-v1'
+PURIFY_GC_CAPABILITY = 'reviewed-archive-v1'
 RETIREMENT_MARKER = Path.home() / '.local/state/c3-control/c2-retired.json'
 
 
 def c3_allows(payload):
     # Frozen historical workers/worktrees are retained. Ordinary Git GC needs no
     # roadmap database, lifecycle lease or C3 service.
-    if payload.get('roadmap_prompt_id') or re.fullmatch(r'\d{6}', str(payload.get('task_id') or '')):
+    if payload.get('roadmap_prompt_id'):
         return False
+    if re.fullmatch(r'\d{6}', str(payload.get('task_id') or '')):
+        merged_proof=(payload.get('status')=='merged' and payload.get('pr_number') and
+                      payload.get('integration_state')=='merged' and
+                      re.fullmatch(r'[0-9a-f]{40}',str(payload.get('integrated_head') or '')) and
+                      re.fullmatch(r'[0-9a-f]{40}',str(payload.get('merge_sha') or '')))
+        retired_proof=(payload.get('status')=='superseded' and payload.get('terminal_evidence') and not payload.get('pr_number'))
+        if not merged_proof and not retired_proof:
+            return False
     path = str(payload.get('worktree') or '')
     return not any(part in path for part in ('c2-supervisor', 'c3-symphony', 'c3-control'))
     prompt = str(payload.get('roadmap_prompt_id') or '')
@@ -53,7 +61,7 @@ def c3_allows(payload):
 
 
 def collect_record(payload, *, dry_run=False):
-    if payload.get('status') != 'merged' or not c3_allows(payload):
+    if payload.get('status') not in {'merged','superseded'} or (payload.get('status')=='superseded' and not payload.get('terminal_evidence')) or not c3_allows(payload):
         return {'removed': [], 'reason': 'nonterminal-active-or-recovery'}
     repo = Path(str(payload.get('repo_path') or '')).expanduser().resolve()
     branch = str(payload.get('branch') or '')
@@ -104,7 +112,7 @@ def collect_record(payload, *, dry_run=False):
         except (OSError, ValueError):
             return {'removed': [], 'reason': 'unreadable-ownership'}
         if (other.get('repo') == payload.get('repo') and other.get('branch') == branch
-                and other.get('status') != 'merged'):
+                and other.get('status') not in {'merged','superseded'}):
             return {'removed': [], 'reason': 'referenced-branch'}
     removed = []
     if path.exists():
@@ -406,3 +414,150 @@ def sweep_legacy_c3(*, dry_run=False, batch_limit=25):
             if dry_run or writer._git(C3_REPO, 'update-ref', '-d', 'refs/heads/' + branch, tip).returncode == 0:
                 result['removed'].append('local-branch')
     return {'checked': len(results), 'results': results}
+
+
+def worktree_snapshot(path):
+    import hashlib,os,stat
+    path=Path(path)
+    result={}
+    for directory,dirs,files in os.walk(path,followlinks=False):
+        if Path(directory)==path:
+            dirs[:]=[n for n in dirs if n!='.git'];files=[n for n in files if n!='.git']
+        for name in sorted(dirs+files):
+            file=Path(directory)/name;rel=file.relative_to(path).as_posix();st=file.lstat()
+            item={'mode':stat.S_IMODE(st.st_mode)}
+            if stat.S_ISLNK(st.st_mode):item.update(kind='link',target=os.readlink(file))
+            elif stat.S_ISDIR(st.st_mode):item.update(kind='directory')
+            elif stat.S_ISREG(st.st_mode):
+                with file.open('rb') as stream:digest=hashlib.file_digest(stream,'sha256').hexdigest()
+                item.update(kind='file',bytes=st.st_size,sha256=digest)
+            else:raise ValueError('live/special file prevents archival')
+            result[rel]=item
+    return result
+
+
+def archive_reviewed_worktree(repo, review_file):
+    """Privately preserve a reviewed, inactive worktree before retiring its checkout.
+
+    The review is an explicit input, not lifecycle authority. Current Git and
+    existing task records are rechecked under the owner lock. C3 stays frozen.
+    """
+    import hashlib
+    import os
+    import stat
+    import tarfile
+
+    repo=Path(repo).resolve();review_file=Path(review_file)
+    raw=review_file.read_bytes();review=json.loads(raw)
+    required={'worktree','expected_head','canonical_sha','status_sha256','disposition','replacement_commit','chat_id','inactive_confirmation','worktree_fingerprint','index_sha256'}
+    if set(review)!=required or not all(isinstance(v,str) and v.strip() for v in review.values()):
+        raise ValueError('complete explicit archival review required')
+    import uuid
+    uuid.UUID(review['chat_id'])
+    if review['disposition'] not in {'integrated','patch-equivalent','superseded'}:
+        raise ValueError('unsupported archival disposition')
+    slug=writer._repo_slug(repo);path=Path(review['worktree']).resolve()
+    if path==repo or path in repo.parents or repo in path.parents:
+        raise ValueError('canonical or nested checkout cannot be archived')
+    root=writer.STATE_ROOT/'preserved-worktrees'/slug.replace('/','_')/hashlib.sha256(raw).hexdigest()
+    def private(name,data):
+        target=root/name
+        with target.open('wb') as stream:
+            os.chmod(target,0o600);stream.write(data);stream.flush();os.fsync(stream.fileno())
+    if path in root.parents or repo in root.parents:raise ValueError('preservation must be outside checkouts')
+    snapshot=lambda:worktree_snapshot(path)
+    with writer.RepoLock(slug):
+        receipt=root/'receipt.json'
+        if receipt.exists():
+            saved=json.loads(receipt.read_text())
+            if saved.get('status')=='archived' and not path.exists():return saved
+        listing=writer._ok(repo,'worktree','list','--porcelain','-z')
+        rows=[dict(line.partition(' ')[::2] for line in block.split('\0') if line) for block in listing.split('\0\0')]
+        row=next((row for row in rows if row.get('worktree')==str(path)),None)
+        if not row or 'locked' in row or _legacy_path(path):raise ValueError('unregistered, locked or frozen worktree')
+        for record in writer._task_dir_for_slug(slug).glob('*.json'):
+            task=json.loads(record.read_text())
+            if Path(str(task.get('worktree') or '/')).resolve()!=path:continue
+            if task.get('roadmap_prompt_id') or task.get('status') not in {'merged','superseded'}:
+                raise ValueError('active or frozen owner forbids archival')
+        if writer._operation_in_progress(path):raise ValueError('unfinished Git operation')
+        lock=Path(writer._ok(path,'rev-parse','--git-path','index.lock'))
+        if not lock.is_absolute():lock=path/lock
+        if lock.exists():raise ValueError('index is locked')
+        if writer._git_common_dir(repo).resolve()!=writer._git_common_dir(path).resolve():raise ValueError('repository identity mismatch')
+        head=writer._ok(path,'rev-parse','HEAD');status=writer._git(path,'status','--porcelain=v1','-z','--untracked-files=all').stdout
+        if head!=review['expected_head'] or hashlib.sha256(status.encode()).hexdigest()!=review['status_sha256']:
+            raise ValueError('reviewed checkout changed')
+        canonical=writer._canonical_branch(repo)
+        live=writer._ok(repo,'ls-remote','origin','refs/heads/'+canonical).split()[0]
+        if live!=review['canonical_sha']:raise ValueError('canonical remote changed since review')
+        if writer._git(repo,'merge-base','--is-ancestor',review['replacement_commit'],live).returncode:
+            raise ValueError('replacement has not been integrated')
+        if review['disposition']=='integrated' and writer._git(repo,'merge-base','--is-ancestor',head,live).returncode:
+            raise ValueError('unintegrated checkout')
+        if review['disposition']=='patch-equivalent':
+            changes=writer._ok(path,'cherry',live,head)
+            if any(line.startswith('+') for line in changes.splitlines()):raise ValueError('non-equivalent commits remain')
+        root.mkdir(parents=True,exist_ok=True,mode=0o700)
+        if root.stat().st_mode&0o077:raise ValueError('private preservation directory required')
+        index_patch=writer._git(path,'diff','--cached','--binary','--full-index','HEAD')
+        working_patch=writer._git(path,'diff','--binary','--full-index','HEAD')
+        if index_patch.returncode or working_patch.returncode:raise ValueError('cannot preserve index/working patch')
+        if hashlib.sha256(index_patch.stdout.encode()).hexdigest()!=review['index_sha256']:raise ValueError('reviewed index changed')
+        expected=snapshot()
+        if hashlib.sha256(json.dumps(expected,sort_keys=True).encode()).hexdigest()!=review['worktree_fingerprint']:
+            raise ValueError('reviewed file contents changed')
+        import shutil
+        if shutil.disk_usage(root).free < sum(x.get('bytes',0) for x in expected.values())+64*1024*1024:
+            raise ValueError('insufficient preservation space')
+        private('review.json',raw)
+        private('index.patch',index_patch.stdout.encode())
+        private('working.patch',working_patch.stdout.encode())
+        bundle=root/'commits.bundle'
+        if not bundle.exists():writer._ok(path,'bundle','create',str(bundle),'HEAD')
+        os.chmod(bundle,0o600)
+        writer._ok(repo,'bundle','verify',str(bundle))
+        if writer._ok(repo,'bundle','list-heads',str(bundle),'HEAD').split()[0]!=head:raise ValueError('bundle head differs')
+        archive=root/'contents.tar.gz'
+        if not archive.exists():
+            partial=root/'contents.partial';os.close(os.open(partial,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600))
+            with tarfile.open(partial,'w:gz',compresslevel=1) as tar:
+                for name in sorted(expected):
+                    info=tar.gettarinfo(path/name,arcname=name)
+                    if expected[name]['kind']=='file':
+                        info.type=tarfile.REGTYPE;info.linkname='';info.size=expected[name]['bytes']
+                        with (path/name).open('rb') as stream:tar.addfile(info,stream)
+                    else:tar.addfile(info)
+            with partial.open('rb') as stream:os.fsync(stream.fileno())
+            os.replace(partial,archive)
+        found={}
+        with tarfile.open(archive,'r:gz') as tar:
+            for member in tar:
+                item={'mode':member.mode}
+                if member.isdir():item.update(kind='directory')
+                elif member.issym():item.update(kind='link',target=member.linkname)
+                elif member.isfile():
+                    with tar.extractfile(member) as stream:digest=hashlib.file_digest(stream,'sha256').hexdigest()
+                    item.update(kind='file',bytes=member.size,sha256=digest)
+                else:raise ValueError('unsupported archived entry')
+                if member.name in found:raise ValueError('duplicate archived entry')
+                found[member.name]=item
+        if found!=expected or snapshot()!=expected:raise ValueError('archive readback or source stability failed')
+        if writer._ok(path,'rev-parse','HEAD')!=head or writer._git(path,'status','--porcelain=v1','-z','--untracked-files=all').stdout!=status or writer._git(path,'diff','--cached','--binary','--full-index','HEAD').stdout!=index_patch.stdout:
+            raise ValueError('Git state changed during preservation')
+        result={'status':'verified','source':str(path),'head':head,'preservation':str(root),
+                'files':len(expected),'source_bytes':sum(x.get('bytes',0) for x in expected.values())}
+        private('manifest.json',json.dumps(expected,sort_keys=True).encode())
+        private('receipt.json',json.dumps(result,sort_keys=True).encode())
+        # Keep the entire original directory as well as the readback-verified
+        # archive. Even a late write through an existing descriptor remains safe.
+        original=root/'original'
+        if original.exists():raise ValueError('preserved original destination occupied')
+        os.rename(path,original)
+        result['original']=str(original)
+        private('receipt.json',json.dumps(result,sort_keys=True).encode())
+        if path.exists():raise ValueError('source path recreated; all files preserved, metadata retained')
+        # Only the now-missing registration is removed; no data directory is deleted.
+        writer._ok(repo,'worktree','remove','--force',str(path))
+        result['status']='archived';private('receipt.json',json.dumps(result,sort_keys=True).encode())
+        return result

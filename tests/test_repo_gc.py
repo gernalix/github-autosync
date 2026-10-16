@@ -102,3 +102,101 @@ class SafeGcTests(unittest.TestCase):
     def test_orphan_gc_requires_positive_terminal_owner_and_preserves_unknown_refs(self):
         with patch.object(gc.sqlite3, "connect", side_effect=AssertionError("C3 archive opened")), patch.object(writer, "_git", side_effect=AssertionError("historical Git mutated")):
             self.assertIn("frozen", gc.sweep_orphan_c3()["reason"])
+
+class ReviewedArchiveTests(unittest.TestCase):
+    fixture=SafeGcTests.fixture
+    def review(self,root,repo,tree,payload,disposition='integrated'):
+        import hashlib
+        head=writer._ok(tree,'rev-parse','HEAD')
+        status=writer._git(tree,'status','--porcelain=v1','-z','--untracked-files=all').stdout
+        value={'worktree':str(tree),'expected_head':head,'canonical_sha':writer._ok(repo,'rev-parse','origin/main'),
+               'status_sha256':hashlib.sha256(status.encode()).hexdigest(),'disposition':disposition,
+               'replacement_commit':writer._ok(repo,'rev-parse','origin/main'),
+               'chat_id':'01a145f5-8e5c-7842-bd33-97f757614c7d',
+               'index_sha256':hashlib.sha256(writer._git(tree,'diff','--cached','--binary','--full-index','HEAD').stdout.encode()).hexdigest(),
+               'worktree_fingerprint':hashlib.sha256(json.dumps(gc.worktree_snapshot(tree),sort_keys=True).encode()).hexdigest(),
+               'inactive_confirmation':'User reports no active chats; reviewed completed work'}
+        p=root/'review.json';p.write_text(json.dumps(value));return p
+
+    def test_complete_dirty_ignored_index_and_symlink_preservation_and_rerun(self):
+        import tarfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                (tree/'integrated.txt').write_text('staged contribution')
+                fixtures.git(['add','integrated.txt'],tree)
+                (tree/'integrated.txt').write_text('local contribution')
+                exclude=Path(writer._ok(repo,'rev-parse','--git-path','info/exclude'))
+                if not exclude.is_absolute():exclude=repo/exclude
+                with exclude.open('a') as stream:stream.write('only-copy.db\n')
+                (tree/'only-copy.db').write_bytes(b'private ignored original')
+                os.link(tree/'only-copy.db',tree/'hardlinked-original')
+                external=root/'external';external.write_text('outside tree')
+                (tree/'link').symlink_to(external)
+                review=self.review(root,repo,tree,payload)
+                result=gc.archive_reviewed_worktree(repo,review)
+                self.assertEqual(result['status'],'archived');self.assertFalse(tree.exists());self.assertTrue(external.exists())
+                self.assertEqual((Path(result['original'])/'only-copy.db').read_bytes(),b'private ignored original')
+                archive=Path(result['preservation'])
+                with tarfile.open(archive/'contents.tar.gz') as tar:
+                    self.assertEqual(tar.extractfile('only-copy.db').read(),b'private ignored original')
+                    self.assertEqual(tar.extractfile('integrated.txt').read(),b'local contribution')
+                    self.assertTrue(tar.getmember('link').issym())
+                self.assertIn(b'staged contribution',(archive/'index.patch').read_bytes())
+                self.assertEqual(gc.archive_reviewed_worktree(repo,review),result)
+                self.assertEqual(0,fixtures.git(['show-ref','--verify','refs/heads/'+payload['branch']],remote).returncode)
+
+    def test_active_and_frozen_owners_remain_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root);review=self.review(root,repo,tree,payload)
+                for status,roadmap in [('active',None),('queued',None),('merged','123456')]:
+                    payload.update(status=status,roadmap_prompt_id=roadmap)
+                    writer._atomic_json(writer._task_record(repo,payload['task_id']),payload)
+                    with self.assertRaisesRegex(ValueError,'active or frozen'):gc.archive_reviewed_worktree(repo,review)
+                    self.assertTrue(tree.exists())
+
+    def test_same_status_with_new_file_contents_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                (tree/'integrated.txt').write_text('reviewed dirty text')
+                review=self.review(root,repo,tree,payload)
+                (tree/'integrated.txt').write_text('unreviewed dirty text')
+                with self.assertRaisesRegex(ValueError,'contents changed'):gc.archive_reviewed_worktree(repo,review)
+                self.assertEqual((tree/'integrated.txt').read_text(),'unreviewed dirty text')
+
+    def test_only_positive_modern_numeric_receipts_allow_collection(self):
+        basic={'task_id':'123456','status':'merged','worktree':'/tmp/modern'}
+        self.assertFalse(gc.c3_allows(basic))
+        proved={**basic,'pr_number':1,'integration_state':'merged','integrated_head':'a'*40,'merge_sha':'b'*40}
+        self.assertTrue(gc.c3_allows(proved))
+        self.assertFalse(gc.c3_allows({**proved,'roadmap_prompt_id':'123456'}))
+        self.assertFalse(gc.c3_allows({**proved,'worktree':'/home/daniele/.local/share/c3-symphony/legacy'}))
+
+    def test_stale_review_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root);review=self.review(root,repo,tree,payload)
+                (tree/'changed').write_text('new work')
+                with self.assertRaisesRegex(ValueError,'changed'):gc.archive_reviewed_worktree(repo,review)
+                self.assertEqual((tree/'changed').read_text(),'new work')
+
+    def test_change_during_copy_never_removes_source(self):
+        import tarfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root);review=self.review(root,repo,tree,payload)
+                original=tarfile.TarFile.addfile;changed=False
+                def concurrent(tar,*args,**kwargs):
+                    nonlocal changed
+                    if not changed:(tree/'integrated.txt').write_text('concurrent update');changed=True
+                    return original(tar,*args,**kwargs)
+                with patch.object(tarfile.TarFile,'addfile',concurrent):
+                    with self.assertRaisesRegex(ValueError,'stability|readback'):gc.archive_reviewed_worktree(repo,review)
+                self.assertTrue(tree.exists());self.assertEqual((tree/'integrated.txt').read_text(),'concurrent update')

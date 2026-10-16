@@ -310,3 +310,18 @@ its NV before human output; `--json`, redirected output and services retain thei
 output contract. Missing or inconsistent source shows `NV unavailable`. Ordinary
 commits retain NV; deliberate releases increment once and reconcile the integrated
 SHA with MegaVault. Initial adoption preserves the existing registry version 1.
+
+### Reviewed worktree preservation
+
+`repo-task archive-worktree --repo PATH --review-file REVIEW.json` handles an
+explicitly reviewed inactive checkout. The input binds its HEAD, canonical SHA,
+index and complete file fingerprint, disposition, replacement commit and actual
+chat UUID. The owner verifies a private full Git bundle, index/working patches
+and a compressed archive of all working files (including ignored artifacts),
+then moves the complete original directory into the private preservation folder.
+Only its missing Git registration is removed; data files are retained. Stale
+reviews, changed files/index, live owner states, locks and C3 roadmap ownership
+fail closed. Archival receipts are recovery evidence, not a lifecycle registry.
+Numeric task IDs alone no longer identify C3: only positive modern merged-PR or
+explicit supersession evidence permits terminal collection; actual C3 markers
+remain protected.

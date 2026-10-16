@@ -991,20 +991,25 @@ def _independence_reason(repo: str, head: str, canonical: str, blocked_prs: list
     return None
 
 
-# This exact repository keeps commit contact metadata redacted. The existing
-# canonical registry activates this route; preparation does not rebind it.
-REDACTED_REPOSITORY = "gernalix/adb-device-keeper-public"
-REDACTED_REPOSITORY_ID = 1421472416
-
-
-def _redacted_source_active() -> bool:
+def _redacted_source_policy(repo: str, number: int) -> dict[str, Any] | None:
+    """Resolve private Git policy through existing registry/task owners."""
+    root = resolve_repo_path(repo)
+    task = _task_by_pr(repo, number)
+    if root is None and task:
+        root = Path(str(task[1]["repo_path"]))
+    if root is None or _git(root, "config", "--bool", "--get", "megavault.redactedFastForward").stdout.strip() != "true":
+        return None
+    expected = _git(root, "config", "--get", "megavault.redactedRepositoryId").stdout.strip()
+    if not expected.isdecimal():
+        raise ValueError("redacted repository ID binding unavailable")
+    remote = "https://github.com/" + repo
     database = Path.home() / "MegaVault/megavault.sqlite"
     with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as conn:
-        rows = conn.execute("SELECT repository_id,remote_url FROM repositories WHERE project_id=95 AND canonical=1").fetchall()
-    return len(rows) == 1 and rows[0][0] == "R0096" and str(rows[0][1]).removesuffix(".git").rstrip("/") == "https://github.com/" + REDACTED_REPOSITORY
+        rows = conn.execute("SELECT worktree_path FROM repositories WHERE canonical=1 AND status='active' AND remote_url IN (?,?)",(remote,remote+".git")).fetchall()
+    return {"github_id":int(expected),"active":len(rows)==1 and Path(rows[0][0]).resolve()==root.resolve()}
 
 
-def _redacted_fast_forward_pr(repo: str, number: int, branch: str, head: str, head_branch: str) -> dict[str, Any]:
+def _redacted_fast_forward_pr(repo: str, number: int, branch: str, head: str, head_branch: str, *, expected_repository_id: int) -> dict[str, Any]:
     """Owner-only FF of the tested bytes, never a GitHub-generated merge commit."""
     def api(endpoint: str, *args: str) -> Any:
         result = run(["gh", "api", endpoint, *args], timeout=120)
@@ -1012,10 +1017,8 @@ def _redacted_fast_forward_pr(repo: str, number: int, branch: str, head: str, he
             raise ValueError("redacted integration API failed")
         return json.loads(result.stdout)
     try:
-        if repo != REDACTED_REPOSITORY:
-            raise ValueError("wrong redacted repository")
         metadata = api("repos/" + repo)
-        if metadata["id"] != REDACTED_REPOSITORY_ID:
+        if metadata["id"] != expected_repository_id:
             raise ValueError("redacted repository identity changed")
         base = api(f"repos/{repo}/branches/{branch}")["commit"]["sha"]
         comparison = api(f"repos/{repo}/compare/{base}...{head}")
@@ -1114,10 +1117,11 @@ def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None
             _observe_task(repo, head_branch, "merge-wait", reason=merge_reason, pr_number=number)
             return {"repo": repo, "number": number, "status": "deferred", "reason": merge_reason}
         _observe_task(repo, head_branch, "integrating", pr_number=number)
-        if repo == REDACTED_REPOSITORY:
-            if not _redacted_source_active():
+        redacted = _redacted_source_policy(repo, number)
+        if redacted:
+            if not redacted["active"]:
                 return {"repo":repo,"number":number,"status":"deferred","reason":"canonical-cutover-not-activated"}
-            return _redacted_fast_forward_pr(repo, number, default_branch, head, head_branch)
+            return _redacted_fast_forward_pr(repo, number, default_branch, head, head_branch, expected_repository_id=redacted["github_id"])
         merged = run(
             ["gh", "api", "--method", "PUT", f"repos/{repo}/pulls/{number}/merge",
              "-f", f"sha={head}", "-f", "merge_method=merge"],

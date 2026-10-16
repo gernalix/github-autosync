@@ -20,7 +20,6 @@ jobs:
   test:
     runs-on: >-
       ${{
-        (github.repository == 'gernalix/github-autosync' && startsWith(vars.CI_CUTOVER_JIT_LABEL, 'p174-sync-') && vars.CI_CUTOVER_HEAD_SHA != '' && ((github.event_name == 'push' && github.sha == vars.CI_CUTOVER_HEAD_SHA) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha == vars.CI_CUTOVER_HEAD_SHA))) && vars.CI_CUTOVER_JIT_LABEL ||
         github.repository == 'gernalix/github-autosync' &&
         (github.ref == 'refs/heads/task/P118-host-aware-source' || github.head_ref == 'task/P118-host-aware-source') &&
         'p118-github-autosync-source' ||
@@ -32,14 +31,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          ref: ${{ (github.repository == 'gernalix/github-autosync' && startsWith(vars.CI_CUTOVER_JIT_LABEL, 'p174-sync-') && vars.CI_CUTOVER_HEAD_SHA != '' && ((github.event_name == 'push' && github.sha == vars.CI_CUTOVER_HEAD_SHA) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha == vars.CI_CUTOVER_HEAD_SHA))) && vars.CI_CUTOVER_HEAD_SHA || github.sha }}
-      - name: Verify cutover JIT checkout
-        if: ${{ github.repository == 'gernalix/github-autosync' && startsWith(vars.CI_CUTOVER_JIT_LABEL, 'p174-sync-') && vars.CI_CUTOVER_HEAD_SHA != '' && ((github.event_name == 'push' && github.sha == vars.CI_CUTOVER_HEAD_SHA) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.sha == vars.CI_CUTOVER_HEAD_SHA)) }}
-        env:
-          EXPECTED_SHA: ${{ vars.CI_CUTOVER_HEAD_SHA }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

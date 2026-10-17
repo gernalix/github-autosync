@@ -1174,10 +1174,6 @@ def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None
         dependency_reason = _dependency_reason(repo, str(info.get("body") or ""))
         if dependency_reason:
             return {"repo": repo, "number": number, "status": "deferred", "reason": dependency_reason}
-        allowed, check_reason = _check_rollup_allows_merge(info.get("statusCheckRollup"))
-        if not allowed:
-            _observe_task(repo, head_branch, check_reason, reason=check_reason, pr_number=number)
-            return {"repo": repo, "number": number, "status": "deferred", "reason": check_reason}
         if not head:
             return {"repo": repo, "number": number, "status": "deferred", "reason": "head-missing"}
         independence_reason = _independence_reason(repo, head, default_branch, blocked_prs or [])
@@ -1204,6 +1200,10 @@ def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None
             refresh_reason = str(refreshed.get("reason") or "branch-refresh-failed")
             _observe_task(repo, head_branch, refresh_reason, reason=refresh_reason, pr_number=number)
             return {"repo": repo, "number": number, "status": "deferred", "reason": refresh_reason}
+        allowed, check_reason = _check_rollup_allows_merge(info.get("statusCheckRollup"))
+        if not allowed:
+            _observe_task(repo, head_branch, check_reason, reason=check_reason, pr_number=number)
+            return {"repo": repo, "number": number, "status": "deferred", "reason": check_reason}
         mergeable = str(info.get("mergeable") or "").upper()
         if mergeable != "MERGEABLE":
             merge_reason = f"mergeable-{mergeable.lower() or 'unknown'}"

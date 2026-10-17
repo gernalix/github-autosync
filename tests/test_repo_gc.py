@@ -147,6 +147,49 @@ class ReviewedArchiveTests(unittest.TestCase):
                 self.assertEqual(gc.archive_reviewed_worktree(repo,review),result)
                 self.assertEqual(0,fixtures.git(['show-ref','--verify','refs/heads/'+payload['branch']],remote).returncode)
 
+    def test_reviewed_patch_equivalent_collection_preserves_originals_and_remote_tip_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                # Simulate the original checkout surviving an integrator rebase.
+                self.assertEqual(0,fixtures.git(['commit','--amend','-m','equivalent original'],tree).returncode)
+                tip=writer._ok(tree,'rev-parse','HEAD')
+                self.assertNotEqual(tip,payload['integrated_head'])
+                review=self.review(root,repo,tree,payload,'patch-equivalent')
+                archived=gc.archive_reviewed_worktree(repo,review)
+                self.assertTrue(gc.preserved_patch_equivalent(payload,tip,'origin/main'))
+                result=gc.collect_record(payload)
+                self.assertEqual(result,{'removed':['remote-branch','local-branch']})
+                self.assertTrue((Path(archived['original'])/'integrated.txt').is_file())
+                self.assertTrue((Path(archived['preservation'])/'commits.bundle').is_file())
+                self.assertNotEqual(0,fixtures.git(['show-ref','--verify','refs/heads/'+payload['branch']],remote).returncode)
+
+    def test_archived_equivalent_tip_does_not_authorize_changed_branch_or_missing_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                fixtures.git(['commit','--amend','-m','equivalent original'],tree)
+                tip=writer._ok(tree,'rev-parse','HEAD')
+                archived=gc.archive_reviewed_worktree(repo,self.review(root,repo,tree,payload,'patch-equivalent'))
+                bundle=Path(archived['preservation'])/'commits.bundle'
+                original=bundle.read_bytes();bundle.write_bytes(b'corrupt')
+                self.assertFalse(gc.preserved_patch_equivalent(payload,tip,'origin/main'))
+                self.assertEqual(gc.collect_record(payload)['removed'],[])
+                bundle.write_bytes(original)
+                self.assertTrue(gc.preserved_patch_equivalent(payload,tip,'origin/main'))
+                self.assertFalse(gc.preserved_patch_equivalent(payload,payload['integrated_head'],'origin/main'))
+                ancestor=writer._ok(repo,'rev-parse','origin/main^')
+                fixtures.git(['update-ref','refs/heads/'+payload['branch'],ancestor],remote)
+                blocked=gc.collect_record(payload)
+                self.assertEqual(blocked['reason'],'remote-changed-or-active')
+                self.assertEqual(blocked['removed'],[])
+                self.assertEqual(writer._ok(repo,'rev-parse',payload['branch']),tip)
+                fixtures.git(['update-ref','refs/heads/'+payload['branch'],payload['integrated_head']],remote)
+                # A newly recreated task directory also invalidates the archival receipt.
+                tree.mkdir();self.assertFalse(gc.preserved_patch_equivalent(payload,tip,'origin/main'))
+
     def test_active_and_frozen_owners_remain_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

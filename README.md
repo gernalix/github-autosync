@@ -326,6 +326,13 @@ Numeric task IDs alone no longer identify C3: only positive modern merged-PR or
 explicit supersession evidence permits terminal collection; actual C3 markers
 remain protected.
 
+A merged task's rebased original tip can be collected only after reviewed
+`patch-equivalent` archival: GC checks the exact receipt/review, preserved
+original directory, verified bundle and current `git cherry` result. A remote
+tip may be that same original or the record's exact integrated head with proven
+ancestry. Recreated worktrees, changed tips or missing recovery evidence remain
+blocked. Archived originals and bundles are never deleted by terminal GC.
+
 The Python single-writer APIs used by MegaVault purification accept an optional
 `scope_guard` callback on task start/finish, terminal cleanup and reviewed
 worktree archival. They invoke it inside the existing repository lock before

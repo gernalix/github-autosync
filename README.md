@@ -325,3 +325,11 @@ fail closed. Archival receipts are recovery evidence, not a lifecycle registry.
 Numeric task IDs alone no longer identify C3: only positive modern merged-PR or
 explicit supersession evidence permits terminal collection; actual C3 markers
 remain protected.
+
+The Python single-writer APIs used by MegaVault purification accept an optional
+`scope_guard` callback on task start/finish, terminal cleanup and reviewed
+worktree archival. They invoke it inside the existing repository lock before
+mutating Git or task data; GC also rechecks immediately before deletion.
+MegaVault owns the callback's live registry/root/origin authorization. The
+callback is not a new allowlist, executor or lifecycle owner. Existing callers
+without this callback retain their own authorization contract.

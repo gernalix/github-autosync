@@ -60,7 +60,7 @@ def c3_allows(payload):
         return False
 
 
-def collect_record(payload, *, dry_run=False):
+def collect_record(payload, *, dry_run=False, scope_guard=None):
     if payload.get('status') not in {'merged','superseded'} or (payload.get('status')=='superseded' and not payload.get('terminal_evidence')) or not c3_allows(payload):
         return {'removed': [], 'reason': 'nonterminal-active-or-recovery'}
     repo = Path(str(payload.get('repo_path') or '')).expanduser().resolve()
@@ -114,10 +114,14 @@ def collect_record(payload, *, dry_run=False):
         if (other.get('repo') == payload.get('repo') and other.get('branch') == branch
                 and other.get('status') not in {'merged','superseded'}):
             return {'removed': [], 'reason': 'referenced-branch'}
+    def authorize():
+        if not dry_run and scope_guard is not None: scope_guard(repo, payload.get('repo'))
+    authorize()
     removed = []
     if path.exists():
         if not c3_allows(payload):
             return {'removed': [], 'reason': 'active-at-delete'}
+        authorize()
         if dry_run:
             removed.append('worktree')
         elif (writer._git(path, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z').returncode != 0
@@ -138,6 +142,7 @@ def collect_record(payload, *, dry_run=False):
     if fields:
         if len(fields) != 2 or fields[0] != tip or not c3_allows(payload):
             return {'removed': removed, 'reason': 'remote-changed-or-active'}
+        authorize()
         if dry_run or writer._git(repo, 'push', 'origin',
                 '--force-with-lease=refs/heads/' + branch + ':' + tip,
                 ':refs/heads/' + branch, timeout=30).returncode == 0:
@@ -153,6 +158,7 @@ def collect_record(payload, *, dry_run=False):
                 return {'removed': removed, 'reason': 'checked-out-at-delete'}
         # Ancestry was proved against fetched canonical, not a stale local HEAD.
         # Compare-and-delete cannot remove a concurrently changed branch tip.
+        authorize()
         if dry_run or writer._git(repo, 'update-ref', '-d', 'refs/heads/' + branch, tip).returncode == 0:
             removed.append('local-branch')
         else:
@@ -436,7 +442,7 @@ def worktree_snapshot(path):
     return result
 
 
-def archive_reviewed_worktree(repo, review_file):
+def archive_reviewed_worktree(repo, review_file, *, scope_guard=None):
     """Privately preserve a reviewed, inactive worktree before retiring its checkout.
 
     The review is an explicit input, not lifecycle authority. Current Git and
@@ -467,6 +473,7 @@ def archive_reviewed_worktree(repo, review_file):
     if path in root.parents or repo in root.parents:raise ValueError('preservation must be outside checkouts')
     snapshot=lambda:worktree_snapshot(path)
     with writer.RepoLock(slug):
+        if scope_guard is not None: scope_guard(repo, slug)
         receipt=root/'receipt.json'
         if receipt.exists():
             saved=json.loads(receipt.read_text())
@@ -498,6 +505,7 @@ def archive_reviewed_worktree(repo, review_file):
         if review['disposition']=='patch-equivalent':
             changes=writer._ok(path,'cherry',live,head)
             if any(line.startswith('+') for line in changes.splitlines()):raise ValueError('non-equivalent commits remain')
+        if scope_guard is not None: scope_guard(repo, slug)
         root.mkdir(parents=True,exist_ok=True,mode=0o700)
         if root.stat().st_mode&0o077:raise ValueError('private preservation directory required')
         index_patch=writer._git(path,'diff','--cached','--binary','--full-index','HEAD')
@@ -553,11 +561,13 @@ def archive_reviewed_worktree(repo, review_file):
         # archive. Even a late write through an existing descriptor remains safe.
         original=root/'original'
         if original.exists():raise ValueError('preserved original destination occupied')
+        if scope_guard is not None: scope_guard(repo, slug)
         os.rename(path,original)
         result['original']=str(original)
         private('receipt.json',json.dumps(result,sort_keys=True).encode())
         if path.exists():raise ValueError('source path recreated; all files preserved, metadata retained')
         # Only the now-missing registration is removed; no data directory is deleted.
+        if scope_guard is not None: scope_guard(repo, slug)
         writer._ok(repo,'worktree','remove','--force',str(path))
         result['status']='archived';private('receipt.json',json.dumps(result,sort_keys=True).encode())
         return result

@@ -323,18 +323,20 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def start_task(repo: Path, task_id: str, actor: str = "agent") -> dict[str, Any]:
+def start_task(repo: Path, task_id: str, actor: str = "agent", *, scope_guard=None) -> dict[str, Any]:
     with RepoLock(_repo_slug(repo.expanduser().resolve())):
-        return _start_task_unlocked(repo, task_id, actor)
+        if scope_guard is not None: scope_guard(repo, _repo_slug(repo))
+        return _start_task_unlocked(repo, task_id, actor, scope_guard=scope_guard)
 
 
-def _start_task_unlocked(repo: Path, task_id: str, actor: str = "agent") -> dict[str, Any]:
+def _start_task_unlocked(repo: Path, task_id: str, actor: str = "agent", *, scope_guard=None) -> dict[str, Any]:
     repo = repo.expanduser().resolve()
     task_id = _safe_task_id(task_id)
     if not (repo / ".git").exists() and _git(repo, "rev-parse", "--is-inside-work-tree").returncode != 0:
         raise RuntimeError(f"not a git repository: {repo}")
     slug = _repo_slug(repo)
     canonical = _canonical_branch(repo)
+    if scope_guard is not None: scope_guard(repo, slug)
     ensure_guard(repo, canonical)
     # Worker isolation must not depend on the state of the canonical checkout.
     # The task worktree starts from the freshly fetched remote canonical tip.
@@ -347,9 +349,11 @@ def _start_task_unlocked(repo: Path, task_id: str, actor: str = "agent") -> dict
             if existing.get("status") == "active":
                 existing["heartbeat_at"] = _iso_now()
                 existing["lease_expires_at"] = None
+                if scope_guard is not None: scope_guard(repo, slug)
                 _atomic_json(record_path, existing)
             return existing
 
+    if scope_guard is not None: scope_guard(repo, slug)
     fetched = _git(repo, "fetch", "--no-tags", "origin",
                    f"refs/heads/{canonical}:refs/remotes/origin/{canonical}", timeout=180)
     if fetched.returncode:
@@ -357,14 +361,17 @@ def _start_task_unlocked(repo: Path, task_id: str, actor: str = "agent") -> dict
     branch = TASK_PREFIX + task_id
     safe_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", slug)
     worktree = WORKTREE_ROOT / safe_slug / task_id
+    if scope_guard is not None: scope_guard(repo, slug)
     worktree.parent.mkdir(parents=True, exist_ok=True)
     if worktree.exists():
         raise RuntimeError(f"task worktree already exists: {worktree}")
     remote_base = f"origin/{canonical}"
     base = remote_base if _git(repo, "show-ref", "--verify", "--quiet", f"refs/remotes/{remote_base}").returncode == 0 else canonical
     if _git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0:
+        if scope_guard is not None: scope_guard(repo, slug)
         add = _git(repo, "worktree", "add", str(worktree), branch, timeout=180)
     else:
+        if scope_guard is not None: scope_guard(repo, slug)
         add = _git(repo, "worktree", "add", "-b", branch, str(worktree), base, timeout=180)
     if add.returncode:
         raise RuntimeError(add.stderr.strip() or add.stdout.strip() or "worktree creation failed")
@@ -383,6 +390,7 @@ def _start_task_unlocked(repo: Path, task_id: str, actor: str = "agent") -> dict
         "heartbeat_at": _iso_now(),
         "lease_expires_at": None,
     }
+    if scope_guard is not None: scope_guard(repo, slug)
     _atomic_json(record_path, payload)
     return payload
 
@@ -625,6 +633,21 @@ def cleanup_task_after_merge(
     *,
     expected_head: str | None = None,
     merge_sha: str | None = None,
+    scope_guard=None,
+) -> dict[str, Any]:
+    with RepoLock(repo_slug):
+        if scope_guard is not None: scope_guard()
+        return _cleanup_task_after_merge_unlocked(repo_slug, branch, expected_head=expected_head,
+                                                  merge_sha=merge_sha, scope_guard=scope_guard)
+
+
+def _cleanup_task_after_merge_unlocked(
+    repo_slug: str,
+    branch: str,
+    *,
+    expected_head: str | None = None,
+    merge_sha: str | None = None,
+    scope_guard=None,
 ) -> dict[str, Any]:
     found = _task_by_branch(repo_slug, branch)
     if found is None:
@@ -641,19 +664,21 @@ def cleanup_task_after_merge(
     payload["integration_observed_at"] = _iso_now()
 
     payload["integrated_head"] = expected_head or payload.get("integrated_head")
+    if scope_guard is not None: scope_guard(repo, repo_slug)
     _atomic_json(record_path, payload)
     from repo_gc import collect_record
-    with RepoLock(repo_slug):
-        result = collect_record(payload)
-        payload["cleanup"] = sorted(set(payload.get("cleanup", [])) | set(result["removed"]))
-        _atomic_json(record_path, payload)
+    result = collect_record(payload, scope_guard=scope_guard)
+    payload["cleanup"] = sorted(set(payload.get("cleanup", [])) | set(result["removed"]))
+    if scope_guard is not None: scope_guard(repo, repo_slug)
+    _atomic_json(record_path, payload)
     return {"status": "merged", "cleanup": payload["cleanup"],
             "cleanup_deferred": result.get("reason"), "task_id": payload.get("task_id")}
 
 
-def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, canonical_sha: str) -> dict[str, Any]:
+def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, canonical_sha: str, scope_guard=None) -> dict[str, Any]:
     """Collect only an already terminal record; never manufacture merged status."""
     with RepoLock(repo_slug):
+        if scope_guard is not None: scope_guard()
         found=_task_by_branch(repo_slug,branch)
         if found is None:return {"status":"preserved","reason":"no-task-record"}
         record,payload=found;repo=Path(payload['repo_path'])
@@ -665,23 +690,27 @@ def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, ca
         live=_ok(repo,'ls-remote','origin','refs/heads/'+payload['canonical_branch']).split()[0]
         if live!=canonical_sha:return {"status":"preserved","reason":"remote-advanced"}
         from repo_gc import collect_record
-        result=collect_record(payload)
+        if scope_guard is not None: scope_guard(repo, repo_slug)
+        result=collect_record(payload, scope_guard=scope_guard)
         payload['cleanup']=sorted(set(payload.get('cleanup',[]))|set(result['removed']))
+        if scope_guard is not None: scope_guard(repo, repo_slug)
         _atomic_json(record,payload)
         return result
 
 
-def _checkpoint_task(worktree: Path, task_id: str) -> None:
+def _checkpoint_task(worktree: Path, task_id: str, *, scope_guard=None) -> None:
     if _operation_in_progress(worktree):
         raise RuntimeError("task has an unfinished Git operation/conflict")
     status = _ok(worktree, "status", "--porcelain")
     if not status:
         return
+    if scope_guard is not None: scope_guard()
     add = _git(worktree, "add", "-A", timeout=120)
     if add.returncode:
         raise RuntimeError(add.stderr.strip() or "git add failed")
     staged = _git(worktree, "diff", "--cached", "--quiet")
     if staged.returncode == 1:
+        if scope_guard is not None: scope_guard()
         commit = _git(worktree, "commit", "-m", f"task {task_id}: checkpoint completed work", timeout=300)
         if commit.returncode:
             raise RuntimeError(commit.stderr.strip() or "task commit failed")
@@ -689,7 +718,15 @@ def _checkpoint_task(worktree: Path, task_id: str) -> None:
         raise RuntimeError("staged diff check failed")
 
 
-def finish_task(repo: Path, task_id: str) -> dict[str, Any]:
+def finish_task(repo: Path, task_id: str, *, scope_guard=None) -> dict[str, Any]:
+    if scope_guard is None:
+        return _finish_task_unlocked(repo, task_id)
+    with RepoLock(_repo_slug(repo)):
+        scope_guard(repo, _repo_slug(repo))
+        return _finish_task_unlocked(repo, task_id, scope_guard=scope_guard)
+
+
+def _finish_task_unlocked(repo: Path, task_id: str, *, scope_guard=None) -> dict[str, Any]:
     repo = repo.expanduser().resolve()
     task_id = _safe_task_id(task_id)
     record_path = _task_record(repo, task_id)
@@ -701,10 +738,15 @@ def finish_task(repo: Path, task_id: str) -> dict[str, Any]:
     if payload.get("status") not in {"active", "blocked"}:
         raise RuntimeError(f"task is not finishable: {payload.get('status')}")
     worktree = Path(payload["worktree"])
-    _checkpoint_task(worktree, task_id)
+    if scope_guard is not None: scope_guard(repo, str(payload["repo"]))
+    if scope_guard is None:
+        _checkpoint_task(worktree, task_id)
+    else:
+        _checkpoint_task(worktree, task_id, scope_guard=scope_guard)
     branch = str(payload["branch"])
 
     canonical = str(payload["canonical_branch"])
+    if scope_guard is not None: scope_guard(repo, str(payload["repo"]))
     fetched = _git(
         worktree,
         "fetch",
@@ -718,16 +760,20 @@ def finish_task(repo: Path, task_id: str) -> dict[str, Any]:
     head = _ok(worktree, "rev-parse", "HEAD")
     canonical_head = _ok(worktree, "rev-parse", f"refs/remotes/origin/{canonical}")
     if head == canonical_head:
-        cleanup_task_after_merge(
+        cleanup = _cleanup_task_after_merge_unlocked if scope_guard is not None else cleanup_task_after_merge
+        cleanup(
             str(payload["repo"]),
             branch,
             merge_sha=head,
+            **({"scope_guard":scope_guard} if scope_guard is not None else {}),
         )
         final = json.loads(record_path.read_text(encoding="utf-8"))
         final["integration"] = "no-op"
+        if scope_guard is not None: scope_guard(repo, str(payload["repo"]))
         _atomic_json(record_path, final)
         return final
 
+    if scope_guard is not None: scope_guard(repo, str(payload["repo"]))
     push = _git(worktree, "push", "-u", "origin", branch, timeout=300)
     if push.returncode:
         raise RuntimeError(push.stderr.strip() or "task branch push failed")
@@ -748,6 +794,7 @@ def finish_task(repo: Path, task_id: str) -> dict[str, Any]:
         except Exception:
             pass
     if pr_number is None:
+        if scope_guard is not None: scope_guard(repo, str(payload["repo"]))
         created = run(
             [
                 "gh", "pr", "create", "--repo", payload["repo"],
@@ -783,6 +830,7 @@ def finish_task(repo: Path, task_id: str) -> dict[str, Any]:
         "integration_reason": None,
         "integration_observed_at": _iso_now(),
     })
+    if scope_guard is not None: scope_guard(repo, str(payload["repo"]))
     _atomic_json(record_path, payload)
     return payload
 

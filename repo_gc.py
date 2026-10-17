@@ -60,6 +60,43 @@ def c3_allows(payload):
         return False
 
 
+def preserved_patch_equivalent(payload, tip, base):
+    """Recognize an exact, privately archived tip after its patches were rebased.
+
+    This does not turn an active task into a terminal one or discard originals.
+    A changed tip, missing bundle, non-equivalent patch or recreated worktree
+    invalidates the evidence.
+    """
+    import hashlib
+    if payload.get('status') != 'merged' or not c3_allows(payload):
+        return False
+    repo=Path(payload['repo_path']);source=Path(payload['worktree'])
+    if source.exists():return False
+    root=writer.STATE_ROOT/'preserved-worktrees'/payload['repo'].replace('/','_')
+    for path in root.glob('*/review.json'):
+        try:
+            raw=path.read_bytes();review=json.loads(raw)
+            if path.parent.name != hashlib.sha256(raw).hexdigest():continue
+            if (review.get('worktree') != str(source) or review.get('expected_head') != tip
+                    or review.get('disposition') != 'patch-equivalent'):continue
+            receipt=json.loads((path.parent/'receipt.json').read_text())
+            if (receipt.get('status') != 'archived' or receipt.get('head') != tip
+                    or receipt.get('source') != str(source)
+                    or receipt.get('original') != str(path.parent/'original')
+                    or not (path.parent/'original').is_dir()):continue
+            if writer._git(repo,'merge-base','--is-ancestor',review['replacement_commit'],base).returncode:continue
+            patches=writer._git(repo,'cherry',base,tip)
+            if patches.returncode or not patches.stdout.strip() or any(not line.startswith('- ') for line in patches.stdout.splitlines()):continue
+            bundle=path.parent/'commits.bundle'
+            if writer._git(repo,'bundle','verify',str(bundle)).returncode:continue
+            listed=writer._git(repo,'bundle','list-heads',str(bundle),'HEAD')
+            if listed.returncode or listed.stdout.split() != [tip,'HEAD']:continue
+            return True
+        except (OSError,ValueError,KeyError):
+            continue
+    return False
+
+
 def collect_record(payload, *, dry_run=False, scope_guard=None):
     if payload.get('status') not in {'merged','superseded'} or (payload.get('status')=='superseded' and not payload.get('terminal_evidence')) or not c3_allows(payload):
         return {'removed': [], 'reason': 'nonterminal-active-or-recovery'}
@@ -83,9 +120,10 @@ def collect_record(payload, *, dry_run=False, scope_guard=None):
         tip = expected
     else:
         tip = head.stdout.strip()
-    if expected and tip != expected:
+    preserved=preserved_patch_equivalent(payload,tip,base)
+    if expected and tip != expected and not preserved:
         return {'removed': [], 'reason': 'changed-after-merge'}
-    if writer._git(repo, 'merge-base', '--is-ancestor', tip, base).returncode:
+    if writer._git(repo, 'merge-base', '--is-ancestor', tip, base).returncode and not preserved:
         return {'removed': [], 'reason': 'unintegrated-tip'}
     if path.exists():
         dirty = writer._git(path, 'status', '--porcelain', '--untracked-files=all')
@@ -140,11 +178,16 @@ def collect_record(payload, *, dry_run=False, scope_guard=None):
         return {'removed': removed, 'reason': 'remote-read-failed'}
     fields = remote.stdout.split()
     if fields:
-        if len(fields) != 2 or fields[0] != tip or not c3_allows(payload):
+        # A rebased task can have its reviewed original locally and the exact
+        # integrated head remotely. Both need independent positive evidence.
+        remote_tip=fields[0]
+        integrated_remote=(preserved and remote_tip == expected and
+                           writer._git(repo,'merge-base','--is-ancestor',remote_tip,base).returncode == 0)
+        if len(fields) != 2 or (remote_tip != tip and not integrated_remote) or not c3_allows(payload):
             return {'removed': removed, 'reason': 'remote-changed-or-active'}
         authorize()
         if dry_run or writer._git(repo, 'push', 'origin',
-                '--force-with-lease=refs/heads/' + branch + ':' + tip,
+                '--force-with-lease=refs/heads/' + branch + ':' + remote_tip,
                 ':refs/heads/' + branch, timeout=30).returncode == 0:
             removed.append('remote-branch')
         else:

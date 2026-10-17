@@ -558,6 +558,31 @@ class SingleWriterTests(unittest.TestCase):
         self.assertEqual("deferred", result["status"])
         self.assertEqual("checks-pending", result["reason"])
 
+    def test_stale_branch_refresh_precedes_failed_check_gate(self) -> None:
+        def fake_run(cmd: list[str], cwd: Path | None = None, timeout: int = 300):
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return cp(stdout=json.dumps({
+                    "title": "[single-writer] 123",
+                    "body": "",
+                    "isDraft": False,
+                    "mergeable": "MERGEABLE",
+                    "baseRefName": "main",
+                    "headRefName": "task/123",
+                    "headRefOid": "abc123",
+                    "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}],
+                }))
+            if cmd[:3] == ["gh", "repo", "view"]:
+                return cp(stdout=json.dumps({"defaultBranchRef": {"name": "main"}}))
+            raise AssertionError(cmd)
+
+        with (
+            mock.patch.object(writer, "run", side_effect=fake_run),
+            mock.patch.object(writer, "_refresh_task_branch_to_latest_base", return_value={"status": "refreshed"}),
+            mock.patch.object(writer, "STATE_ROOT", Path("/tmp/single-writer-test-state")),
+        ):
+            result = writer.integrate_pr("gernalix/example", 4)
+        self.assertEqual("branch-refreshed", result["reason"])
+
 
     def test_clean_rebased_head_recovers_after_leased_push_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

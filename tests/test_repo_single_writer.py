@@ -599,7 +599,7 @@ class SingleWriterTests(unittest.TestCase):
                 with mock.patch.object(writer, "_git", side_effect=fail_first_push):
                     first = writer._refresh_task_branch_to_latest_base(
                         task["repo"], branch, "main", old_head)
-                self.assertEqual("branch-refresh-race", first.get("reason"))
+                self.assertEqual("branch-refresh-push-failed", first.get("reason"))
                 resumed = writer._refresh_task_branch_to_latest_base(
                     task["repo"], branch, "main", old_head)
                 self.assertEqual("refreshed", resumed.get("status"), resumed)
@@ -609,6 +609,17 @@ class SingleWriterTests(unittest.TestCase):
                 current = writer._refresh_task_branch_to_latest_base(
                     task["repo"], branch, "main", rebased_head)
                 self.assertEqual("current", current.get("status"))
+
+    def test_branch_refresh_push_failure_redacts_private_email_rejection(self) -> None:
+        message = "remote: error: GH007: Your push would publish a private email address."
+        self.assertEqual(
+            "branch-refresh-email-protection",
+            writer._branch_refresh_push_failure(message),
+        )
+        self.assertEqual(
+            "branch-refresh-race",
+            writer._branch_refresh_push_failure("! [rejected] task/x (stale info)"),
+        )
 
     def test_rebased_head_recovery_rejects_tampered_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

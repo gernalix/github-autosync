@@ -890,6 +890,18 @@ class RepoLock:
             self.handle.close()
 
 
+def _branch_refresh_push_failure(stderr: str) -> str:
+    """Classify a failed leased refresh without persisting sensitive stderr."""
+    message = stderr.lower()
+    if "gh007" in message and "private email" in message:
+        return "branch-refresh-email-protection"
+    if "stale info" in message or "non-fast-forward" in message or "fetch first" in message:
+        return "branch-refresh-race"
+    if "remote rejected" in message:
+        return "branch-refresh-remote-rejected"
+    return "branch-refresh-push-failed"
+
+
 def _refresh_task_branch_to_latest_base(
     repo_slug: str,
     branch: str,
@@ -957,7 +969,7 @@ def _refresh_task_branch_to_latest_base(
             "origin", f"HEAD:refs/heads/{branch}", timeout=300,
         )
         if pushed.returncode:
-            return {"status": "deferred", "reason": "branch-refresh-race"}
+            return {"status": "deferred", "reason": _branch_refresh_push_failure(pushed.stderr)}
         payload.update(status="queued", base_sha=remote_base, head_sha=local_head,
                        refreshed_at=_iso_now())
         _atomic_json(record_path, payload)
@@ -981,7 +993,7 @@ def _refresh_task_branch_to_latest_base(
         "origin", f"HEAD:refs/heads/{branch}", timeout=300,
     )
     if pushed.returncode:
-        return {"status": "deferred", "reason": "branch-refresh-race"}
+        return {"status": "deferred", "reason": _branch_refresh_push_failure(pushed.stderr)}
     payload["status"] = "queued"
     payload["base_sha"] = remote_base
     payload["head_sha"] = new_head

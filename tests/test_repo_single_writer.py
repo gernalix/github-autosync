@@ -488,6 +488,9 @@ class SingleWriterTests(unittest.TestCase):
                 writer.integrate_pr("gernalix/example", 1)
                 result = writer.integrate_pr("gernalix/example", 1)
                 self.assertTrue(result["retry_suppressed"])
+                observed = json.loads(record.read_text())
+                self.assertEqual("task-head-drift", observed["integration_state"])
+                self.assertEqual("needs-fix", writer._pipeline_state({"status": "queued", **observed}))
                 self.assertEqual(1, integrate.call_count)
                 live_base[0] = "d" * 40
                 # The PR diff base stays unchanged while canonical advances.

@@ -36,7 +36,6 @@ MEGAVAULT_REPOSITORY = "gernalix/MegaVault"
 RUNTIME_DEPLOYERS: dict[str, tuple[str, ...]] = {
     "gernalix/workflowy-importer": ("python3", "deploy_runtime.py"),
     "gernalix/chrome-codex-switcher": ("bash", "install.sh"),
-    "gernalix/PersonalHub": ("python3", "deploy_runtime.py"),
 }
 INDEPENDENT_CANONICAL_WRITER_REPOSITORIES = (
     repo_single_writer.INDEPENDENT_CANONICAL_WRITER_REPOSITORIES

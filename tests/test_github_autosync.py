@@ -398,10 +398,10 @@ class AutosyncTests(unittest.TestCase):
             ("bash", "install.sh"),
             autosync.RUNTIME_DEPLOYERS["gernalix/chrome-codex-switcher"],
         )
-        self.assertEqual(
-            ("python3", "deploy_runtime.py"),
-            autosync.RUNTIME_DEPLOYERS["gernalix/PersonalHub"],
-        )
+        self.assertNotIn("gernalix/PersonalHub", autosync.RUNTIME_DEPLOYERS)
+        with mock.patch.object(autosync, "run", side_effect=AssertionError("retired deployment executed")):
+            self.assertEqual(("not_applicable", ""), autosync.deploy_runtime_if_needed(
+                "gernalix/PersonalHub", Path("/unused"), {}, dry_run=False))
 
     def test_runtime_deploy_runs_once_per_checked_out_head(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

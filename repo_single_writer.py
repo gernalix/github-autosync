@@ -533,7 +533,7 @@ def _pipeline_state(payload: dict[str, Any]) -> str:
         return "done"
     if status in {"blocked", "orphaned"}:
         return "needs-fix"
-    if integration in {
+    if integration in HARD_RETRY_REASONS or integration in {
         "semantic-conflict",
         "checks-failed",
         "task-worktree-missing",
@@ -1229,6 +1229,10 @@ def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None
         retry = found[1].get("integration_retry", {}) if found else {}
         if (str(info.get("state") or "").upper() == "OPEN" and fingerprint
                 and retry.get("fingerprint") == fingerprint and retry.get("reason") in HARD_RETRY_REASONS):
+            # Queue discovery observes every open PR first; retain the actual
+            # blocker instead of displaying an unchanged failure as progress.
+            _observe_task(repo, str(info.get("headRefName") or ""), retry["reason"],
+                          reason=retry["reason"], pr_number=number)
             return {"repo": repo, "number": number, "status": "deferred",
                     "reason": retry["reason"], "retry_suppressed": True}
         result = _integrate_pr_once(repo, number, info, blocked_prs=blocked_prs)

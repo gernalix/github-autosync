@@ -1185,7 +1185,7 @@ HARD_RETRY_REASONS = frozenset({
 
 def _retry_fingerprint(info: dict[str, Any], payload: dict[str, Any], blocked_prs: list[int]) -> str | None:
     # Without a live base identity, suppression cannot be justified.
-    if not re.fullmatch(r"[0-9a-f]{40}", str(info.get("baseRefOid") or "")):
+    if not re.fullmatch(r"[0-9a-f]{40}", str(info.get("canonicalLiveOid") or "")):
         return None
     worktree = Path(str(payload.get("worktree") or ""))
     if not worktree.is_dir():
@@ -1217,6 +1217,14 @@ def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None
         except json.JSONDecodeError:
             return {"repo": repo, "number": number, "status": "deferred", "reason": "pr-json-invalid"}
         found = _task_by_branch(repo, str(info.get("headRefName") or ""))
+        # baseRefOid is the PR's diff base and may lag the actual branch tip.
+        # Suppression must expire as soon as the server's canonical tip moves.
+        if found and info.get("baseRefName"):
+            live = run(["gh", "api", f"repos/{repo}/git/ref/heads/{quote(info['baseRefName'], safe='')}"], timeout=60)
+            try:
+                info["canonicalLiveOid"] = json.loads(live.stdout)["object"]["sha"] if not live.returncode else None
+            except (ValueError, KeyError, TypeError):
+                info["canonicalLiveOid"] = None
         fingerprint = _retry_fingerprint(info, found[1], blocked_prs or []) if found else None
         retry = found[1].get("integration_retry", {}) if found else {}
         if (str(info.get("state") or "").upper() == "OPEN" and fingerprint

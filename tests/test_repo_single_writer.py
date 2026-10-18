@@ -467,9 +467,10 @@ class SingleWriterTests(unittest.TestCase):
             record = root / "task.json"
             payload = {"worktree": str(root)}
             record.write_text(json.dumps(payload))
-            info = {"state": "OPEN", "title": "[single-writer] retry", "baseRefOid": "a" * 40,
+            info = {"state": "OPEN", "title": "[single-writer] retry", "baseRefOid": "a" * 40, "baseRefName": "main",
                     "headRefName": "task/retry", "headRefOid": "b" * 40,
                     "statusCheckRollup": [{"conclusion": "FAILURE"}]}
+            live_base = ["a" * 40]
             local_head = ["c" * 40]
             def local_git(path, *args, **kwargs):
                 if args[0] == "rev-parse": return cp(stdout=local_head[0])
@@ -479,7 +480,7 @@ class SingleWriterTests(unittest.TestCase):
                 return record, json.loads(record.read_text())
             blocked = {"repo": "gernalix/example", "number": 1, "status": "deferred", "reason": "task-head-drift"}
             with (mock.patch.object(writer, "RepoLock", return_value=__import__("contextlib").nullcontext()),
-                  mock.patch.object(writer, "run", side_effect=lambda *a, **k: cp(stdout=json.dumps(info))),
+                  mock.patch.object(writer, "run", side_effect=lambda args, **k: cp(stdout=json.dumps({"object": {"sha": live_base[0]}} if args[:2] == ["gh", "api"] else info))),
                   mock.patch.object(writer, "_task_by_branch", side_effect=task),
                   mock.patch.object(writer, "_git", side_effect=local_git),
                   mock.patch.object(writer, "_operation_in_progress", return_value=False),
@@ -488,7 +489,8 @@ class SingleWriterTests(unittest.TestCase):
                 result = writer.integrate_pr("gernalix/example", 1)
                 self.assertTrue(result["retry_suppressed"])
                 self.assertEqual(1, integrate.call_count)
-                info["baseRefOid"] = "d" * 40
+                live_base[0] = "d" * 40
+                # The PR diff base stays unchanged while canonical advances.
                 writer.integrate_pr("gernalix/example", 1)
                 self.assertEqual(2, integrate.call_count)
                 info["statusCheckRollup"] = [{"conclusion": "SUCCESS"}]

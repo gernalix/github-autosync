@@ -461,6 +461,46 @@ class SingleWriterTests(unittest.TestCase):
         payload = {"status": "queued", "integration_state": "semantic-conflict"}
         self.assertEqual("needs-fix", writer._pipeline_state(payload))
 
+    def test_hard_retry_waits_for_changed_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            record = root / "task.json"
+            payload = {"worktree": str(root)}
+            record.write_text(json.dumps(payload))
+            info = {"state": "OPEN", "title": "[single-writer] retry", "baseRefOid": "a" * 40,
+                    "headRefName": "task/retry", "headRefOid": "b" * 40,
+                    "statusCheckRollup": [{"conclusion": "FAILURE"}]}
+            local_head = ["c" * 40]
+            def local_git(path, *args, **kwargs):
+                if args[0] == "rev-parse": return cp(stdout=local_head[0])
+                if args[0] == "var": return cp(stdout="Owner <owner@users.noreply.github.com> 123 +0000")
+                return cp()
+            def task(*args):
+                return record, json.loads(record.read_text())
+            blocked = {"repo": "gernalix/example", "number": 1, "status": "deferred", "reason": "task-head-drift"}
+            with (mock.patch.object(writer, "RepoLock", return_value=__import__("contextlib").nullcontext()),
+                  mock.patch.object(writer, "run", side_effect=lambda *a, **k: cp(stdout=json.dumps(info))),
+                  mock.patch.object(writer, "_task_by_branch", side_effect=task),
+                  mock.patch.object(writer, "_git", side_effect=local_git),
+                  mock.patch.object(writer, "_operation_in_progress", return_value=False),
+                  mock.patch.object(writer, "_integrate_pr_once", return_value=blocked) as integrate):
+                writer.integrate_pr("gernalix/example", 1)
+                result = writer.integrate_pr("gernalix/example", 1)
+                self.assertTrue(result["retry_suppressed"])
+                self.assertEqual(1, integrate.call_count)
+                info["baseRefOid"] = "d" * 40
+                writer.integrate_pr("gernalix/example", 1)
+                self.assertEqual(2, integrate.call_count)
+                info["statusCheckRollup"] = [{"conclusion": "SUCCESS"}]
+                writer.integrate_pr("gernalix/example", 1)
+                self.assertEqual(3, integrate.call_count)
+                local_head[0] = "e" * 40
+                writer.integrate_pr("gernalix/example", 1)
+                self.assertEqual(4, integrate.call_count)
+                info["state"] = "MERGED"
+                writer.integrate_pr("gernalix/example", 1)
+                self.assertEqual(5, integrate.call_count)
+
     def test_integrate_pr_merges_only_ready_task_pr(self) -> None:
         calls: list[list[str]] = []
 

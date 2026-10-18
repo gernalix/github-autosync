@@ -161,7 +161,7 @@ Current deploy contracts:
 
 - `gernalix/workflowy-importer` → `python3 deploy_runtime.py`; personal Workflowy bridge only. No roadmap sync or C3 control units are installed or started.
 - `gernalix/chrome-codex-switcher` → `bash install.sh`; this refreshes the installed host/extension files and restarts the local switcher service.
-- `gernalix/PersonalHub` → `python3 deploy_runtime.py`; this installs the consolidation watcher. Once every non-`main` remote branch is already contained in `origin/main`, the watcher builds one signed/minified release APK from that exact main SHA, retries if the physical Pixel is unavailable, installs the exact artifact, verifies the installed version, and only then sends the Telegram completion notification. State is keyed by main SHA so build/install/notification phases are not repeated after success.
+- PersonalHub consolidation deployment is retired. Synchronization must not reinstall or launch its former watcher; Android delivery remains an explicit project operation.
 
 A deploy failure is surfaced as `runtime_deploy_failed` and does not advance the deploy-state SHA. The ordinary repository fingerprint may still advance because Git synchronization itself succeeded; the next timer run therefore retries only the deployment step.
 
@@ -340,3 +340,5 @@ mutating Git or task data; GC also rechecks immediately before deletion.
 MegaVault owns the callback's live registry/root/origin authorization. The
 callback is not a new allowlist, executor or lifecycle owner. Existing callers
 without this callback retain their own authorization contract.
+
+The integrator retains hard failure fingerprints in existing task records. Unchanged PR/base/checks and local worktree state do not trigger another integration attempt. A changed input immediately permits reevaluation; no check is treated as passing by this suppression.

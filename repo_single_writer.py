@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1176,112 +1177,162 @@ def _redacted_fast_forward_pr(repo: str, number: int, branch: str, head: str, he
         return {"repo":repo,"number":number,"status":"deferred","reason":"redacted-fast-forward-verification-failed"}
 
 
+HARD_RETRY_REASONS = frozenset({
+    "branch-refresh-email-protection", "task-head-drift", "checks-failed",
+    "semantic-conflict", "task-worktree-dirty", "task-git-operation-in-progress",
+})
+
+
+def _retry_fingerprint(info: dict[str, Any], payload: dict[str, Any], blocked_prs: list[int]) -> str | None:
+    # Without a live base identity, suppression cannot be justified.
+    if not re.fullmatch(r"[0-9a-f]{40}", str(info.get("baseRefOid") or "")):
+        return None
+    worktree = Path(str(payload.get("worktree") or ""))
+    if not worktree.is_dir():
+        return None
+    local = []
+    for argv in (("rev-parse", "HEAD"), ("status", "--porcelain=v1", "--untracked-files=all"),
+                 ("var", "GIT_COMMITTER_IDENT")):
+        result = _git(worktree, *argv)
+        if result.returncode:
+            return None
+        # Git identity timestamps vary every second; only identity matters.
+        value = result.stdout.strip()
+        if argv[0] == "var":
+            value = value.rsplit(">", 1)[0] + ">"
+        local.append(value)
+    operation = _operation_in_progress(worktree)
+    evidence = {"pr": info, "local": local, "operation": operation, "predecessors": blocked_prs}
+    return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
+
+
 def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None) -> dict[str, Any]:
     with RepoLock(repo):
-        view = run(
-            ["gh", "pr", "view", str(number), "--repo", repo,
-             "--json", "title,body,state,isDraft,mergeable,baseRefName,headRefName,headRefOid,statusCheckRollup,mergeCommit"],
-            timeout=120,
-        )
+        view = run(["gh", "pr", "view", str(number), "--repo", repo,
+                    "--json", "title,body,state,isDraft,mergeable,baseRefName,baseRefOid,headRefName,headRefOid,statusCheckRollup,mergeCommit"], timeout=120)
         if view.returncode:
             return {"repo": repo, "number": number, "status": "deferred", "reason": "pr-read-failed"}
         try:
             info = json.loads(view.stdout)
         except json.JSONDecodeError:
             return {"repo": repo, "number": number, "status": "deferred", "reason": "pr-json-invalid"}
-        if not str(info.get("title") or "").startswith(PR_PREFIX):
-            return {"repo": repo, "number": number, "status": "ignored"}
-        head_branch = str(info.get("headRefName") or "")
-        head = str(info.get("headRefOid") or "")
-        if str(info.get("state") or "").upper() == "MERGED":
-            merge_commit = info.get("mergeCommit") or {}
-            merge_sha = str(merge_commit.get("oid") or "") if isinstance(merge_commit, dict) else ""
-            return {
-                "repo": repo,
-                "number": number,
-                "status": "merged",
-                "sha": merge_sha,
-                "head_branch": head_branch,
-                "head_sha": head,
-                "already_merged": True,
-            }
-        repo_view = run(["gh", "repo", "view", repo, "--json", "defaultBranchRef"], timeout=120)
-        if repo_view.returncode:
-            return {"repo": repo, "number": number, "status": "deferred", "reason": "repo-read-failed"}
-        try:
-            repo_info = json.loads(repo_view.stdout)
-            default_branch = str((repo_info.get("defaultBranchRef") or {}).get("name") or "")
-        except Exception:
-            default_branch = ""
-        if not default_branch or str(info.get("baseRefName") or "") != default_branch:
-            return {"repo": repo, "number": number, "status": "deferred", "reason": "wrong-base-branch"}
-        if info.get("isDraft"):
-            return {"repo": repo, "number": number, "status": "deferred", "reason": "draft"}
-        if not head_branch.startswith(TASK_PREFIX):
-            return {"repo": repo, "number": number, "status": "deferred", "reason": "non-task-branch"}
-        dependency_reason = _dependency_reason(repo, str(info.get("body") or ""))
-        if dependency_reason:
-            return {"repo": repo, "number": number, "status": "deferred", "reason": dependency_reason}
-        if not head:
-            return {"repo": repo, "number": number, "status": "deferred", "reason": "head-missing"}
-        independence_reason = _independence_reason(repo, head, default_branch, blocked_prs or [])
-        if independence_reason:
-            _observe_task(repo, head_branch, independence_reason, reason=independence_reason, pr_number=number)
-            return {"repo": repo, "number": number, "status": "deferred", "reason": independence_reason}
-        redacted = _redacted_source_policy(repo, number)
-        bootstrap_task = _task_by_pr(repo, number)
-        bootstrap = bool(bootstrap_task and private_bootstrap.authorization_path(bootstrap_task[0]).exists())
-        if bootstrap and (not redacted or redacted["active"]):
-            return {"repo": repo, "number": number, "status": "deferred", "reason": "private-bootstrap-policy-changed"}
-        if redacted and not redacted["active"]:
-            # A future target is never rebased/refreshed outside its approved
-            # object inventory. Only this explicit task authorization can proceed.
-            if str(info.get("mergeable") or "").upper() != "MERGEABLE":
-                return {"repo": repo, "number": number, "status": "deferred", "reason": "mergeable-unknown"}
-            return private_bootstrap.integrate(sys.modules[__name__], repo, number, default_branch,
-                                               head, head_branch, redacted["github_id"])
-        refreshed = _refresh_task_branch_to_latest_base(repo, head_branch, default_branch, head)
-        if refreshed.get("status") == "refreshed":
-            _observe_task(repo, head_branch, "rebasing", reason="branch-refreshed", pr_number=number)
-            return {"repo": repo, "number": number, "status": "deferred", "reason": "branch-refreshed"}
-        if refreshed.get("status") == "deferred":
-            refresh_reason = str(refreshed.get("reason") or "branch-refresh-failed")
-            _observe_task(repo, head_branch, refresh_reason, reason=refresh_reason, pr_number=number)
-            return {"repo": repo, "number": number, "status": "deferred", "reason": refresh_reason}
-        allowed, check_reason = _check_rollup_allows_merge(info.get("statusCheckRollup"))
-        if not allowed:
-            _observe_task(repo, head_branch, check_reason, reason=check_reason, pr_number=number)
-            return {"repo": repo, "number": number, "status": "deferred", "reason": check_reason}
-        mergeable = str(info.get("mergeable") or "").upper()
-        if mergeable != "MERGEABLE":
-            merge_reason = f"mergeable-{mergeable.lower() or 'unknown'}"
-            _observe_task(repo, head_branch, "merge-wait", reason=merge_reason, pr_number=number)
-            return {"repo": repo, "number": number, "status": "deferred", "reason": merge_reason}
-        _observe_task(repo, head_branch, "integrating", pr_number=number)
-        if redacted:
-            return _redacted_fast_forward_pr(repo, number, default_branch, head, head_branch, expected_repository_id=redacted["github_id"])
-        merged = run(
-            ["gh", "api", "--method", "PUT", f"repos/{repo}/pulls/{number}/merge",
-             "-f", f"sha={head}", "-f", "merge_method=merge"],
-            timeout=180,
-        )
-        if merged.returncode:
-            _observe_task(repo, head_branch, "merge-race-or-failure", reason="merge-race-or-failure", pr_number=number)
-            return {"repo": repo, "number": number, "status": "deferred", "reason": "merge-race-or-failure"}
-        try:
-            payload = json.loads(merged.stdout)
-        except json.JSONDecodeError:
-            payload = {}
-        if not payload.get("merged"):
-            return {"repo": repo, "number": number, "status": "deferred", "reason": str(payload.get("message") or "merge-failed")}
+        found = _task_by_branch(repo, str(info.get("headRefName") or ""))
+        fingerprint = _retry_fingerprint(info, found[1], blocked_prs or []) if found else None
+        retry = found[1].get("integration_retry", {}) if found else {}
+        if (str(info.get("state") or "").upper() == "OPEN" and fingerprint
+                and retry.get("fingerprint") == fingerprint and retry.get("reason") in HARD_RETRY_REASONS):
+            return {"repo": repo, "number": number, "status": "deferred",
+                    "reason": retry["reason"], "retry_suppressed": True}
+        result = _integrate_pr_once(repo, number, info, blocked_prs=blocked_prs)
+        # Store the post-attempt local state: a rejected push can leave a valid
+        # local candidate, which must not be replayed again on every timer tick.
+        if found:
+            path, _ = found
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if result.get("reason") in HARD_RETRY_REASONS:
+                after = _retry_fingerprint(info, payload, blocked_prs or [])
+                if after:
+                    payload["integration_retry"] = {"fingerprint": after, "reason": result["reason"]}
+            else:
+                payload.pop("integration_retry", None)
+            _atomic_json(path, payload)
+        return result
+
+
+def _integrate_pr_once(repo: str, number: int, info: dict[str, Any], *, blocked_prs: list[int] | None = None) -> dict[str, Any]:
+    if not str(info.get("title") or "").startswith(PR_PREFIX):
+        return {"repo": repo, "number": number, "status": "ignored"}
+    head_branch = str(info.get("headRefName") or "")
+    head = str(info.get("headRefOid") or "")
+    if str(info.get("state") or "").upper() == "MERGED":
+        merge_commit = info.get("mergeCommit") or {}
+        merge_sha = str(merge_commit.get("oid") or "") if isinstance(merge_commit, dict) else ""
         return {
             "repo": repo,
             "number": number,
             "status": "merged",
-            "sha": payload.get("sha"),
+            "sha": merge_sha,
             "head_branch": head_branch,
             "head_sha": head,
+            "already_merged": True,
         }
+    repo_view = run(["gh", "repo", "view", repo, "--json", "defaultBranchRef"], timeout=120)
+    if repo_view.returncode:
+        return {"repo": repo, "number": number, "status": "deferred", "reason": "repo-read-failed"}
+    try:
+        repo_info = json.loads(repo_view.stdout)
+        default_branch = str((repo_info.get("defaultBranchRef") or {}).get("name") or "")
+    except Exception:
+        default_branch = ""
+    if not default_branch or str(info.get("baseRefName") or "") != default_branch:
+        return {"repo": repo, "number": number, "status": "deferred", "reason": "wrong-base-branch"}
+    if info.get("isDraft"):
+        return {"repo": repo, "number": number, "status": "deferred", "reason": "draft"}
+    if not head_branch.startswith(TASK_PREFIX):
+        return {"repo": repo, "number": number, "status": "deferred", "reason": "non-task-branch"}
+    dependency_reason = _dependency_reason(repo, str(info.get("body") or ""))
+    if dependency_reason:
+        return {"repo": repo, "number": number, "status": "deferred", "reason": dependency_reason}
+    if not head:
+        return {"repo": repo, "number": number, "status": "deferred", "reason": "head-missing"}
+    independence_reason = _independence_reason(repo, head, default_branch, blocked_prs or [])
+    if independence_reason:
+        _observe_task(repo, head_branch, independence_reason, reason=independence_reason, pr_number=number)
+        return {"repo": repo, "number": number, "status": "deferred", "reason": independence_reason}
+    redacted = _redacted_source_policy(repo, number)
+    bootstrap_task = _task_by_pr(repo, number)
+    bootstrap = bool(bootstrap_task and private_bootstrap.authorization_path(bootstrap_task[0]).exists())
+    if bootstrap and (not redacted or redacted["active"]):
+        return {"repo": repo, "number": number, "status": "deferred", "reason": "private-bootstrap-policy-changed"}
+    if redacted and not redacted["active"]:
+        # A future target is never rebased/refreshed outside its approved
+        # object inventory. Only this explicit task authorization can proceed.
+        if str(info.get("mergeable") or "").upper() != "MERGEABLE":
+            return {"repo": repo, "number": number, "status": "deferred", "reason": "mergeable-unknown"}
+        return private_bootstrap.integrate(sys.modules[__name__], repo, number, default_branch,
+                                           head, head_branch, redacted["github_id"])
+    refreshed = _refresh_task_branch_to_latest_base(repo, head_branch, default_branch, head)
+    if refreshed.get("status") == "refreshed":
+        _observe_task(repo, head_branch, "rebasing", reason="branch-refreshed", pr_number=number)
+        return {"repo": repo, "number": number, "status": "deferred", "reason": "branch-refreshed"}
+    if refreshed.get("status") == "deferred":
+        refresh_reason = str(refreshed.get("reason") or "branch-refresh-failed")
+        _observe_task(repo, head_branch, refresh_reason, reason=refresh_reason, pr_number=number)
+        return {"repo": repo, "number": number, "status": "deferred", "reason": refresh_reason}
+    allowed, check_reason = _check_rollup_allows_merge(info.get("statusCheckRollup"))
+    if not allowed:
+        _observe_task(repo, head_branch, check_reason, reason=check_reason, pr_number=number)
+        return {"repo": repo, "number": number, "status": "deferred", "reason": check_reason}
+    mergeable = str(info.get("mergeable") or "").upper()
+    if mergeable != "MERGEABLE":
+        merge_reason = f"mergeable-{mergeable.lower() or 'unknown'}"
+        _observe_task(repo, head_branch, "merge-wait", reason=merge_reason, pr_number=number)
+        return {"repo": repo, "number": number, "status": "deferred", "reason": merge_reason}
+    _observe_task(repo, head_branch, "integrating", pr_number=number)
+    if redacted:
+        return _redacted_fast_forward_pr(repo, number, default_branch, head, head_branch, expected_repository_id=redacted["github_id"])
+    merged = run(
+        ["gh", "api", "--method", "PUT", f"repos/{repo}/pulls/{number}/merge",
+         "-f", f"sha={head}", "-f", "merge_method=merge"],
+        timeout=180,
+    )
+    if merged.returncode:
+        _observe_task(repo, head_branch, "merge-race-or-failure", reason="merge-race-or-failure", pr_number=number)
+        return {"repo": repo, "number": number, "status": "deferred", "reason": "merge-race-or-failure"}
+    try:
+        payload = json.loads(merged.stdout)
+    except json.JSONDecodeError:
+        payload = {}
+    if not payload.get("merged"):
+        return {"repo": repo, "number": number, "status": "deferred", "reason": str(payload.get("message") or "merge-failed")}
+    return {
+        "repo": repo,
+        "number": number,
+        "status": "merged",
+        "sha": payload.get("sha"),
+        "head_branch": head_branch,
+        "head_sha": head,
+    }
 
 
 def _retry_pending_catalog_publications() -> list[dict[str, Any]]:

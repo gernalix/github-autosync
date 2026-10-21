@@ -106,6 +106,30 @@ class SingleWriterTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "retired as superseded"):
                         writer.start_task(repo, "125435")
 
+    def test_closed_pr_retirement_requires_exact_closed_and_integrated_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);repo,_=self.make_repo(root/'git')
+            with mock.patch.object(writer,'STATE_ROOT',root/'state'),mock.patch.object(writer,'WORKTREE_ROOT',root/'trees'):
+                task=writer.start_task(repo,'closed-source');task.update(status='queued',pr_number=19)
+                writer._atomic_json(writer._task_record(repo,'closed-source'),task)
+                sha=writer._ok(repo,'rev-parse','HEAD');branch=task['branch'];original=writer.run
+                response=dict(state='OPEN',headRefName=branch,headRefOid=sha,baseRefName=task['canonical_branch'],mergeCommit=None)
+                def provider(args,cwd=None,timeout=300):
+                    if args[:3]==['gh','pr','view']:return cp(stdout=json.dumps(response))
+                    return original(args,cwd,timeout)
+                options=dict(expected_head=sha,canonical_sha=sha,chat_id='01a15d5d-1567-7b20-915f-d9e72f0af83a',
+                             reason='Reviewed source already integrated through replacement PR',scope_guard=lambda *args:None)
+                with mock.patch.object(writer,'run',side_effect=provider):
+                    with self.assertRaisesRegex(ValueError,'closed unmerged'):writer.retire_integrated_closed_task(task['repo'],branch,**options)
+                    response['state']='CLOSED';response['headRefOid']='a'*40
+                    with self.assertRaisesRegex(ValueError,'closed unmerged'):writer.retire_integrated_closed_task(task['repo'],branch,**options)
+                    response['headRefOid']=sha
+                    retired=writer.retire_integrated_closed_task(task['repo'],branch,**options)
+                self.assertEqual(retired['pr_state'],'CLOSED');self.assertEqual(retired['status'],'superseded')
+                self.assertTrue(Path(task['worktree']).is_dir())
+                stored=json.loads(writer._task_record(repo,'closed-source').read_text())
+                self.assertNotIn('merge_sha',stored);self.assertEqual(stored['status'],'superseded')
+
     def test_retire_superseded_rejects_unintegrated_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

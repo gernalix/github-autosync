@@ -213,6 +213,54 @@ class ReviewedArchiveTests(unittest.TestCase):
                 self.assertEqual(gc.archive_reviewed_worktree(repo,review),result)
                 self.assertEqual(0,fixtures.git(['show-ref','--verify','refs/heads/'+payload['branch']],remote).returncode)
 
+    def test_cross_device_archival_keeps_actual_source_and_durable_original_copy(self):
+        import errno
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                (tree/'local.txt').write_text('valid local original')
+                (tree/'link').symlink_to('local.txt')
+                expected=gc.worktree_snapshot(tree);review=self.review(root,repo,tree,payload)
+                rename=os.rename;blocked=[]
+                def cross_device(src,dst,*args,**kwargs):
+                    if Path(src)==tree and not blocked:
+                        blocked.append(True);raise OSError(errno.EXDEV,'cross-device')
+                    return rename(src,dst,*args,**kwargs)
+                with patch.object(os,'rename',side_effect=cross_device):
+                    result=gc.archive_reviewed_worktree(repo,review)
+                self.assertEqual(result['status'],'archived');self.assertFalse(tree.exists())
+                original=Path(result['original']);retained=Path(result['retained_source'])
+                self.assertEqual(gc.worktree_snapshot(original),expected)
+                self.assertEqual(gc.worktree_snapshot(retained),expected)
+                self.assertEqual(retained.parent.stat().st_mode&0o777,0o700)
+                (retained/'late-write').write_text('still recoverable')
+                self.assertTrue((retained/'late-write').exists())
+                self.assertEqual(gc.archive_reviewed_worktree(repo,review),result)
+
+    def test_cross_device_copy_failure_restores_source_without_deregistering(self):
+        import errno,shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root);review=self.review(root,repo,tree,payload)
+                rename=os.rename;blocked=[]
+                def cross_device(src,dst,*args,**kwargs):
+                    if Path(src)==tree and not blocked:
+                        blocked.append(True);raise OSError(errno.EXDEV,'cross-device')
+                    return rename(src,dst,*args,**kwargs)
+                def fail_copy(*args,**kwargs):
+                    receipts=list((root/'state'/'preserved-worktrees').glob('*/*/receipt.json'))
+                    self.assertEqual(len(receipts),1)
+                    saved=json.loads(receipts[0].read_text())
+                    self.assertTrue(Path(saved['retained_source']).is_dir())
+                    raise OSError('copy failed')
+                with patch.object(os,'rename',side_effect=cross_device),patch.object(shutil,'copytree',side_effect=fail_copy):
+                    with self.assertRaisesRegex(OSError,'copy failed'):
+                        gc.archive_reviewed_worktree(repo,review)
+                self.assertTrue(tree.exists())
+                self.assertIn(str(tree),writer._ok(repo,'worktree','list','--porcelain'))
+
     def test_reviewed_patch_equivalent_collection_preserves_originals_and_remote_tip_guard(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

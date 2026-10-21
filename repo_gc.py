@@ -707,7 +707,28 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
         original=root/'original'
         if original.exists():raise ValueError('preserved original destination occupied')
         if scope_guard is not None: scope_guard(repo, slug)
-        os.rename(path,original)
+        try:
+            os.rename(path,original)
+        except OSError as error:
+            import errno,tempfile
+            if error.errno!=errno.EXDEV:raise
+            # Preserve the actual source by same-filesystem rename as well as
+            # a durable verified copy. Never copy-and-delete an open checkout:
+            # late writes through existing descriptors remain recoverable.
+            retained_root=Path(tempfile.mkdtemp(prefix='.codex-preserved-',dir=path.parent))
+            retained=retained_root/'original'
+            result['retained_source']=str(retained)
+            private('receipt.json',json.dumps(result,sort_keys=True).encode())
+            os.rename(path,retained)
+            try:
+                staging=Path(tempfile.mkdtemp(prefix='original-copy-',dir=root))/'original'
+                shutil.copytree(retained,staging,symlinks=True)
+                if worktree_snapshot(retained)!=expected or worktree_snapshot(staging)!=expected:
+                    raise ValueError('cross-device original preservation readback changed')
+                os.rename(staging,original)
+            except BaseException:
+                if not path.exists() and retained.exists():os.rename(retained,path)
+                raise
         result['original']=str(original)
         private('receipt.json',json.dumps(result,sort_keys=True).encode())
         if path.exists():raise ValueError('source path recreated; all files preserved, metadata retained')

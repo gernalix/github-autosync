@@ -604,14 +604,21 @@ def _task_by_pr(repo_slug: str, number: int) -> tuple[Path, dict[str, Any]] | No
     root = _task_dir_for_slug(repo_slug)
     if not root.is_dir():
         return None
+    candidates = []
     for path in sorted(root.glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if payload.get("pr_number") == number:
-            return path, payload
-    return None
+        if payload.get("pr_number") == number and str(payload.get("repo") or "").lower() == repo_slug.lower():
+            candidates.append((path, payload))
+    # Imported historical records can reuse a provider PR number. An open
+    # integration belongs to the unique current task, never the first filename.
+    current = [item for item in candidates if item[1].get("status") not in {"merged", "superseded"}]
+    selected = current or candidates
+    if len(selected) > 1:
+        raise RuntimeError("ambiguous repository PR task identity")
+    return selected[0] if selected else None
 
 
 def _operation_in_progress(worktree: Path) -> bool:
@@ -690,6 +697,13 @@ def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, ca
             return {"status":"preserved","reason":"changed-tip"}
         live=_ok(repo,'ls-remote','origin','refs/heads/'+payload['canonical_branch']).split()[0]
         if live!=canonical_sha:return {"status":"preserved","reason":"remote-advanced"}
+        tracking='refs/remotes/origin/'+payload['canonical_branch']
+        if _git(repo,'rev-parse','--verify',tracking).stdout.strip()!=live:
+            if scope_guard is not None: scope_guard(repo,repo_slug)
+            fetched=_git(repo,'fetch','--no-tags','origin','refs/heads/'+payload['canonical_branch']+':'+tracking)
+            if (fetched.returncode or _ok(repo,'rev-parse',tracking)!=live
+                    or _ok(repo,'ls-remote','origin','refs/heads/'+payload['canonical_branch']).split()[0]!=live):
+                return {"status":"preserved","reason":"canonical-fetch-changed"}
         from repo_gc import collect_record,preserve_integrated_ref
         if (preservation_chat_id and tip.returncode==0
                 and _git(repo,'merge-base','--is-ancestor',expected_head,'refs/remotes/origin/'+payload['canonical_branch']).returncode==0):

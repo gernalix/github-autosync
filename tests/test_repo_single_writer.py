@@ -26,6 +26,18 @@ def cp(code: int = 0, stdout: str = "", stderr: str = "") -> subprocess.Complete
 
 
 class SingleWriterTests(unittest.TestCase):
+    def test_pr_number_collision_prefers_unique_current_owner_and_rejects_ambiguity(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(writer,'STATE_ROOT',Path(tmp)):
+            slug='gernalix/example';root=writer._task_dir_for_slug(slug);root.mkdir(parents=True)
+            for task,status,repo in [('a-old','merged',slug),('b-other','active','gernalix/other'),('z-current','queued',slug)]:
+                (root/(task+'.json')).write_text(json.dumps({'task_id':task,'repo':repo,'status':status,'pr_number':6}))
+            selected=writer._task_by_pr(slug,6)
+            self.assertEqual(selected[1]['task_id'],'z-current')
+            (root/'another.json').write_text(json.dumps({'repo':slug,'status':'active','pr_number':6}))
+            with self.assertRaisesRegex(RuntimeError,'ambiguous repository PR'):
+                writer._task_by_pr(slug,6)
+            self.assertIsNone(writer._task_by_pr(slug,7))
+
     def test_roadmap_code_uses_generic_allocation_and_retires_old_guard(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

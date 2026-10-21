@@ -94,6 +94,41 @@ def prepare(
     }
 
 
+def current_canonical_readback(prepared: dict[str, Any], cli: Path) -> dict[str, Any] | None:
+    """An older applied event may have been superseded by a later canonical manifest."""
+    import tempfile
+    import repo_single_writer as writer
+    repo = str(prepared.get("repo") or "")
+    merged = str(prepared.get("merge_sha") or "")
+    worktree = Path(str(prepared.get("worktree") or ""))
+    if not repo or not re.fullmatch(r"[0-9a-f]{40}", merged):
+        return None
+    try:
+        if writer._repo_slug(worktree).lower() != repo.lower():
+            return None
+        branch = writer._canonical_branch(worktree)
+        def remote_tip():
+            return writer._ok(worktree,"ls-remote","origin","refs/heads/"+branch).split()[0]
+        tip = remote_tip()
+        if tip == merged or writer._git(worktree,"merge-base","--is-ancestor",merged,tip).returncode:
+            return None
+        raw = writer._ok(worktree,"show",tip+":"+str(MANIFEST))
+        if json.loads(raw).get("project_id") != prepared.get("project_id"):
+            return None
+        with tempfile.TemporaryDirectory(prefix="catalog-readback-") as temp:
+            manifest = Path(temp)/"commands-v1.json"
+            manifest.write_text(raw,encoding="utf-8")
+            result = _run(cli,worktree,"reconcile","--manifest",str(manifest))
+        if result.returncode or remote_tip() != tip:
+            return None
+        readback = json.loads(result.stdout)
+        if readback.get("status") != "PASS" or readback.get("project_id") != prepared.get("project_id"):
+            return None
+        return {"canonical_sha":tip,"readback":readback}
+    except (OSError,ValueError,RuntimeError,KeyError,IndexError,subprocess.SubprocessError):
+        return None
+
+
 def publish(prepared: dict[str, Any], *, cli: Path = DEFAULT_MEGAVAULT) -> dict[str, Any]:
     """Ingest and read back only after the owner commit has been merged."""
     if prepared.get("status") == "not-applicable":
@@ -110,6 +145,13 @@ def publish(prepared: dict[str, Any], *, cli: Path = DEFAULT_MEGAVAULT) -> dict[
             return {"status": "pending", "reason": "event-ingest-failed", "outbox": str(outbox)}
     reconcile = _run(cli, worktree, "reconcile", "--manifest", str(MANIFEST))
     if reconcile.returncode:
+        current = current_canonical_readback(prepared,cli)
+        if current is not None:
+            # Never replay an old definition or register an older live version.
+            # Its immutable events were ingested above; current authority is
+            # separately verified against the newer canonical manifest.
+            return {"status":"pass","outbox":str(outbox),"superseded_by":current["canonical_sha"],
+                    "readback":current["readback"],"version":{"status":"superseded"}}
         return {"status": "pending", "reason": "manifest-readback-failed", "outbox": str(outbox)}
     try:
         receipt = json.loads(reconcile.stdout)

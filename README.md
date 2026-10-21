@@ -349,7 +349,8 @@ The integrator retains hard failure fingerprints in existing task records. Uncha
 GitHub CLI subprocesses in the synchronizer and task writer fetch
 `GITHUB_TOKEN` from `FEDORA_GITHUB_ENV` through the Fedora `bws-credential`
 runtime on every invocation. Only `gh` receives it as `GH_TOKEN`; the parent
-worker, Git hooks and other child commands do not inherit that variable.
+worker does not receive the fetched environment value. Other commands launched
+directly by the worker keep their own environment.
 Inherited GitHub tokens are excluded for these calls, and vault errors do not
 fall back to native `gh` authentication. The private-bootstrap Git credential
 helper uses the same runtime through Git's private credential protocol, with

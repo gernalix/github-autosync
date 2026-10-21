@@ -730,6 +730,58 @@ def recover_merged_task(repo_slug: str, branch: str, *, scope_guard) -> dict[str
         return {"status":"merged","pr_number":payload['pr_number'],"merge_sha":merged,"catalog":publication,"cleanup":cleanup}
 
 
+def retire_integrated_closed_task(repo_slug: str, branch: str, *, expected_head: str,
+                                 canonical_sha: str, chat_id: str, reason: str, scope_guard) -> dict[str, Any]:
+    """Retire an explicitly reviewed CLOSED PR whose source is integrated elsewhere.
+
+    Preserve its true closed outcome and files; this never invents a merged PR.
+    Normal terminal GC performs private preservation and ref collection later.
+    """
+    import uuid
+    uuid.UUID(chat_id)
+    if not reason.strip() or not branch.startswith('task/'):
+        raise ValueError('explicit integrated-source review required')
+    with RepoLock(repo_slug):
+        scope_guard()
+        found=_task_by_branch(repo_slug,branch)
+        if not found:raise ValueError('native source owner missing')
+        record,payload=found;repo=Path(payload['repo_path']);tree=Path(payload['worktree'])
+        if payload.get('status')=='superseded' and payload.get('closed_pr_retirement'):
+            return payload['closed_pr_retirement']
+        if payload.get('status') not in {'active','ready','queued'} or not isinstance(payload.get('pr_number'),int):
+            raise ValueError('source is not a reviewable PR owner')
+        if payload.get('roadmap_prompt_id'):raise ValueError('frozen roadmap owner')
+        info=run(['gh','pr','view',str(payload['pr_number']),'--repo',repo_slug,'--json',
+                  'state,headRefName,headRefOid,baseRefName,mergeCommit'],timeout=120)
+        pr=json.loads(info.stdout) if info.returncode==0 else {}
+        canonical=payload['canonical_branch']
+        if (pr.get('state')!='CLOSED' or pr.get('mergeCommit') or pr.get('headRefName')!=branch
+                or pr.get('headRefOid')!=expected_head or pr.get('baseRefName')!=canonical):
+            raise ValueError('exact closed unmerged PR receipt required')
+        if (not tree.is_dir() or _git_common_dir(tree)!=_git_common_dir(repo)
+                or _operation_in_progress(tree) or _ok(tree,'symbolic-ref','--short','HEAD')!=branch
+                or _ok(tree,'rev-parse','HEAD')!=expected_head
+                or _git(tree,'status','--porcelain','--untracked-files=all').stdout.strip()):
+            raise ValueError('clean unchanged closed source required')
+        scope_guard(repo,repo_slug)
+        fetched=_git(repo,'fetch','--no-tags','origin','refs/heads/'+canonical+':refs/remotes/origin/'+canonical)
+        live=_ok(repo,'ls-remote','origin','refs/heads/'+canonical).split()[0]
+        if (fetched.returncode or live!=canonical_sha
+                or _ok(repo,'rev-parse','origin/'+canonical)!=live
+                or _git(repo,'merge-base','--is-ancestor',expected_head,live).returncode):
+            raise ValueError('every source commit must be integrated in current canonical history')
+        receipt=dict(status='superseded',pr_number=payload['pr_number'],pr_state='CLOSED',
+                     source_head=expected_head,canonical_sha=live,chat_id=chat_id,reason=reason)
+        scope_guard(repo,repo_slug)
+        if (_ok(tree,'rev-parse','HEAD')!=expected_head or _operation_in_progress(tree)
+                or _git(tree,'status','--porcelain','--untracked-files=all').stdout.strip()):
+            raise ValueError('closed source changed before retirement')
+        payload.update(status='superseded',retired_at=_iso_now(),terminal_evidence=reason,
+                       closed_pr_retirement=receipt)
+        _atomic_json(record,payload)
+        return receipt
+
+
 def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, canonical_sha: str, scope_guard=None, preservation_chat_id=None) -> dict[str, Any]:
     """Collect only an already terminal record; never manufacture merged status."""
     with RepoLock(repo_slug):

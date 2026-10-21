@@ -676,7 +676,7 @@ def _cleanup_task_after_merge_unlocked(
             "cleanup_deferred": result.get("reason"), "task_id": payload.get("task_id")}
 
 
-def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, canonical_sha: str, scope_guard=None) -> dict[str, Any]:
+def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, canonical_sha: str, scope_guard=None, preservation_chat_id=None) -> dict[str, Any]:
     """Collect only an already terminal record; never manufacture merged status."""
     with RepoLock(repo_slug):
         if scope_guard is not None: scope_guard()
@@ -690,7 +690,10 @@ def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, ca
             return {"status":"preserved","reason":"changed-tip"}
         live=_ok(repo,'ls-remote','origin','refs/heads/'+payload['canonical_branch']).split()[0]
         if live!=canonical_sha:return {"status":"preserved","reason":"remote-advanced"}
-        from repo_gc import collect_record
+        from repo_gc import collect_record,preserve_integrated_ref
+        if preservation_chat_id and tip.returncode==0:
+            preserve_integrated_ref(payload,expected_head,'refs/remotes/origin/'+payload['canonical_branch'],
+                                    preservation_chat_id,scope_guard=scope_guard)
         if scope_guard is not None: scope_guard(repo, repo_slug)
         result=collect_record(payload, scope_guard=scope_guard)
         payload['cleanup']=sorted(set(payload.get('cleanup',[]))|set(result['removed']))

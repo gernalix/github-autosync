@@ -326,6 +326,16 @@ Numeric task IDs alone no longer identify C3: only positive modern merged-PR or
 explicit supersession evidence permits terminal collection; actual C3 markers
 remain protected.
 
+An explicit MegaVault review can preserve an integrated, clean Git checkout
+inside a retired C2 directory. It additionally binds `retirement_sha256` to the
+existing retirement marker, verifies its execution units are inactive both before
+preservation and before moving the original, and requires the live project scope
+guard. Unpublished local changes must be integrated first. This exception never
+opens or updates historical C3 databases, never starts retired services and does
+not enable periodic legacy garbage collection. Full original files and Git
+history remain in private preservation; the retired checkout registration alone
+is removed.
+
 A merged task's rebased original tip can be collected only after reviewed
 `patch-equivalent` archival: GC checks the exact receipt/review, preserved
 original directory, verified bundle and current `git cherry` result. A remote

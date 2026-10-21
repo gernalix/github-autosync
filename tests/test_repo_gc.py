@@ -105,6 +105,36 @@ class SafeGcTests(unittest.TestCase):
 
 class ReviewedArchiveTests(unittest.TestCase):
     fixture=SafeGcTests.fixture
+    def test_stale_queued_owner_requires_exact_already_merged_receipt_and_catalog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                payload.update(status='queued',pr_number=1)
+                record=writer._task_record(repo,payload['task_id']);writer._atomic_json(record,payload)
+                info={'state':'MERGED','headRefName':payload['branch'],'headRefOid':payload['integrated_head'],'baseRefName':'main','mergeCommit':{'oid':payload['merge_sha']}}
+                original=writer.run
+                def response(argv,*args,**kwargs):
+                    if argv[:3]==['gh','pr','view']:
+                        import subprocess
+                        return subprocess.CompletedProcess(argv,0,json.dumps(info),'')
+                    return original(argv,*args,**kwargs)
+                with patch.object(writer,'run',side_effect=response),patch.object(writer.command_catalog_bridge,'prepare',return_value={'status':'not-applicable'}) as prepare:
+                    info['state']='OPEN'
+                    self.assertEqual(writer.recover_merged_task(payload['repo'],payload['branch'],scope_guard=lambda *a:None)['status'],'preserved');prepare.assert_not_called()
+                    info['state']='MERGED';info['headRefName']='task/another'
+                    self.assertEqual(writer.recover_merged_task(payload['repo'],payload['branch'],scope_guard=lambda *a:None)['status'],'preserved');prepare.assert_not_called()
+                    info['headRefName']=payload['branch'];(tree/'unpublished').write_text('retain')
+                    self.assertEqual(writer.recover_merged_task(payload['repo'],payload['branch'],scope_guard=lambda *a:None)['status'],'preserved');prepare.assert_not_called()
+                    (tree/'unpublished').unlink()
+                    with patch.object(writer.command_catalog_bridge,'publish',return_value={'status':'pending'}):
+                        blocked=writer.recover_merged_task(payload['repo'],payload['branch'],scope_guard=lambda *a:None)
+                        self.assertEqual(blocked['reason'],'merged-catalog-not-verified')
+                        self.assertEqual(json.loads(record.read_text())['status'],'queued')
+                    result=writer.recover_merged_task(payload['repo'],payload['branch'],scope_guard=lambda *a:None)
+                self.assertEqual(result['status'],'merged');self.assertEqual(json.loads(record.read_text())['status'],'merged')
+                self.assertEqual(writer._ok(repo,'branch','--format=%(refname:short)'),'main')
+
     def test_cleanup_checks_integration_against_fresh_canonical_tracking(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

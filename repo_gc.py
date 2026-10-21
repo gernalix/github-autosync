@@ -107,6 +107,21 @@ def preserved_integrated_history(payload, tip, base):
     repo=Path(payload['repo_path'])
     if writer._git(repo,'merge-base','--is-ancestor',tip,base).returncode:
         return False
+    refs=writer.STATE_ROOT/'preserved-refs'/payload['repo'].replace('/','_')
+    for path in refs.glob('*/review.json'):
+        try:
+            raw=path.read_bytes();review=json.loads(raw)
+            if path.parent.name!=hashlib.sha256(raw).hexdigest():continue
+            if (review.get('head')!=tip or review.get('branch')!=payload.get('branch')
+                    or review.get('source')!=payload.get('worktree')
+                    or review.get('disposition')!='integrated-ref'):continue
+            receipt=json.loads((path.parent/'receipt.json').read_text())
+            if receipt.get('status')!='verified' or receipt.get('review_sha256')!=path.parent.name:continue
+            bundle=path.parent/'commits.bundle'
+            if writer._git(repo,'bundle','verify',str(bundle)).returncode:continue
+            heads=writer._git(repo,'bundle','list-heads',str(bundle),'refs/heads/'+payload['branch'])
+            if heads.returncode==0 and heads.stdout.split()==[tip,'refs/heads/'+payload['branch']]:return True
+        except (OSError,ValueError,KeyError):continue
     root=writer.STATE_ROOT/'preserved-worktrees'/payload['repo'].replace('/','_')
     for path in root.glob('*/review.json'):
         try:
@@ -125,6 +140,49 @@ def preserved_integrated_history(payload, tip, base):
             if listed.returncode==0 and listed.stdout.split()==[tip,'HEAD']:return True
         except (OSError,ValueError,KeyError):continue
     return False
+
+
+def preserve_integrated_ref(payload, tip, base, chat_id, *, scope_guard):
+    """Caller holds RepoLock; preserve an integrated ref whose checkout is absent."""
+    import hashlib,os,uuid
+    uuid.UUID(chat_id)
+    repo=Path(payload['repo_path']);branch=payload['branch']
+    terminal=(payload.get('status')=='merged' or
+              (payload.get('status')=='superseded' and payload.get('terminal_evidence')))
+    if not terminal or not branch.startswith('task/') or Path(payload['worktree']).exists():
+        return {'status':'preserved','reason':'not-an-absent-terminal-checkout'}
+    if scope_guard is None:raise ValueError('scope guard required for integrated ref preservation')
+    scope_guard(repo,payload['repo'])
+    if preserved_integrated_history(payload,tip,base):return {'status':'already-preserved'}
+    if writer._git(repo,'merge-base','--is-ancestor',tip,base).returncode:
+        raise ValueError('ref has unintegrated commits')
+    if writer._ok(repo,'rev-parse','refs/heads/'+branch)!=tip:
+        raise ValueError('ref changed before preservation')
+    listing=writer._ok(repo,'worktree','list','--porcelain')
+    if 'branch refs/heads/'+branch+'\n' in listing+'\n':
+        raise ValueError('another checkout still uses the ref')
+    review={'disposition':'integrated-ref','repo':payload['repo'],'branch':branch,'head':tip,
+            'canonical_sha':writer._ok(repo,'rev-parse',base),'source':payload['worktree'],
+            'chat_id':chat_id,'source_state':'checkout already absent; no original files removed'}
+    raw=json.dumps(review,sort_keys=True).encode();digest=hashlib.sha256(raw).hexdigest()
+    root=writer.STATE_ROOT/'preserved-refs'/payload['repo'].replace('/','_')/digest
+    root.mkdir(parents=True,exist_ok=True,mode=0o700)
+    if root.stat().st_mode&0o077:raise ValueError('private ref preservation directory required')
+    bundle=root/'commits.bundle'
+    if not bundle.exists():writer._ok(repo,'bundle','create',str(bundle),'refs/heads/'+branch)
+    os.chmod(bundle,0o600)
+    writer._ok(repo,'bundle','verify',str(bundle))
+    if writer._ok(repo,'bundle','list-heads',str(bundle),'refs/heads/'+branch).split()!=[tip,'refs/heads/'+branch]:
+        raise ValueError('preserved ref bundle head differs')
+    def save(name,data):
+        with (root/name).open('wb') as stream:
+            os.chmod(root/name,0o600);stream.write(data);stream.flush();os.fsync(stream.fileno())
+    save('review.json',raw)
+    receipt={'status':'verified','review_sha256':digest,'head':tip,'preservation':str(root)}
+    save('receipt.json',json.dumps(receipt,sort_keys=True).encode())
+    scope_guard(repo,payload['repo'])
+    if not preserved_integrated_history(payload,tip,base):raise ValueError('ref preservation readback failed')
+    return receipt
 
 
 def collect_record(payload, *, dry_run=False, scope_guard=None):

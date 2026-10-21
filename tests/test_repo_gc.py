@@ -105,6 +105,30 @@ class SafeGcTests(unittest.TestCase):
 
 class ReviewedArchiveTests(unittest.TestCase):
     fixture=SafeGcTests.fixture
+    def test_missing_historical_checkout_keeps_verified_bundle_before_ref_deletion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                payload['roadmap_prompt_id']='123456'
+                writer._atomic_json(writer._task_record(repo,payload['task_id']),payload)
+                fixtures.git(['worktree','remove',str(tree)],repo)
+                self.assertEqual(gc.collect_record(payload)['removed'],[])
+                calls=[]
+                with patch.object(gc.sqlite3,'connect',side_effect=AssertionError('historical DB must stay frozen')):
+                    result=writer.cleanup_terminal_task(payload['repo'],payload['branch'],
+                        expected_head=payload['integrated_head'],canonical_sha=payload['merge_sha'],
+                        scope_guard=lambda *args:calls.append(args),
+                        preservation_chat_id='01a15d5d-1567-7b20-915f-d9e72f0af83a')
+                self.assertEqual(result['removed'],['remote-branch','local-branch'])
+                self.assertTrue(calls)
+                self.assertTrue(gc.preserved_integrated_history(payload,payload['integrated_head'],'origin/main'))
+                bundles=list((root/'state'/'preserved-refs').glob('*/*/commits.bundle'))
+                self.assertEqual(len(bundles),1)
+                self.assertEqual(bundles[0].stat().st_mode&0o777,0o600)
+                bundles[0].unlink()
+                self.assertFalse(gc.preserved_integrated_history(payload,payload['integrated_head'],'origin/main'))
+
     def review(self,root,repo,tree,payload,disposition='integrated'):
         import hashlib
         head=writer._ok(tree,'rev-parse','HEAD')

@@ -691,7 +691,8 @@ def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, ca
         live=_ok(repo,'ls-remote','origin','refs/heads/'+payload['canonical_branch']).split()[0]
         if live!=canonical_sha:return {"status":"preserved","reason":"remote-advanced"}
         from repo_gc import collect_record,preserve_integrated_ref
-        if preservation_chat_id and tip.returncode==0:
+        if (preservation_chat_id and tip.returncode==0
+                and _git(repo,'merge-base','--is-ancestor',expected_head,'refs/remotes/origin/'+payload['canonical_branch']).returncode==0):
             preserve_integrated_ref(payload,expected_head,'refs/remotes/origin/'+payload['canonical_branch'],
                                     preservation_chat_id,scope_guard=scope_guard)
         if scope_guard is not None: scope_guard(repo, repo_slug)

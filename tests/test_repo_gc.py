@@ -214,6 +214,38 @@ class ReviewedArchiveTests(unittest.TestCase):
                 # A newly recreated task directory also invalidates the archival receipt.
                 tree.mkdir();self.assertFalse(gc.preserved_patch_equivalent(payload,tip,'origin/main'))
 
+    def test_explicit_terminal_history_review_preserves_dirty_originals_and_removes_refs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                payload.update(status='superseded',roadmap_prompt_id='123456',terminal_evidence='Already superseded prototype')
+                record=writer._task_record(repo,payload['task_id']);writer._atomic_json(record,payload)
+                (tree/'unpublished.txt').write_text('preserve unpublished prototype')
+                review=self.review(root,repo,tree,payload)
+                with self.assertRaisesRegex(ValueError,'active or frozen'):
+                    gc.archive_reviewed_worktree(repo,review,allow_reviewed_terminal_history=True)
+                with patch.object(gc.sqlite3,'connect',side_effect=AssertionError('historical DB must stay frozen')):
+                    receipt=gc.archive_reviewed_worktree(repo,review,scope_guard=lambda *args:None,allow_reviewed_terminal_history=True)
+                    result=writer.cleanup_terminal_task(payload['repo'],payload['branch'],expected_head=payload['integrated_head'],canonical_sha=payload['merge_sha'],scope_guard=lambda *args:None,preservation_chat_id='01a15d5d-1567-7b20-915f-d9e72f0af83a')
+                self.assertEqual(result['removed'],['remote-branch','local-branch'])
+                self.assertEqual((Path(receipt['original'])/'unpublished.txt').read_text(),'preserve unpublished prototype')
+                self.assertEqual(json.loads(record.read_text())['status'],'superseded')
+
+    def test_reviewed_frozen_patch_equivalent_tip_is_collected_without_recapturing_as_ancestor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                fixtures.git(['commit','--amend','-m','equivalent original'],tree)
+                tip=writer._ok(tree,'rev-parse','HEAD');payload['roadmap_prompt_id']='123456'
+                writer._atomic_json(writer._task_record(repo,payload['task_id']),payload)
+                review=self.review(root,repo,tree,payload,'patch-equivalent')
+                gc.archive_reviewed_worktree(repo,review,scope_guard=lambda *args:None,allow_reviewed_terminal_history=True)
+                with patch.object(gc.sqlite3,'connect',side_effect=AssertionError('historical DB must stay frozen')):
+                    result=writer.cleanup_terminal_task(payload['repo'],payload['branch'],expected_head=tip,canonical_sha=payload['merge_sha'],scope_guard=lambda *args:None,preservation_chat_id='01a15d5d-1567-7b20-915f-d9e72f0af83a')
+                self.assertEqual(result['removed'],['remote-branch','local-branch'])
+
     def test_active_and_frozen_owners_remain_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

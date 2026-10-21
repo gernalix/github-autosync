@@ -68,7 +68,7 @@ def preserved_patch_equivalent(payload, tip, base):
     invalidates the evidence.
     """
     import hashlib
-    if payload.get('status') != 'merged' or not c3_allows(payload):
+    if payload.get('status') != 'merged':
         return False
     repo=Path(payload['repo_path']);source=Path(payload['worktree'])
     if source.exists():return False
@@ -208,7 +208,8 @@ def collect_record(payload, *, dry_run=False, scope_guard=None):
         tip = expected
     else:
         tip = head.stdout.strip()
-    allowed=lambda: c3_allows(payload) or preserved_integrated_history(payload,tip,base)
+    allowed=lambda: (c3_allows(payload) or preserved_integrated_history(payload,tip,base)
+                     or preserved_patch_equivalent(payload,tip,base))
     if not allowed():return {'removed':[],'reason':'nonterminal-active-or-recovery'}
     preserved=preserved_patch_equivalent(payload,tip,base)
     if expected and tip != expected and not preserved:
@@ -575,7 +576,7 @@ def worktree_snapshot(path):
     return result
 
 
-def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_integrated_history=False):
+def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_integrated_history=False, allow_reviewed_terminal_history=False):
     """Privately preserve a reviewed, inactive worktree before retiring its checkout.
 
     The review is an explicit input, not lifecycle authority. Current Git and
@@ -622,13 +623,14 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
             matched_owners+=1
             terminal=(task.get('status')=='merged' or
                       (task.get('status')=='superseded' and task.get('terminal_evidence')))
+            reviewed_explicit=(allow_reviewed_terminal_history and scope_guard is not None and terminal)
             reviewed_history=(allow_integrated_history and review['disposition']=='integrated' and terminal)
-            if (task.get('roadmap_prompt_id') and not reviewed_history) or task.get('status') not in {'merged','superseded'}:
+            if (task.get('roadmap_prompt_id') and not (reviewed_history or reviewed_explicit)) or task.get('status') not in {'merged','superseded'}:
                 raise ValueError('active or frozen owner forbids archival')
             if reviewed_history and (writer._git(path,'status','--porcelain=v1','--untracked-files=all').stdout.strip()
                                      or writer._operation_in_progress(path)):
                 raise ValueError('integrated automatic archival requires a clean terminal checkout')
-        if allow_integrated_history and matched_owners!=1:
+        if (allow_integrated_history or allow_reviewed_terminal_history) and matched_owners!=1:
             raise ValueError('automatic archival requires exactly one terminal owner')
         if writer._operation_in_progress(path):raise ValueError('unfinished Git operation')
         lock=Path(writer._ok(path,'rev-parse','--git-path','index.lock'))

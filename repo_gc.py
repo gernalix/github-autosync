@@ -97,8 +97,36 @@ def preserved_patch_equivalent(payload, tip, base):
     return False
 
 
+def preserved_integrated_history(payload, tip, base):
+    """Exact archived terminal history authorizes ref GC, never lifecycle writes."""
+    import hashlib
+    if payload.get('status')!='merged' or Path(str(payload.get('worktree') or '/')).exists():
+        return False
+    repo=Path(payload['repo_path'])
+    if writer._git(repo,'merge-base','--is-ancestor',tip,base).returncode:
+        return False
+    root=writer.STATE_ROOT/'preserved-worktrees'/payload['repo'].replace('/','_')
+    for path in root.glob('*/review.json'):
+        try:
+            raw=path.read_bytes();review=json.loads(raw)
+            if path.parent.name!=hashlib.sha256(raw).hexdigest():continue
+            if (review.get('disposition')!='integrated' or review.get('expected_head')!=tip
+                    or review.get('worktree')!=payload.get('worktree')):continue
+            receipt=json.loads((path.parent/'receipt.json').read_text())
+            if (receipt.get('status')!='archived' or receipt.get('head')!=tip
+                    or receipt.get('source')!=payload.get('worktree')
+                    or receipt.get('original')!=str(path.parent/'original')
+                    or not (path.parent/'original').is_dir()):continue
+            bundle=path.parent/'commits.bundle'
+            if writer._git(repo,'bundle','verify',str(bundle)).returncode:continue
+            listed=writer._git(repo,'bundle','list-heads',str(bundle),'HEAD')
+            if listed.returncode==0 and listed.stdout.split()==[tip,'HEAD']:return True
+        except (OSError,ValueError,KeyError):continue
+    return False
+
+
 def collect_record(payload, *, dry_run=False, scope_guard=None):
-    if payload.get('status') not in {'merged','superseded'} or (payload.get('status')=='superseded' and not payload.get('terminal_evidence')) or not c3_allows(payload):
+    if payload.get('status') not in {'merged','superseded'} or (payload.get('status')=='superseded' and not payload.get('terminal_evidence')):
         return {'removed': [], 'reason': 'nonterminal-active-or-recovery'}
     repo = Path(str(payload.get('repo_path') or '')).expanduser().resolve()
     branch = str(payload.get('branch') or '')
@@ -120,6 +148,8 @@ def collect_record(payload, *, dry_run=False, scope_guard=None):
         tip = expected
     else:
         tip = head.stdout.strip()
+    allowed=lambda: c3_allows(payload) or preserved_integrated_history(payload,tip,base)
+    if not allowed():return {'removed':[],'reason':'nonterminal-active-or-recovery'}
     preserved=preserved_patch_equivalent(payload,tip,base)
     if expected and tip != expected and not preserved:
         return {'removed': [], 'reason': 'changed-after-merge'}
@@ -157,7 +187,7 @@ def collect_record(payload, *, dry_run=False, scope_guard=None):
     authorize()
     removed = []
     if path.exists():
-        if not c3_allows(payload):
+        if not allowed():
             return {'removed': [], 'reason': 'active-at-delete'}
         authorize()
         if dry_run:
@@ -183,7 +213,7 @@ def collect_record(payload, *, dry_run=False, scope_guard=None):
         remote_tip=fields[0]
         integrated_remote=(preserved and remote_tip == expected and
                            writer._git(repo,'merge-base','--is-ancestor',remote_tip,base).returncode == 0)
-        if len(fields) != 2 or (remote_tip != tip and not integrated_remote) or not c3_allows(payload):
+        if len(fields) != 2 or (remote_tip != tip and not integrated_remote) or not allowed():
             return {'removed': removed, 'reason': 'remote-changed-or-active'}
         authorize()
         if dry_run or writer._git(repo, 'push', 'origin',
@@ -192,7 +222,7 @@ def collect_record(payload, *, dry_run=False, scope_guard=None):
             removed.append('remote-branch')
         else:
             return {'removed': removed, 'reason': 'remote-delete-refused'}
-    if not c3_allows(payload):
+    if not allowed():
         return {'removed': removed, 'reason': 'active-at-local-delete'}
     if has_local:
         if not dry_run:
@@ -485,7 +515,7 @@ def worktree_snapshot(path):
     return result
 
 
-def archive_reviewed_worktree(repo, review_file, *, scope_guard=None):
+def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_integrated_history=False):
     """Privately preserve a reviewed, inactive worktree before retiring its checkout.
 
     The review is an explicit input, not lifecycle authority. Current Git and
@@ -525,11 +555,20 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None):
         rows=[dict(line.partition(' ')[::2] for line in block.split('\0') if line) for block in listing.split('\0\0')]
         row=next((row for row in rows if row.get('worktree')==str(path)),None)
         if not row or 'locked' in row or _legacy_path(path):raise ValueError('unregistered, locked or frozen worktree')
+        matched_owners=0
         for record in writer._task_dir_for_slug(slug).glob('*.json'):
             task=json.loads(record.read_text())
             if Path(str(task.get('worktree') or '/')).resolve()!=path:continue
-            if task.get('roadmap_prompt_id') or task.get('status') not in {'merged','superseded'}:
+            matched_owners+=1
+            reviewed_history=(allow_integrated_history and review['disposition']=='integrated'
+                              and task.get('status')=='merged')
+            if (task.get('roadmap_prompt_id') and not reviewed_history) or task.get('status') not in {'merged','superseded'}:
                 raise ValueError('active or frozen owner forbids archival')
+            if reviewed_history and (writer._git(path,'status','--porcelain=v1','--untracked-files=all').stdout.strip()
+                                     or writer._operation_in_progress(path)):
+                raise ValueError('integrated automatic archival requires a clean terminal checkout')
+        if allow_integrated_history and matched_owners!=1:
+            raise ValueError('automatic archival requires exactly one terminal owner')
         if writer._operation_in_progress(path):raise ValueError('unfinished Git operation')
         lock=Path(writer._ok(path,'rev-parse','--git-path','index.lock'))
         if not lock.is_absolute():lock=path/lock

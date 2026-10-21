@@ -683,6 +683,53 @@ def _cleanup_task_after_merge_unlocked(
             "cleanup_deferred": result.get("reason"), "task_id": payload.get("task_id")}
 
 
+def recover_merged_task(repo_slug: str, branch: str, *, scope_guard) -> dict[str, Any]:
+    """Recover a stale queued owner only from an exact, already merged provider receipt."""
+    with RepoLock(repo_slug):
+        scope_guard()
+        found=_task_by_branch(repo_slug,branch)
+        if not found:return {"status":"preserved","reason":"no-task-record"}
+        record,payload=found
+        if payload.get("status")!="queued" or not isinstance(payload.get("pr_number"),int):
+            return {"status":"preserved","reason":"not-a-queued-PR"}
+        repo=Path(payload['repo_path']);tree=Path(payload['worktree'])
+        response=run(['gh','pr','view',str(payload['pr_number']),'--repo',repo_slug,'--json',
+                      'state,headRefName,headRefOid,baseRefName,mergeCommit'],timeout=120)
+        try:info=json.loads(response.stdout) if response.returncode==0 else {}
+        except ValueError:info={}
+        head=info.get('headRefOid');merged=(info.get('mergeCommit') or {}).get('oid')
+        canonical=_canonical_branch(repo)
+        if (info.get('state')!='MERGED' or info.get('headRefName')!=branch
+                or info.get('baseRefName')!=canonical
+                or not re.fullmatch(r'[0-9a-f]{40}',str(head))
+                or not re.fullmatch(r'[0-9a-f]{40}',str(merged))):
+            return {"status":"preserved","reason":"no-matching-merged-receipt"}
+        if (not tree.is_dir() or _git_common_dir(tree)!=_git_common_dir(repo)
+                or _operation_in_progress(tree) or _git(tree,'status','--porcelain','--untracked-files=all').stdout.strip()
+                or _ok(tree,'rev-parse','HEAD')!=head or _ok(tree,'symbolic-ref','--short','HEAD')!=branch):
+            return {"status":"preserved","reason":"source-does-not-match-merged-head"}
+        scope_guard(repo,repo_slug)
+        live=_ok(repo,'ls-remote','origin','refs/heads/'+canonical).split()[0]
+        fetched=_git(repo,'fetch','--no-tags','origin','refs/heads/'+canonical+':refs/remotes/origin/'+canonical)
+        if (fetched.returncode or _ok(repo,'rev-parse','refs/remotes/origin/'+canonical)!=live
+                or _git(repo,'merge-base','--is-ancestor',merged,live).returncode
+                or _git(repo,'merge-base','--is-ancestor',head,live).returncode):
+            return {"status":"preserved","reason":"merged-receipt-not-in-current-canonical-history"}
+        prepared=command_catalog_bridge.prepare(tree,repo_slug,head)
+        if prepared.get('status')=='ready':prepared['merge_sha']=merged
+        publication=command_catalog_bridge.publish(prepared)
+        if publication.get('status') not in {'pass','not-applicable'}:
+            return {"status":"preserved","reason":"merged-catalog-not-verified","catalog":publication}
+        # No task status is changed until source, canonical history and catalog
+        # all prove the existing integration. This never integrates an open PR.
+        scope_guard(repo,repo_slug)
+        if (_ok(tree,'rev-parse','HEAD')!=head or _git(tree,'status','--porcelain','--untracked-files=all').stdout.strip()
+                or _ok(repo,'ls-remote','origin','refs/heads/'+canonical).split()[0]!=live):
+            return {"status":"preserved","reason":"source-or-canonical-advanced"}
+        cleanup=_cleanup_task_after_merge_unlocked(repo_slug,branch,expected_head=head,merge_sha=merged,scope_guard=scope_guard)
+        return {"status":"merged","pr_number":payload['pr_number'],"merge_sha":merged,"catalog":publication,"cleanup":cleanup}
+
+
 def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, canonical_sha: str, scope_guard=None, preservation_chat_id=None) -> dict[str, Any]:
     """Collect only an already terminal record; never manufacture merged status."""
     with RepoLock(repo_slug):

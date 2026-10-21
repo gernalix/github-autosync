@@ -342,3 +342,26 @@ callback is not a new allowlist, executor or lifecycle owner. Existing callers
 without this callback retain their own authorization contract.
 
 The integrator retains hard failure fingerprints in existing task records. Unchanged PR/base/checks and local worktree state do not trigger another integration attempt. A changed input immediately permits reevaluation; no check is treated as passing by this suppression.
+
+
+### GitHub credentials from Bitwarden
+
+GitHub CLI subprocesses in the synchronizer and task writer fetch
+`GITHUB_TOKEN` from `FEDORA_GITHUB_ENV` through the Fedora `bws-credential`
+runtime on every invocation. Only `gh` receives it as `GH_TOKEN`; the parent
+worker does not receive the fetched environment value. Other commands launched
+directly by the worker keep their own environment.
+Inherited GitHub tokens are excluded for these calls, and vault errors do not
+fall back to native `gh` authentication. The private-bootstrap Git credential
+helper uses the same runtime through Git's private credential protocol, with
+process-scoped configuration. If retrieval fails, the helper returns Git's
+`quit=true` response to prevent other helpers and interactive prompts, as
+defined in the [Git credential protocol](https://git-scm.com/docs/gitcredentials#_custom_helpers).
+Existing SSH authentication remains separate.
+
+The Fedora runtime must be configured and its desktop Secret Service unlocked.
+No token renewal/revocation at GitHub is performed by this boundary. The initial
+token can be shared with native tools: coordinate provider changes and update
+the vault before relying on subsequent calls. This does not alter the managed
+repository allowlist, integration/approval gates, Git reference authorization,
+or the user's personal `gh` command.

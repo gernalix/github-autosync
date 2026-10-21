@@ -19,6 +19,7 @@ from contextlib import closing
 import re
 import sqlite3
 import subprocess
+from github_credentials import prepare_process
 import sys
 from typing import Any
 from urllib.parse import quote
@@ -43,9 +44,11 @@ HOOK_MARKER = "github-autosync-single-writer-v1"
 
 
 def run(cmd: list[str], cwd: Path | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+    cmd, env = prepare_process(cmd)
     return subprocess.run(
         cmd,
         cwd=cwd,
+        env=env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

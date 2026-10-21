@@ -201,6 +201,25 @@ class ReviewedArchiveTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError,'active or frozen'):gc.archive_reviewed_worktree(repo,review)
                     self.assertTrue(tree.exists())
 
+    def test_explicit_integrated_history_preserves_original_then_collects_only_refs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                payload['roadmap_prompt_id']='123456'
+                writer._atomic_json(writer._task_record(repo,payload['task_id']),payload)
+                review=self.review(root,repo,tree,payload)
+                with patch.object(gc.sqlite3,'connect',side_effect=AssertionError('historical DB must stay frozen')):
+                    receipt=gc.archive_reviewed_worktree(repo,review,allow_integrated_history=True)
+                    tip=payload['integrated_head']
+                    self.assertTrue(gc.preserved_integrated_history(payload,tip,'origin/main'))
+                    self.assertEqual(gc.collect_record(payload)['removed'],['remote-branch','local-branch'])
+                self.assertEqual(writer._ok(repo,'branch','--format=%(refname:short)'),'main')
+                self.assertTrue((Path(receipt['original'])/'integrated.txt').is_file())
+                self.assertFalse(gc.preserved_integrated_history(payload,'0'*40,'origin/main'))
+                (Path(receipt['preservation'])/'commits.bundle').unlink()
+                self.assertFalse(gc.preserved_integrated_history(payload,tip,'origin/main'))
+
     def test_same_status_with_new_file_contents_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

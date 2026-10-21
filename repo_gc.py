@@ -100,7 +100,9 @@ def preserved_patch_equivalent(payload, tip, base):
 def preserved_integrated_history(payload, tip, base):
     """Exact archived terminal history authorizes ref GC, never lifecycle writes."""
     import hashlib
-    if payload.get('status')!='merged' or Path(str(payload.get('worktree') or '/')).exists():
+    terminal=(payload.get('status')=='merged' or
+              (payload.get('status')=='superseded' and payload.get('terminal_evidence')))
+    if not terminal or Path(str(payload.get('worktree') or '/')).exists():
         return False
     repo=Path(payload['repo_path'])
     if writer._git(repo,'merge-base','--is-ancestor',tip,base).returncode:
@@ -560,8 +562,9 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
             task=json.loads(record.read_text())
             if Path(str(task.get('worktree') or '/')).resolve()!=path:continue
             matched_owners+=1
-            reviewed_history=(allow_integrated_history and review['disposition']=='integrated'
-                              and task.get('status')=='merged')
+            terminal=(task.get('status')=='merged' or
+                      (task.get('status')=='superseded' and task.get('terminal_evidence')))
+            reviewed_history=(allow_integrated_history and review['disposition']=='integrated' and terminal)
             if (task.get('roadmap_prompt_id') and not reviewed_history) or task.get('status') not in {'merged','superseded'}:
                 raise ValueError('active or frozen owner forbids archival')
             if reviewed_history and (writer._git(path,'status','--porcelain=v1','--untracked-files=all').stdout.strip()

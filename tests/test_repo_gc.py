@@ -220,6 +220,23 @@ class ReviewedArchiveTests(unittest.TestCase):
                 (Path(receipt['preservation'])/'commits.bundle').unlink()
                 self.assertFalse(gc.preserved_integrated_history(payload,tip,'origin/main'))
 
+    def test_superseded_integrated_history_requires_positive_terminal_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                payload.update(status='superseded',roadmap_prompt_id='123456')
+                record=writer._task_record(repo,payload['task_id']);writer._atomic_json(record,payload)
+                review=self.review(root,repo,tree,payload)
+                with self.assertRaisesRegex(ValueError,'active or frozen'):
+                    gc.archive_reviewed_worktree(repo,review,allow_integrated_history=True)
+                payload['terminal_evidence']='Reviewed obsolete task; original commits integrated'
+                writer._atomic_json(record,payload)
+                receipt=gc.archive_reviewed_worktree(repo,review,allow_integrated_history=True)
+                self.assertEqual(gc.collect_record(payload)['removed'],['remote-branch','local-branch'])
+                self.assertEqual(json.loads(record.read_text())['status'],'superseded')
+                self.assertTrue(Path(receipt['original']).is_dir())
+
     def test_same_status_with_new_file_contents_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

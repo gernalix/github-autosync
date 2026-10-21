@@ -105,6 +105,58 @@ class SafeGcTests(unittest.TestCase):
 
 class ReviewedArchiveTests(unittest.TestCase):
     fixture=SafeGcTests.fixture
+
+    def test_explicit_retired_checkout_preserves_original_without_opening_historical_database(self):
+        import hashlib,subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                (tree/'ignored-original').write_text('private recoverable artifact')
+                exclude=Path(writer._ok(repo,'rev-parse','--git-path','info/exclude'))
+                if not exclude.is_absolute():exclude=repo/exclude
+                with exclude.open('a') as stream:stream.write('ignored-original\n')
+                review=self.review(root,repo,tree,payload)
+                with patch.object(gc,'_legacy_path',return_value=True):
+                    with self.assertRaisesRegex(ValueError,'frozen'):gc.archive_reviewed_worktree(repo,review)
+                marker=root/'retired.json';marker.write_text(json.dumps({'schema':'c3.c2-retired.v1','units':['c2-runtime.service']}))
+                value=json.loads(review.read_text());value['retirement_sha256']=hashlib.sha256(marker.read_bytes()).hexdigest();review.write_text(json.dumps(value))
+                original=writer.run;checks=[]
+                def run(argv,*args,**kwargs):
+                    if argv[0]=='systemctl':
+                        checks.append(argv);return subprocess.CompletedProcess(argv,0,'inactive\n','')
+                    return original(argv,*args,**kwargs)
+                with patch.object(gc,'_legacy_path',return_value=True),patch.object(gc,'RETIREMENT_MARKER',marker),patch.object(writer,'run',side_effect=run),patch.object(gc.sqlite3,'connect',side_effect=AssertionError('C3 archive must remain frozen')):
+                    receipt=gc.archive_reviewed_worktree(repo,review,scope_guard=lambda *a:None,allow_reviewed_retired_history=True)
+                self.assertEqual(len(checks),2)
+                self.assertFalse(tree.exists())
+                self.assertEqual((Path(receipt['original'])/'ignored-original').read_text(),'private recoverable artifact')
+                self.assertTrue((Path(receipt['preservation'])/'commits.bundle').is_file())
+
+    def test_retired_review_refuses_changed_marker_dirty_checkout_and_reactivated_unit(self):
+        import hashlib,subprocess
+        for failure in ('marker','dirty','reactivated'):
+            with self.subTest(failure=failure),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp)
+                with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                    repo,remote,tree,payload=self.fixture(root)
+                    review=self.review(root,repo,tree,payload)
+                    marker=root/'retired.json';marker.write_text(json.dumps({'schema':'c3.c2-retired.v1','units':['c2-runtime.service']}))
+                    value=json.loads(review.read_text());value['retirement_sha256']=hashlib.sha256(marker.read_bytes()).hexdigest();review.write_text(json.dumps(value))
+                    if failure=='marker':marker.write_text(marker.read_text()+'\n')
+                    if failure=='dirty':(tree/'unpublished.txt').write_text('valid local work')
+                    original=writer.run;checks=[]
+                    def run(argv,*args,**kwargs):
+                        if argv[0]=='systemctl':
+                            checks.append(argv)
+                            return subprocess.CompletedProcess(argv,0,'active\n' if len(checks)>1 else 'inactive\n','')
+                        return original(argv,*args,**kwargs)
+                    with patch.object(gc,'_legacy_path',return_value=True),patch.object(gc,'RETIREMENT_MARKER',marker),patch.object(writer,'run',side_effect=run):
+                        with self.assertRaisesRegex(ValueError,'retirement evidence changed|unpublished|not confirmed inactive'):
+                            gc.archive_reviewed_worktree(repo,review,scope_guard=lambda *a:None,allow_reviewed_retired_history=True)
+                    self.assertTrue(tree.exists())
+                    self.assertEqual(writer._ok(tree,'rev-parse','HEAD'),payload['integrated_head'])
+
     def test_stale_queued_owner_requires_exact_already_merged_receipt_and_catalog(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

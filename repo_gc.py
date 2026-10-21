@@ -576,7 +576,27 @@ def worktree_snapshot(path):
     return result
 
 
-def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_integrated_history=False, allow_reviewed_terminal_history=False):
+def _verify_retired_git_review(review):
+    """Read retirement evidence and live unit state; never open the C3 database."""
+    import hashlib
+    import os
+    import re
+    if RETIREMENT_MARKER.is_symlink() or not RETIREMENT_MARKER.is_file():
+        raise ValueError('retirement evidence unavailable')
+    raw=RETIREMENT_MARKER.read_bytes()
+    if RETIREMENT_MARKER.stat().st_uid!=os.getuid() or hashlib.sha256(raw).hexdigest()!=review['retirement_sha256']:
+        raise ValueError('retirement evidence changed')
+    marker=json.loads(raw);units=marker.get('units')
+    if (marker.get('schema')!='c3.c2-retired.v1' or not isinstance(units,list) or not units or
+            any(not isinstance(u,str) or not re.fullmatch(r'(?:c2-|codex-roadmap-)[a-z0-9-]+\.(?:service|timer|path)',u) for u in units) or
+            len(set(units))!=len(units)):
+        raise ValueError('invalid retirement evidence')
+    live=writer.run(['systemctl','--user','show',*units,'--property=ActiveState','--value','--no-pager'],timeout=20)
+    if live.returncode or live.stdout.split()!=['inactive']*len(units):
+        raise ValueError('retired execution units are not confirmed inactive')
+
+
+def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_integrated_history=False, allow_reviewed_terminal_history=False, allow_reviewed_retired_history=False):
     """Privately preserve a reviewed, inactive worktree before retiring its checkout.
 
     The review is an explicit input, not lifecycle authority. Current Git and
@@ -590,6 +610,7 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
     repo=Path(repo).resolve();review_file=Path(review_file)
     raw=review_file.read_bytes();review=json.loads(raw)
     required={'worktree','expected_head','canonical_sha','status_sha256','disposition','replacement_commit','chat_id','inactive_confirmation','worktree_fingerprint','index_sha256'}
+    if allow_reviewed_retired_history:required.add('retirement_sha256')
     if set(review)!=required or not all(isinstance(v,str) and v.strip() for v in review.values()):
         raise ValueError('complete explicit archival review required')
     import uuid
@@ -615,7 +636,15 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
         listing=writer._ok(repo,'worktree','list','--porcelain','-z')
         rows=[dict(line.partition(' ')[::2] for line in block.split('\0') if line) for block in listing.split('\0\0')]
         row=next((row for row in rows if row.get('worktree')==str(path)),None)
-        if not row or 'locked' in row or _legacy_path(path):raise ValueError('unregistered, locked or frozen worktree')
+        retired=_legacy_path(path)
+        if not row or 'locked' in row or (retired and not allow_reviewed_retired_history):
+            raise ValueError('unregistered, locked or frozen worktree')
+        if allow_reviewed_retired_history:
+            if not retired or scope_guard is None or review['disposition']!='integrated':
+                raise ValueError('retired archival requires explicit scope and integrated history')
+            _verify_retired_git_review(review)
+            if writer._git(path,'status','--porcelain=v1','--untracked-files=all').stdout.strip():
+                raise ValueError('retired checkout has unpublished local changes')
         matched_owners=0
         for record in writer._task_dir_for_slug(slug).glob('*.json'):
             task=json.loads(record.read_text())
@@ -707,6 +736,7 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
         original=root/'original'
         if original.exists():raise ValueError('preserved original destination occupied')
         if scope_guard is not None: scope_guard(repo, slug)
+        if allow_reviewed_retired_history:_verify_retired_git_review(review)
         try:
             os.rename(path,original)
         except OSError as error:

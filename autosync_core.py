@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
+from github_credentials import prepare_process
 import sys
 import tempfile
 import time
@@ -109,6 +110,7 @@ def run(
     timeout: int = 300,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    cmd, env = prepare_process(cmd, env)
     return subprocess.run(
         cmd,
         cwd=cwd,

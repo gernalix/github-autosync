@@ -20,6 +20,7 @@ architecture:
     - repo_integrator.py
     - runtime_watchdog.py
   important_paths:
+    - github_credentials.py
     - private_bootstrap.py
     - systemd
     - tests
@@ -76,6 +77,7 @@ references:
 freshness:
   reviewed_commit: e83a2c5542553e7ccd7b304cb2055e9cd69691d0
   watch_paths:
+    - github_credentials.py
     - private_bootstrap.py
     - README.md
     - github_autosync.py

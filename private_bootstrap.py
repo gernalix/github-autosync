@@ -9,6 +9,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+from github_credentials import git_credential_helper
 import re
 import stat
 import sys
@@ -219,7 +220,7 @@ def _push_exact_base(owner, root, branch, base, head, expected_remote):
         hook.write_text(_PRE_PUSH); hook.chmod(0o700)
         result = owner._git(root, '-c', 'core.hooksPath=' + directory,
                             '-c', 'push.followTags=false',
-                            '-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential',
+                            '-c', 'credential.helper=', '-c', 'credential.helper=' + git_credential_helper(),
                             'push', '--porcelain', '--atomic', 'origin', head + ':refs/heads/' + branch)
         if result.returncode:
             raise ValueError('private bootstrap push rejected or unconfirmed; read back before retry')

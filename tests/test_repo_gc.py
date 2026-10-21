@@ -105,6 +105,18 @@ class SafeGcTests(unittest.TestCase):
 
 class ReviewedArchiveTests(unittest.TestCase):
     fixture=SafeGcTests.fixture
+    def test_cleanup_checks_integration_against_fresh_canonical_tracking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                fixtures.git(['worktree','remove',str(tree)],repo)
+                old=writer._ok(repo,'rev-parse','origin/main^')
+                fixtures.git(['update-ref','refs/remotes/origin/main',old],repo)
+                result=writer.cleanup_terminal_task(payload['repo'],payload['branch'],expected_head=payload['integrated_head'],canonical_sha=payload['merge_sha'],scope_guard=lambda *args:None,preservation_chat_id='01a15d5d-1567-7b20-915f-d9e72f0af83a')
+                self.assertEqual(result['removed'],['remote-branch','local-branch'])
+                self.assertEqual(writer._ok(repo,'rev-parse','origin/main'),payload['merge_sha'])
+
     def test_missing_historical_checkout_keeps_verified_bundle_before_ref_deletion(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

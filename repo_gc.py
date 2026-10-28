@@ -9,6 +9,7 @@ import subprocess
 import time
 
 import repo_single_writer as writer
+from retired_git_sources import verify_retired_source
 
 C3_DB = Path.home() / '.local/state/c3-control/roadmap.sqlite'
 C3_REPO = Path.home() / 'projects/codex-roadmap'
@@ -647,9 +648,12 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
         rows=[dict(line.partition(' ')[::2] for line in block.split('\0') if line) for block in listing.split('\0\0')]
         row=next((row for row in rows if row.get('worktree')==str(path)),None)
         retired=_legacy_path(path)
+        retired_source=allow_reviewed_retired_history and review['disposition']=='superseded'
         if not row or 'locked' in row or (retired and not allow_reviewed_retired_history):
             raise ValueError('unregistered, locked or frozen worktree')
-        if allow_reviewed_retired_history:
+        if retired_source:
+            verify_retired_source(repo,review,scope_guard,worktree=path)
+        elif allow_reviewed_retired_history:
             if not retired or scope_guard is None or review['disposition']!='integrated':
                 raise ValueError('retired archival requires explicit scope and integrated history')
             _verify_retired_git_review(review)
@@ -664,7 +668,7 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
                       (task.get('status')=='superseded' and task.get('terminal_evidence')))
             reviewed_explicit=(allow_reviewed_terminal_history and scope_guard is not None and terminal)
             reviewed_history=(allow_integrated_history and review['disposition']=='integrated' and terminal)
-            if (task.get('roadmap_prompt_id') and not (reviewed_history or reviewed_explicit)) or task.get('status') not in {'merged','superseded'}:
+            if not retired_source and ((task.get('roadmap_prompt_id') and not (reviewed_history or reviewed_explicit)) or task.get('status') not in {'merged','superseded'}):
                 raise ValueError('active or frozen owner forbids archival')
             if reviewed_history and (writer._git(path,'status','--porcelain=v1','--untracked-files=all').stdout.strip()
                                      or writer._operation_in_progress(path)):
@@ -746,7 +750,8 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
         original=root/'original'
         if original.exists():raise ValueError('preserved original destination occupied')
         if scope_guard is not None: scope_guard(repo, slug)
-        if allow_reviewed_retired_history:_verify_retired_git_review(review)
+        if retired_source:verify_retired_source(repo,review,scope_guard,worktree=path)
+        elif allow_reviewed_retired_history:_verify_retired_git_review(review)
         try:
             os.rename(path,original)
         except OSError as error:

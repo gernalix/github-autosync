@@ -379,3 +379,18 @@ token can be shared with native tools: coordinate provider changes and update
 the vault before relying on subsequent calls. This does not alter the managed
 repository allowlist, integration/approval gates, Git reference authorization,
 or the user's personal `gh` command.
+
+
+### Explicit retired Codex Roadmap source preservation
+
+Automatic legacy GC remains frozen. An explicit `superseded` archival review
+with the exact retirement-marker hash can preserve the retired project-51
+sources without claiming they were merged or changing historical task records.
+The owner verifies the canonical C2/C3 retirement declaration, all marker units
+and C3 inactivity, historical checkout/owner identity, and no process using the
+source. Unintegrated sources newer than the completed 2026-10-05 retirement
+package are rejected. Complete original directories, index/working patches,
+verified archives and Git bundles remain private and recoverable. Marker,
+unit and process checks repeat immediately before moving the original.
+The same explicit verifier is available to reviewed exact-ref retirement;
+ordinary active owners, open PRs and unexpected ref updates remain protected.

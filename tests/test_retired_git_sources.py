@@ -114,6 +114,7 @@ class IndependentCloneTests(RetiredSourceTests):
 
     def independent_review(self):
         p=self.review();value=json.loads(p.read_text())
+        value['independent_registered_head']=writer._ok(self.repo,'rev-parse',self.payload['branch'])
         value['independent_git_fingerprint']=hashlib.sha256(json.dumps(policy.independent_git_snapshot(self.tree),sort_keys=True).encode()).hexdigest()
         p.write_text(json.dumps(value));return p
 
@@ -160,5 +161,30 @@ class IndependentCloneTests(RetiredSourceTests):
             return value
         with patch.object(gc,'worktree_snapshot',side_effect=snapshot):
             with self.assertRaisesRegex(ValueError,'Git state changed'):
+                gc.archive_reviewed_worktree(self.repo,review,scope_guard=self.scope,allow_reviewed_retired_history=True)
+        self.assertTrue(self.tree.exists())
+
+
+    def test_divergent_registered_head_must_be_explicit_and_bundled(self):
+        self.clone_source();registered=writer._ok(self.repo,'rev-parse','main')
+        writer._ok(self.repo,'update-ref','refs/heads/'+self.payload['branch'],registered)
+        review=self.independent_review();value=json.loads(review.read_text());value['independent_registered_head']='0'*40;review.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError,'registered HEAD'):
+            gc.archive_reviewed_worktree(self.repo,review,scope_guard=self.scope,allow_reviewed_retired_history=True)
+        result=gc.archive_reviewed_worktree(self.repo,self.independent_review(),scope_guard=self.scope,allow_reviewed_retired_history=True)
+        self.assertEqual(result['status'],'archived')
+        bundled=writer._ok(self.repo,'bundle','list-heads',str(Path(result['preservation'])/'commits.bundle'))
+        self.assertIn(registered,bundled)
+        self.assertNotEqual(result['head'],registered)
+
+    def test_registration_changed_during_capture_refuses_move(self):
+        self.clone_source();review=self.independent_review();original=gc.worktree_snapshot;calls=0
+        def snapshot(path):
+            nonlocal calls
+            value=original(path);calls+=1
+            if calls==2:writer._ok(self.repo,'update-ref','refs/heads/'+self.payload['branch'],writer._ok(self.repo,'rev-parse','main'))
+            return value
+        with patch.object(gc,'worktree_snapshot',side_effect=snapshot):
+            with self.assertRaisesRegex(ValueError,'registration changed'):
                 gc.archive_reviewed_worktree(self.repo,review,scope_guard=self.scope,allow_reviewed_retired_history=True)
         self.assertTrue(self.tree.exists())

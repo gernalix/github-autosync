@@ -477,3 +477,42 @@ class ReviewedArchiveTests(unittest.TestCase):
                 with patch.object(tarfile.TarFile,'addfile',concurrent):
                     with self.assertRaisesRegex(ValueError,'stability|readback'):gc.archive_reviewed_worktree(repo,review)
                 self.assertTrue(tree.exists());self.assertEqual((tree/'integrated.txt').read_text(),'concurrent update')
+
+    def split_tip_fixture(self, root):
+        repo,remote,tree,payload=self.fixture(root)
+        (tree/'late-source.txt').write_text('valid source integrated by later PR\n')
+        fixtures.git(['add','late-source.txt'],tree)
+        self.assertEqual(fixtures.git(['commit','-m','late valid source'],tree).returncode,0)
+        tip=writer._ok(tree,'rev-parse','HEAD')
+        self.assertEqual(fixtures.git(['push','origin','HEAD:main'],tree).returncode,0)
+        fixtures.git(['fetch','origin'],repo)
+        receipt=gc.archive_reviewed_worktree(repo,self.review(root,repo,tree,payload))
+        return repo,remote,tree,payload,tip,receipt
+
+    def test_independently_integrated_local_and_exact_remote_tips_are_collected_after_preservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload,tip,receipt=self.split_tip_fixture(root)
+                before=writer._task_record(repo,'gc-example').read_bytes()
+                self.assertTrue(gc.preserved_integrated_split_tips(payload,tip,payload['integrated_head'],'origin/main'))
+                self.assertEqual(gc.collect_record(payload),{'removed':['remote-branch','local-branch']})
+                self.assertEqual(writer._task_record(repo,'gc-example').read_bytes(),before)
+                self.assertEqual((Path(receipt['original'])/'late-source.txt').read_text(),'valid source integrated by later PR\n')
+                self.assertEqual(writer._ok(repo,'rev-parse','origin/main'),tip)
+
+    def test_split_tip_cleanup_refuses_changed_remote_or_lost_preservation(self):
+        for failure in ['remote','bundle','recreated']:
+            with self.subTest(failure=failure),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp)
+                with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                    repo,remote,tree,payload,tip,receipt=self.split_tip_fixture(root)
+                    if failure=='remote':
+                        # Even another already integrated ancestor is unexpected.
+                        ancestor=writer._ok(repo,'rev-parse',payload['integrated_head']+'^')
+                        fixtures.git(['update-ref','refs/heads/'+payload['branch'],ancestor],remote)
+                    elif failure=='bundle':(Path(receipt['preservation'])/'commits.bundle').write_bytes(b'corrupt')
+                    else:tree.mkdir()
+                    self.assertEqual(gc.collect_record(payload)['removed'],[])
+                    self.assertEqual(writer._ok(repo,'rev-parse','refs/heads/'+payload['branch']),tip)
+                    self.assertEqual(fixtures.git(['show-ref','--verify','refs/heads/'+payload['branch']],remote).returncode,0)

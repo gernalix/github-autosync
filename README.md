@@ -341,7 +341,11 @@ A merged task's rebased original tip can be collected only after reviewed
 original directory, verified bundle and current `git cherry` result. A remote
 tip may be that same original or the record's exact integrated head with proven
 ancestry. Recreated worktrees, changed tips or missing recovery evidence remain
-blocked. Archived originals and bundles are never deleted by terminal GC.
+blocked. Archived originals and bundles are never deleted by terminal GC. A later local
+tip may also be collected after its exact source is privately preserved and
+integrated independently. The remote must still match the task's original
+integrated receipt and be an ancestor of current main; any unexpected remote
+tip remains blocked. This never changes a task's terminal disposition.
 
 The Python single-writer APIs used by MegaVault purification accept an optional
 `scope_guard` callback on task start/finish, terminal cleanup and reviewed

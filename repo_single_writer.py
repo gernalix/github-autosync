@@ -757,9 +757,11 @@ def retire_integrated_closed_task(repo_slug: str, branch: str, *, expected_head:
         info=run(['gh','pr','view',str(payload['pr_number']),'--repo',repo_slug,'--json',
                   'state,headRefName,headRefOid,baseRefName,mergeCommit'],timeout=120)
         pr=json.loads(info.stdout) if info.returncode==0 else {}
-        canonical=payload['canonical_branch']
+        canonical=payload['canonical_branch'];pr_head=pr.get('headRefOid')
+        split_source=(pr_head!=expected_head and pr_head in {payload.get('head_sha'),payload.get('integrated_head')})
         if (pr.get('state')!='CLOSED' or pr.get('mergeCommit') or pr.get('headRefName')!=branch
-                or pr.get('headRefOid')!=expected_head or pr.get('baseRefName')!=canonical):
+                or not re.fullmatch(r'[0-9a-f]{40}',str(pr_head))
+                or (pr_head!=expected_head and not split_source) or pr.get('baseRefName')!=canonical):
             raise ValueError('exact closed unmerged PR receipt required')
         if (not tree.is_dir() or _git_common_dir(tree)!=_git_common_dir(repo)
                 or _operation_in_progress(tree) or _ok(tree,'symbolic-ref','--short','HEAD')!=branch
@@ -771,10 +773,13 @@ def retire_integrated_closed_task(repo_slug: str, branch: str, *, expected_head:
         live=_ok(repo,'ls-remote','origin','refs/heads/'+canonical).split()[0]
         if (fetched.returncode or live!=canonical_sha
                 or _ok(repo,'rev-parse','origin/'+canonical)!=live
-                or _git(repo,'merge-base','--is-ancestor',expected_head,live).returncode):
+                or _git(repo,'merge-base','--is-ancestor',expected_head,live).returncode
+                or _git(repo,'merge-base','--is-ancestor',pr_head,live).returncode):
             raise ValueError('every source commit must be integrated in current canonical history')
+        if split_source and _ok(repo,'rev-parse',expected_head+'^{tree}')!=_ok(repo,'rev-parse',pr_head+'^{tree}'):
+            raise ValueError('reviewed local source differs from the exact closed PR contents')
         receipt=dict(status='superseded',pr_number=payload['pr_number'],pr_state='CLOSED',
-                     source_head=expected_head,canonical_sha=live,chat_id=chat_id,reason=reason)
+                     source_head=expected_head,closed_pr_head=pr_head,canonical_sha=live,chat_id=chat_id,reason=reason)
         scope_guard(repo,repo_slug)
         if (_ok(tree,'rev-parse','HEAD')!=expected_head or _operation_in_progress(tree)
                 or _git(tree,'status','--porcelain','--untracked-files=all').stdout.strip()):

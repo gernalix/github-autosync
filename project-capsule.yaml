@@ -17,6 +17,7 @@ architecture:
   entrypoints:
     - github_autosync.py
     - repo_single_writer.py
+    - retired_git_sources.py
     - repo_integrator.py
     - runtime_watchdog.py
   important_paths:
@@ -83,6 +84,7 @@ freshness:
     - github_autosync.py
     - autosync_core.py
     - repo_single_writer.py
+    - retired_git_sources.py
     - repo_integrator.py
     - runtime_watchdog.py
     - install_systemd.py

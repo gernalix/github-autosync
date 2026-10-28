@@ -86,6 +86,30 @@ class CommandCatalogBridgeTests(unittest.TestCase):
             self.assertEqual(result['status'],'pass');self.assertEqual(result['superseded_by'],'b'*40)
             version.assert_not_called()
 
+    def test_unchanged_catalog_recovers_only_with_verified_current_version_registration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);self.manifest(root)
+            prepared={'status':'ready','worktree':str(root),'outbox':str(root/'outbox'),
+                      'events':1,'project_id':92,'merge_sha':'a'*40}
+            current={'canonical_sha':'b'*40,'readback':{'status':'PASS','project_id':92}}
+            for latest_ok in (True,False):
+                with self.subTest(latest_ok=latest_ok),mock.patch.object(bridge,'_run',side_effect=[self.result(),self.result()]),mock.patch.object(bridge,'current_canonical_readback',return_value=current),mock.patch.object(bridge,'_run_version',side_effect=[self.result(2),self.result(0 if latest_ok else 2,{'versione':7})]) as version:
+                    result=bridge.publish(prepared)
+                self.assertEqual([call.args[-1] for call in version.call_args_list],['a'*40,'b'*40])
+                self.assertEqual(result['status'],'pass' if latest_ok else 'pending')
+                if latest_ok:
+                    self.assertEqual(result['version'],{'versione':7})
+                    self.assertEqual(result['superseded_by'],'b'*40)
+
+    def test_version_failure_without_current_canonical_proof_remains_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);self.manifest(root)
+            prepared={'status':'ready','worktree':str(root),'outbox':str(root/'outbox'),
+                      'events':1,'project_id':92,'merge_sha':'a'*40}
+            with mock.patch.object(bridge,'_run',side_effect=[self.result(),self.result()]),mock.patch.object(bridge,'current_canonical_readback',return_value=None),mock.patch.object(bridge,'_run_version',return_value=self.result(2)) as version:
+                result=bridge.publish(prepared)
+            self.assertEqual(result['status'],'pending');version.assert_called_once()
+
     @mock.patch("command_catalog_bridge._run")
     def test_publish_preserves_outbox_on_ingest_failure(self, run):
         run.return_value = self.result(1)

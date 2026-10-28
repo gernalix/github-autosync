@@ -163,6 +163,20 @@ def publish(prepared: dict[str, Any], *, cli: Path = DEFAULT_MEGAVAULT) -> dict[
         return {"status": "pending", "reason": "version-evidence-incomplete", "outbox": str(outbox)}
     version = _run_version(cli, worktree, project_id, merge_sha)
     if version.returncode:
+        # A merged task may be recovered after main advanced while its command
+        # manifest stayed identical. Register only the proven current revision;
+        # an older successful manifest readback cannot authorize an old version.
+        current = current_canonical_readback(prepared, cli)
+        if current is not None:
+            latest = _run_version(cli, worktree, project_id, current['canonical_sha'])
+            if latest.returncode == 0:
+                try:
+                    latest_receipt = json.loads(latest.stdout)
+                except json.JSONDecodeError:
+                    latest_receipt = None
+                if isinstance(latest_receipt, dict):
+                    return {'status':'pass','outbox':str(outbox),'superseded_by':current['canonical_sha'],
+                            'readback':current['readback'],'version':latest_receipt}
         return {"status": "pending", "reason": "version-registration-failed", "outbox": str(outbox)}
     try:
         version_receipt = json.loads(version.stdout)

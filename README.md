@@ -336,6 +336,14 @@ not enable periodic legacy garbage collection. Full original files and Git
 history remain in private preservation; the retired checkout registration alone
 is removed.
 
+A retired source whose registration points to a separate self-contained clone
+requires an additional explicit `independent_git_fingerprint`. The owner checks
+its origin, registered HEAD, all refs, configuration fingerprint and historical
+cutoff, rejects alternate object storage and partial clones, and verifies an
+all-refs bundle before preserving the entire original `.git` directory. The
+fingerprint is checked again before moving the source; normal identity mismatch
+protection remains in place for every other checkout.
+
 A merged task's rebased original tip can be collected only after reviewed
 `patch-equivalent` archival: GC checks the exact receipt/review, preserved
 original directory, verified bundle and current `git cherry` result. A remote

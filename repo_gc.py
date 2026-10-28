@@ -622,7 +622,7 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
     raw=review_file.read_bytes();review=json.loads(raw)
     required={'worktree','expected_head','canonical_sha','status_sha256','disposition','replacement_commit','chat_id','inactive_confirmation','worktree_fingerprint','index_sha256'}
     if allow_reviewed_retired_history:required.add('retirement_sha256')
-    if allow_reviewed_retired_history and 'independent_git_fingerprint' in review:required.add('independent_git_fingerprint')
+    if allow_reviewed_retired_history and 'independent_git_fingerprint' in review:required|={'independent_git_fingerprint','independent_registered_head'}
     if set(review)!=required or not all(isinstance(v,str) and v.strip() for v in review.values()):
         raise ValueError('complete explicit archival review required')
     import uuid
@@ -684,7 +684,9 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
         if writer._git_common_dir(repo).resolve()!=writer._git_common_dir(path).resolve():
             if not retired_source:raise ValueError('repository identity mismatch')
             independent=verify_independent_git(repo,path,review)
-            if independent['head']!=row.get('HEAD'):raise ValueError('independent source differs from registered HEAD')
+            if (row.get('HEAD')!=review['independent_registered_head']
+                    or row['HEAD'] not in set(independent['refs'].values())|{independent['head']}):
+                raise ValueError('registered HEAD was not reviewed and preserved in independent refs')
         head=writer._ok(path,'rev-parse','HEAD');status=writer._git(path,'status','--porcelain=v1','-z','--untracked-files=all').stdout
         if head!=review['expected_head'] or hashlib.sha256(status.encode()).hexdigest()!=review['status_sha256']:
             raise ValueError('reviewed checkout changed')
@@ -761,8 +763,12 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
         if scope_guard is not None: scope_guard(repo, slug)
         if retired_source:verify_retired_source(repo,review,scope_guard,worktree=path)
         elif allow_reviewed_retired_history:_verify_retired_git_review(review)
-        if independent and verify_independent_git(repo,path,review)!=independent:
-            raise ValueError('independent Git state changed during preservation')
+        if independent:
+            if verify_independent_git(repo,path,review)!=independent:
+                raise ValueError('independent Git state changed during preservation')
+            current_rows=[dict(line.partition(' ')[::2] for line in block.split('\0') if line) for block in writer._ok(repo,'worktree','list','--porcelain','-z').split('\0\0')]
+            if next((r for r in current_rows if r.get('worktree')==str(path)),None)!=row:
+                raise ValueError('independent source registration changed during preservation')
         try:
             os.rename(path,original)
         except OSError as error:

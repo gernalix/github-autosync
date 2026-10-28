@@ -337,7 +337,10 @@ history remain in private preservation; the retired checkout registration alone
 is removed.
 
 A retired source whose registration points to a separate self-contained clone
-requires an additional explicit `independent_git_fingerprint`. The owner checks
+requires explicit `independent_git_fingerprint` and `independent_registered_head`
+values. A stale registration can differ from the clone HEAD only when its exact
+commit is also preserved among the clone refs; both are checked before the move.
+The owner checks
 its origin, registered HEAD, all refs, configuration fingerprint and historical
 cutoff, rejects alternate object storage and partial clones, and verifies an
 all-refs bundle before preserving the entire original `.git` directory. The

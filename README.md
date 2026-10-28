@@ -394,3 +394,10 @@ verified archives and Git bundles remain private and recoverable. Marker,
 unit and process checks repeat immediately before moving the original.
 The same explicit verifier is available to reviewed exact-ref retirement;
 ordinary active owners, open PRs and unexpected ref updates remain protected.
+
+
+A reviewed closed-source retirement can recognize a later local history only
+when the provider still reports the exact original head recorded by the task,
+both original and local commits are independently integrated in current main,
+and their complete source trees are identical. The receipt records both heads;
+it preserves the CLOSED/superseded outcome and never fabricates a merged PR.

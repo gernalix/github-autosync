@@ -130,6 +130,39 @@ class SingleWriterTests(unittest.TestCase):
                 stored=json.loads(writer._task_record(repo,'closed-source').read_text())
                 self.assertNotIn('merge_sha',stored);self.assertEqual(stored['status'],'superseded')
 
+    def test_closed_source_with_two_integrated_identical_histories_preserves_true_closed_receipt(self):
+        for failure in (None,'provider-not-integrated','contents-differ'):
+            with self.subTest(failure=failure),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);repo,remote=self.make_repo(root/'git')
+                with mock.patch.object(writer,'STATE_ROOT',root/'state'),mock.patch.object(writer,'WORKTREE_ROOT',root/'trees'):
+                    task=writer.start_task(repo,'closed-split');tree=Path(task['worktree']);branch=task['branch']
+                    (tree/'feature').write_text('tested contents');writer._ok(tree,'add','feature');writer._ok(tree,'commit','-m','original source')
+                    provider_head=writer._ok(tree,'rev-parse','HEAD');writer._ok(tree,'push','origin',provider_head+':refs/heads/'+branch)
+                    if failure=='contents-differ':
+                        (tree/'later').write_text('different later contents');writer._ok(tree,'add','later')
+                    writer._ok(tree,'commit','--amend','-m','local source history');local_head=writer._ok(tree,'rev-parse','HEAD')
+                    writer._ok(tree,'push','origin',local_head+':refs/heads/fixture-local')
+                    seed=root/'git/seed';writer._ok(seed,'fetch','origin')
+                    if failure!='provider-not-integrated':writer._ok(seed,'merge','--no-ff','--no-edit','origin/'+branch)
+                    writer._ok(seed,'merge','--no-ff','--no-edit','origin/fixture-local');writer._ok(seed,'push','origin','main')
+                    canonical=writer._ok(seed,'rev-parse','HEAD')
+                    task.update(status='queued',pr_number=19,head_sha=provider_head);writer._atomic_json(writer._task_record(repo,'closed-split'),task)
+                    response=dict(state='CLOSED',headRefName=branch,headRefOid=provider_head,baseRefName='main',mergeCommit=None);original=writer.run
+                    def provider(args,cwd=None,timeout=300):
+                        if args[:3]==['gh','pr','view']:return cp(stdout=json.dumps(response))
+                        return original(args,cwd,timeout)
+                    options=dict(expected_head=local_head,canonical_sha=canonical,chat_id='01a15d5d-1567-7b20-915f-d9e72f0af83a',reason='Both source histories integrated by replacement PR',scope_guard=lambda *a:None)
+                    with mock.patch.object(writer,'run',side_effect=provider):
+                        if failure:
+                            with self.assertRaises(ValueError):writer.retire_integrated_closed_task(task['repo'],branch,**options)
+                        else:
+                            result=writer.retire_integrated_closed_task(task['repo'],branch,**options)
+                            self.assertEqual(result['source_head'],local_head);self.assertEqual(result['closed_pr_head'],provider_head)
+                            self.assertEqual(result['status'],'superseded');self.assertEqual(result['pr_state'],'CLOSED')
+                    stored=json.loads(writer._task_record(repo,'closed-split').read_text())
+                    self.assertEqual(stored['status'],'queued' if failure else 'superseded');self.assertNotIn('merge_sha',stored)
+                    self.assertEqual((tree/'feature').read_text(),'tested contents')
+
     def test_retire_superseded_rejects_unintegrated_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

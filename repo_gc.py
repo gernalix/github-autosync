@@ -9,7 +9,7 @@ import subprocess
 import time
 
 import repo_single_writer as writer
-from retired_git_sources import verify_retired_source
+from retired_git_sources import verify_retired_source, verify_independent_git
 
 C3_DB = Path.home() / '.local/state/c3-control/roadmap.sqlite'
 C3_REPO = Path.home() / 'projects/codex-roadmap'
@@ -622,6 +622,7 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
     raw=review_file.read_bytes();review=json.loads(raw)
     required={'worktree','expected_head','canonical_sha','status_sha256','disposition','replacement_commit','chat_id','inactive_confirmation','worktree_fingerprint','index_sha256'}
     if allow_reviewed_retired_history:required.add('retirement_sha256')
+    if allow_reviewed_retired_history and 'independent_git_fingerprint' in review:required.add('independent_git_fingerprint')
     if set(review)!=required or not all(isinstance(v,str) and v.strip() for v in review.values()):
         raise ValueError('complete explicit archival review required')
     import uuid
@@ -679,7 +680,11 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
         lock=Path(writer._ok(path,'rev-parse','--git-path','index.lock'))
         if not lock.is_absolute():lock=path/lock
         if lock.exists():raise ValueError('index is locked')
-        if writer._git_common_dir(repo).resolve()!=writer._git_common_dir(path).resolve():raise ValueError('repository identity mismatch')
+        independent=None
+        if writer._git_common_dir(repo).resolve()!=writer._git_common_dir(path).resolve():
+            if not retired_source:raise ValueError('repository identity mismatch')
+            independent=verify_independent_git(repo,path,review)
+            if independent['head']!=row.get('HEAD'):raise ValueError('independent source differs from registered HEAD')
         head=writer._ok(path,'rev-parse','HEAD');status=writer._git(path,'status','--porcelain=v1','-z','--untracked-files=all').stdout
         if head!=review['expected_head'] or hashlib.sha256(status.encode()).hexdigest()!=review['status_sha256']:
             raise ValueError('reviewed checkout changed')
@@ -710,10 +715,14 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
         private('index.patch',index_patch.stdout.encode())
         private('working.patch',working_patch.stdout.encode())
         bundle=root/'commits.bundle'
-        if not bundle.exists():writer._ok(path,'bundle','create',str(bundle),'HEAD')
+        if not bundle.exists():writer._ok(path,'bundle','create',str(bundle),*(['--all','HEAD'] if independent else ['HEAD']))
         os.chmod(bundle,0o600)
         writer._ok(repo,'bundle','verify',str(bundle))
         if writer._ok(repo,'bundle','list-heads',str(bundle),'HEAD').split()[0]!=head:raise ValueError('bundle head differs')
+        if independent:
+            bundled={line.split(' ',1)[1]:line.split(' ',1)[0] for line in writer._ok(repo,'bundle','list-heads',str(bundle)).splitlines()}
+            if any(bundled.get(ref)!=sha for ref,sha in independent['refs'].items()):raise ValueError('independent Git refs missing from bundle')
+            private('git-state.json',json.dumps(independent,sort_keys=True).encode())
         archive=root/'contents.tar.gz'
         if not archive.exists():
             partial=root/'contents.partial';os.close(os.open(partial,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600))
@@ -752,6 +761,8 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
         if scope_guard is not None: scope_guard(repo, slug)
         if retired_source:verify_retired_source(repo,review,scope_guard,worktree=path)
         elif allow_reviewed_retired_history:_verify_retired_git_review(review)
+        if independent and verify_independent_git(repo,path,review)!=independent:
+            raise ValueError('independent Git state changed during preservation')
         try:
             os.rename(path,original)
         except OSError as error:
@@ -768,6 +779,8 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
             try:
                 staging=Path(tempfile.mkdtemp(prefix='original-copy-',dir=root))/'original'
                 shutil.copytree(retained,staging,symlinks=True)
+                if independent and worktree_snapshot(retained/'.git')!=worktree_snapshot(staging/'.git'):
+                    raise ValueError('independent Git directory copy differs')
                 if worktree_snapshot(retained)!=expected or worktree_snapshot(staging)!=expected:
                     raise ValueError('cross-device original preservation readback changed')
                 os.rename(staging,original)

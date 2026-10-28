@@ -81,3 +81,40 @@ def verify_retired_source(repo, review, scope_guard, *, worktree=None, branch=No
     if branch is not None:
         found=writer._task_by_branch(writer._repo_slug(repo),branch)
         if found and not historical_owner(found[1]):raise ValueError('current task owner forbids retired-ref collection')
+
+
+def independent_git_snapshot(path):
+    """Capture a self-contained clone without exposing local configuration values."""
+    import hashlib
+    path=Path(path).resolve();git=path/'.git'
+    if git.is_symlink() or not git.is_dir() or writer._git_common_dir(path).resolve()!=git:
+        raise ValueError('independent source must have a self-contained Git directory')
+    for directory,dirs,files in os.walk(git/'objects',followlinks=False):
+        if Path(directory).is_symlink() or any((Path(directory)/name).is_symlink() for name in dirs+files):
+            raise ValueError('external Git object storage is not self-contained')
+    alternate=git/'objects/info/alternates'
+    if alternate.exists() and alternate.read_text().strip():raise ValueError('Git alternates are not self-contained')
+    if writer._git(path,'config','--get','extensions.partialClone').stdout.strip():
+        raise ValueError('partial clone is not self-contained')
+    refs={line.split(' ',1)[1]:line.split(' ',1)[0] for line in writer._ok(path,'for-each-ref','--format=%(objectname) %(refname)').splitlines()}
+    return {'head':writer._ok(path,'rev-parse','HEAD'),
+            'symbolic_head':writer._git(path,'symbolic-ref','-q','HEAD').stdout.strip(),
+            'refs':refs,'config_sha256':hashlib.sha256((git/'config').read_bytes()).hexdigest()}
+
+
+def verify_independent_git(repo,path,review):
+    import hashlib,json
+    if writer._repo_slug(path).lower()!=writer._repo_slug(repo).lower():
+        raise ValueError('independent source origin differs')
+    state=independent_git_snapshot(path)
+    digest=hashlib.sha256(json.dumps(state,sort_keys=True).encode()).hexdigest()
+    if digest!=review.get('independent_git_fingerprint'):
+        raise ValueError('independent Git state changed or was not reviewed')
+    for tip in set(state['refs'].values())|{state['head']}:
+        # Tags pointing to non-commit objects are preserved by --all too.
+        commit=writer._git(path,'rev-parse','--verify',tip+'^{commit}')
+        if commit.returncode:continue
+        stamp=int(writer._ok(path,'log','-1','--format=%ct',tip+'^{commit}'))
+        if stamp>CUTOFF and writer._git(repo,'merge-base','--is-ancestor',tip+'^{commit}',review['canonical_sha']).returncode:
+            raise ValueError('independent source contains recent unintegrated history')
+    return state

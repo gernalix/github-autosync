@@ -101,3 +101,64 @@ class RetiredSourceTests(unittest.TestCase):
         with patch.object(gc,'worktree_snapshot',side_effect=snapshot):
             with self.assertRaisesRegex(ValueError,'still in use'):gc.archive_reviewed_worktree(self.repo,review,scope_guard=self.scope,allow_reviewed_retired_history=True)
         self.assertTrue(self.tree.exists())
+
+
+class IndependentCloneTests(RetiredSourceTests):
+    def clone_source(self):
+        clone=self.root/'independent'
+        writer._ok(self.repo,'clone','--no-hardlinks',str(self.repo),str(clone))
+        writer._ok(clone,'checkout','--detach',writer._ok(self.tree,'rev-parse','HEAD'))
+        (self.tree/'.git').unlink()
+        (clone/'.git').rename(self.tree/'.git')
+        writer._ok(self.tree,'remote','set-url','origin',str(self.remote))
+
+    def independent_review(self):
+        p=self.review();value=json.loads(p.read_text())
+        value['independent_git_fingerprint']=hashlib.sha256(json.dumps(policy.independent_git_snapshot(self.tree),sort_keys=True).encode()).hexdigest()
+        p.write_text(json.dumps(value));return p
+
+    def test_explicit_clone_preserves_all_refs_git_and_historical_owner(self):
+        self.clone_source();writer._ok(self.tree,'update-ref','refs/heads/extra-old',writer._ok(self.tree,'rev-parse','HEAD'))
+        expected=policy.independent_git_snapshot(self.tree)
+        record=writer._task_record(self.repo,'gc-example');before=record.read_bytes()
+        result=gc.archive_reviewed_worktree(self.repo,self.independent_review(),scope_guard=self.scope,allow_reviewed_retired_history=True)
+        self.assertEqual(result['status'],'archived');self.assertEqual(record.read_bytes(),before)
+        self.assertTrue((Path(result['original'])/'.git/config').is_file())
+        self.assertEqual(policy.independent_git_snapshot(Path(result['original'])),expected)
+        bundle=Path(result['preservation'])/'commits.bundle'
+        self.assertIn('refs/heads/extra-old',writer._ok(self.repo,'bundle','list-heads',str(bundle)))
+        self.assertNotIn(str(self.tree),writer._ok(self.repo,'worktree','list','--porcelain'))
+
+    def test_clone_without_exact_review_or_with_alternates_is_rejected(self):
+        self.clone_source()
+        with self.assertRaisesRegex(ValueError,'not reviewed'):
+            gc.archive_reviewed_worktree(self.repo,self.review(),scope_guard=self.scope,allow_reviewed_retired_history=True)
+        review=self.independent_review();(self.tree/'.git/objects/info/alternates').write_text('/tmp/unknown')
+        with self.assertRaisesRegex(ValueError,'alternates'):
+            gc.archive_reviewed_worktree(self.repo,review,scope_guard=self.scope,allow_reviewed_retired_history=True)
+        self.assertTrue(self.tree.exists())
+
+    def test_clone_new_unintegrated_ref_and_origin_mismatch_refused(self):
+        self.clone_source()
+        with patch.object(writer,'_repo_slug',side_effect=lambda path:'other/repo' if Path(path)==self.tree else 'gernalix/codex-roadmap'):
+            with self.assertRaisesRegex(ValueError,'origin differs'):
+                gc.archive_reviewed_worktree(self.repo,self.independent_review(),scope_guard=self.scope,allow_reviewed_retired_history=True)
+        writer._ok(self.tree,'config','user.name','Test');writer._ok(self.tree,'config','user.email','test@example.invalid')
+        (self.tree/'new-active').write_text('new');writer._ok(self.tree,'add','new-active');writer._ok(self.tree,'commit','-m','recent work')
+        tip=writer._ok(self.tree,'rev-parse','HEAD');writer._ok(self.tree,'update-ref','refs/heads/hidden-new',tip)
+        writer._ok(self.tree,'checkout','--detach',writer._ok(self.repo,'rev-parse',self.payload['branch']))
+        with self.assertRaisesRegex(ValueError,'recent unintegrated'):
+            gc.archive_reviewed_worktree(self.repo,self.independent_review(),scope_guard=self.scope,allow_reviewed_retired_history=True)
+        self.assertTrue(self.tree.exists())
+
+    def test_clone_ref_changed_after_capture_refuses_move(self):
+        self.clone_source();review=self.independent_review();original=gc.worktree_snapshot;calls=0
+        def snapshot(path):
+            nonlocal calls
+            value=original(path);calls+=1
+            if calls==2:writer._ok(self.tree,'update-ref','refs/heads/late-old',writer._ok(self.tree,'rev-parse','HEAD'))
+            return value
+        with patch.object(gc,'worktree_snapshot',side_effect=snapshot):
+            with self.assertRaisesRegex(ValueError,'Git state changed'):
+                gc.archive_reviewed_worktree(self.repo,review,scope_guard=self.scope,allow_reviewed_retired_history=True)
+        self.assertTrue(self.tree.exists())

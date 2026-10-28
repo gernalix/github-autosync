@@ -188,3 +188,19 @@ class IndependentCloneTests(RetiredSourceTests):
             with self.assertRaisesRegex(ValueError,'registration changed'):
                 gc.archive_reviewed_worktree(self.repo,review,scope_guard=self.scope,allow_reviewed_retired_history=True)
         self.assertTrue(self.tree.exists())
+
+
+class HistoricalCheckoutPathTests(unittest.TestCase):
+    def test_previously_unrecognized_real_retired_layouts_and_sibling_boundaries(self):
+        with patch.object(policy,'HOME',Path('/home/fixture')):
+            for relative in ['.local/share/c2-task-state/phase-c-source-task-checkpoint',
+                             '.local/share/chatgpt-task-state/857906',
+                             '.local/share/chatgpt-c2-state-alerts',
+                             'Documents/ChatGPT/C2/c3-priorities-import',
+                             '.local/share/codex-github-autosync/worktrees/gernalix_codex-roadmap/175908',
+                             'projects/codex-roadmap-android-favorites-probe',
+                             'projects/codex-roadmap-uptime-red']:
+                with self.subTest(path=relative):self.assertTrue(policy.historical_path(policy.HOME/relative))
+            for relative in ['projects/current-work','projects/codex-roadmap-uptime-red-current',
+                             '.local/share/codex-github-autosync/worktrees/gernalix_other/175908']:
+                with self.subTest(path=relative):self.assertFalse(policy.historical_path(policy.HOME/relative))

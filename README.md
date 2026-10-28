@@ -338,7 +338,11 @@ is removed.
 
 A retired source whose registration points to a separate self-contained clone
 requires explicit `independent_git_fingerprint` and `independent_registered_head`
-values. A stale registration can differ from the clone HEAD only when its exact
+values. The explicit retired-source namespaces include the historical task-state,
+C2 document, alert and two standalone probe checkouts. Every such checkout still
+requires the Codex Roadmap project scope, cutoff, inactive runtime and exact review;
+current task owners remain protected even inside an old directory.
+A stale registration can differ from the clone HEAD only when its exact
 commit is also preserved among the clone refs; both are checked before the move.
 The owner checks
 its origin, registered HEAD, all refs, configuration fingerprint and historical

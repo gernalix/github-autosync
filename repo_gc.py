@@ -142,6 +142,15 @@ def preserved_integrated_history(payload, tip, base):
     return False
 
 
+def preserved_integrated_split_tips(payload, local_tip, remote_tip, base):
+    """Both integrated tips, exact original remote receipt and preserved local source."""
+    expected=payload.get('integrated_head') or payload.get('head_sha')
+    if not local_tip or not remote_tip or local_tip==remote_tip or remote_tip!=expected:
+        return False
+    return (preserved_integrated_history(payload,local_tip,base)
+            and writer._git(Path(payload['repo_path']),'merge-base','--is-ancestor',remote_tip,base).returncode==0)
+
+
 def preserve_integrated_ref(payload, tip, base, chat_id, *, scope_guard):
     """Caller holds RepoLock; preserve an integrated ref whose checkout is absent."""
     import hashlib,os,uuid
@@ -212,7 +221,7 @@ def collect_record(payload, *, dry_run=False, scope_guard=None):
                      or preserved_patch_equivalent(payload,tip,base))
     if not allowed():return {'removed':[],'reason':'nonterminal-active-or-recovery'}
     preserved=preserved_patch_equivalent(payload,tip,base)
-    if expected and tip != expected and not preserved:
+    if expected and tip != expected and not (preserved or preserved_integrated_history(payload,tip,base)):
         return {'removed': [], 'reason': 'changed-after-merge'}
     if writer._git(repo, 'merge-base', '--is-ancestor', tip, base).returncode and not preserved:
         return {'removed': [], 'reason': 'unintegrated-tip'}
@@ -272,8 +281,9 @@ def collect_record(payload, *, dry_run=False, scope_guard=None):
         # A rebased task can have its reviewed original locally and the exact
         # integrated head remotely. Both need independent positive evidence.
         remote_tip=fields[0]
-        integrated_remote=(preserved and remote_tip == expected and
-                           writer._git(repo,'merge-base','--is-ancestor',remote_tip,base).returncode == 0)
+        integrated_remote=((preserved and remote_tip == expected and
+                            writer._git(repo,'merge-base','--is-ancestor',remote_tip,base).returncode == 0)
+                           or preserved_integrated_split_tips(payload,tip,remote_tip,base))
         if len(fields) != 2 or (remote_tip != tip and not integrated_remote) or not allowed():
             return {'removed': removed, 'reason': 'remote-changed-or-active'}
         authorize()

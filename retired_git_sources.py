@@ -19,7 +19,12 @@ def historical_owner(payload):
 
 
 def historical_path(path):
-    roots = [HOME/'.local/share/c2-bootstrap', HOME/'.local/share/c2-chatgpt-worktrees',
+    roots = [HOME/'.local/share/c2-task-state', HOME/'.local/share/chatgpt-task-state',
+             HOME/'.local/share/chatgpt-c2-state-alerts', HOME/'Documents/ChatGPT/C2',
+             HOME/'.local/share/codex-github-autosync/worktrees/gernalix_codex-roadmap',
+             HOME/'projects/codex-roadmap-android-favorites-probe',
+             HOME/'projects/codex-roadmap-uptime-red',
+             HOME/'.local/share/c2-bootstrap', HOME/'.local/share/c2-chatgpt-worktrees',
              HOME/'.local/share/c2-maintenance', HOME/'.local/share/c2-supervisor',
              HOME/'.local/share/chatgpt-rdc-supervisor/worktrees/codex-roadmap',
              HOME/'.local/share/chatgpt-watchdog/codex-roadmap',

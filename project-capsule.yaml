@@ -76,7 +76,7 @@ references:
   c2: c2.project-capsule.v1
   megavault: /home/daniele/MegaVault/megavault.sqlite
 freshness:
-  reviewed_commit: c7a0358db17ab31d97233e387a1572ab45a9e1c6
+  reviewed_commit: 9a6c3cf72fe7c7a3d45dd6ad511c6083fbd829be
   watch_paths:
     - github_credentials.py
     - private_bootstrap.py

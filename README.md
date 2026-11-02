@@ -271,11 +271,11 @@ the oneshot service is already running. A process lock also excludes manual runs
 The timer deliberately executes the lightweight fingerprint/audit `run` path, not
 the forced `reconcile-all` path, so routine heartbeats do not require a full network
 reconciliation of every repository.. The Fedora System Monitor now owns the Uptime Kuma heartbeat for this timer.
-Every non-dry periodic run sends a Kuma heartbeat; fatal autosync errors send an
-explicit DOWN heartbeat instead of silently aging into "No heartbeat in the time window".
-Repository-level reconciliation findings keep the service heartbeat UP and are included
-in the heartbeat message as diagnostics; they do not masquerade as a service outage.
-A missing/unusable Push URL is treated as a heartbeat failure rather than success.
+Autosync does not send its own Kuma heartbeat or require a Push URL. Inspect the
+Monitor's separate result/freshness evidence for delivery and service health; a
+source check or completed repository reconciliation is not proof of a delivered
+heartbeat. Repository findings remain visible in the synchronizer's own structured
+result rather than being reported as a second health transport.
 The Fedora bootstrap also compares the installed user units with the repository copies;
 after a canonical checkout advances, the next reconcile repairs stale unit files and
 reloads systemd automatically. An independent `github-autosync-watchdog.timer` runs every

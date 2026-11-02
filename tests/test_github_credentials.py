@@ -68,7 +68,7 @@ else:print('accepted-'+str(n))
 
     def test_git_private_credential_protocol_uses_vault_helper(self):
         env=dict(os.environ,GIT_CONFIG_GLOBAL=os.devnull,GIT_CONFIG_SYSTEM=os.devnull,GIT_TERMINAL_PROMPT='0')
-        result=subprocess.run(['git','-c','credential.helper=','-c','credential.helper='+credentials.git_credential_helper(),'credential','fill'],input='protocol=https\nhost=github.com\n\n',timeout=15,capture_output=True,text=True,env=env)
+        result=subprocess.run(['git','-c','credential.helper=','-c','credential.helper='+credentials.git_credential_helper(),'credential','fill'],input='protocol=https\nhost=github.com\n\n',timeout=15,capture_output=True,text=True,env=env,cwd=self.root)
         self.assertEqual(result.returncode,0,result.stderr)
         fields=dict(line.split('=',1) for line in result.stdout.splitlines() if '=' in line)
         self.assertEqual(fields['password'],'inert-1')
@@ -77,7 +77,7 @@ else:print('accepted-'+str(n))
     def test_git_does_not_use_other_helpers_on_vault_failure(self):
         self.bws.write_text('#!/bin/sh\nexit 37\n')
         env=dict(os.environ,GIT_CONFIG_GLOBAL=os.devnull,GIT_CONFIG_SYSTEM=os.devnull,GIT_TERMINAL_PROMPT='0')
-        result=subprocess.run(['git','-c','credential.helper=','-c','credential.helper='+credentials.git_credential_helper(),'credential','fill'],input='protocol=https\nhost=github.com\n\n',timeout=15,capture_output=True,text=True,env=env)
+        result=subprocess.run(['git','-c','credential.helper=','-c','credential.helper='+credentials.git_credential_helper(),'credential','fill'],input='protocol=https\nhost=github.com\n\n',timeout=15,capture_output=True,text=True,env=env,cwd=self.root)
         self.assertNotEqual(result.returncode,0)
         self.assertFalse((self.root/'gh-called').exists())
         self.assertNotIn('password=',result.stdout)

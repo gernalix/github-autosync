@@ -447,6 +447,57 @@ class SingleWriterTests(unittest.TestCase):
                 self.assertEqual(7, ready["pr_number"])
                 self.assertEqual(0, git(["show-ref", "--verify", "--quiet", "refs/remotes/origin/task/alpha"], task).returncode)
 
+    def test_queued_followup_preserves_pr_and_rejects_unsafe_changes(self):
+        for scenario in ("append", "dirty", "closed", "remote-drift", "rewritten"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                repo, bare = self.make_repo(root / "git")
+                with (mock.patch.object(writer, "STATE_ROOT", root / "state"),
+                      mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees")):
+                    payload = writer.start_task(repo, "followup")
+                    task = Path(payload["worktree"])
+                    (task / "feature.txt").write_text("first\n")
+                    self.assertEqual(git(["add", "feature.txt"], task).returncode, 0)
+                    self.assertEqual(git(["commit", "-m", "first"], task).returncode, 0)
+                    original = git(["rev-parse", "HEAD"], task).stdout.strip()
+                    self.assertEqual(git(["push", "origin", "HEAD:refs/heads/" + payload["branch"]], task).returncode, 0)
+                    payload.update(status="queued", head_sha=original, pr_number=7,
+                                   integration_retry={"reason": "checks-failed"})
+                    record = writer._task_record(repo, "followup")
+                    writer._atomic_json(record, payload)
+                    if scenario == "rewritten":
+                        # A sibling commit is not a permitted append.
+                        self.assertEqual(git(["checkout", "--detach", "HEAD^"], task).returncode, 0)
+                        self.assertEqual(git(["branch", "-f", payload["branch"], "HEAD"], task).returncode, 0)
+                        self.assertEqual(git(["checkout", payload["branch"]], task).returncode, 0)
+                    (task / "feature.txt").write_text("followup\n")
+                    if scenario != "dirty":
+                        self.assertEqual(git(["add", "feature.txt"], task).returncode, 0)
+                        self.assertEqual(git(["commit", "-m", "followup"], task).returncode, 0)
+                    expected = git(["rev-parse", "HEAD"], task).stdout.strip()
+                    original_run = writer.run
+                    def fake(cmd, cwd=None, timeout=300):
+                        if cmd[0] != "gh":
+                            return original_run(cmd, cwd, timeout)
+                        self.assertEqual(cmd[:3], ["gh", "pr", "view"])
+                        remote = git(["rev-parse", "refs/heads/" + payload["branch"]], bare).stdout.strip()
+                        return cp(stdout=json.dumps({"state": "CLOSED" if scenario == "closed" else "OPEN",
+                            "headRefName": payload["branch"], "baseRefName": "main",
+                            "headRefOid": "f" * 40 if scenario == "remote-drift" else remote}))
+                    with mock.patch.object(writer, "run", side_effect=fake):
+                        if scenario == "append":
+                            updated = writer.finish_task(repo, "followup")
+                            self.assertEqual(updated["head_sha"], expected)
+                            self.assertEqual(updated["pr_number"], 7)
+                            self.assertNotIn("integration_retry", updated)
+                            self.assertEqual(writer.finish_task(repo, "followup"), updated)
+                        else:
+                            with self.assertRaises(RuntimeError):
+                                writer.finish_task(repo, "followup")
+                            self.assertEqual(json.loads(record.read_text())["head_sha"], original)
+                            self.assertEqual(git(["rev-parse", "refs/heads/" + payload["branch"]], bare).stdout.strip(), original)
+                    self.assertEqual(git(["show", "main:base.txt"], bare).stdout, "base\n")
+
     def test_start_task_ignores_dirty_canonical_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -845,11 +845,54 @@ def _checkpoint_task(worktree: Path, task_id: str, *, scope_guard=None) -> None:
 
 
 def finish_task(repo: Path, task_id: str, *, scope_guard=None) -> dict[str, Any]:
-    if scope_guard is None:
-        return _finish_task_unlocked(repo, task_id)
     with RepoLock(_repo_slug(repo)):
-        scope_guard(repo, _repo_slug(repo))
+        if scope_guard is not None:
+            scope_guard(repo, _repo_slug(repo))
         return _finish_task_unlocked(repo, task_id, scope_guard=scope_guard)
+
+
+def _publish_queued_followup(repo, record_path, payload, *, scope_guard=None):
+    """Append reviewed commits to the same open PR without rewriting history."""
+    worktree = Path(payload["worktree"])
+    branch = str(payload["branch"])
+    if _ok(worktree, "branch", "--show-current") != branch or _operation_in_progress(worktree):
+        raise RuntimeError("queued task worktree or branch mismatch")
+    if _ok(worktree, "status", "--porcelain"):
+        raise RuntimeError("queued follow-up must be committed and clean")
+    head = _ok(worktree, "rev-parse", "HEAD")
+    previous = str(payload.get("head_sha") or "")
+    if head == previous:
+        return payload
+    if not re.fullmatch(r"[0-9a-f]{40}", previous) or _git(
+            worktree, "merge-base", "--is-ancestor", previous, head).returncode:
+        raise RuntimeError("queued follow-up must preserve the published ancestry")
+    command = ["gh", "pr", "view", str(payload["pr_number"]), "--repo", payload["repo"],
+               "--json", "state,headRefName,headRefOid,baseRefName"]
+    def read_open_pr():
+        result = run(command, timeout=120)
+        if result.returncode:
+            raise RuntimeError("queued PR read failed")
+        info = json.loads(result.stdout)
+        if (info.get("state") != "OPEN" or info.get("headRefName") != branch
+                or info.get("baseRefName") != payload["canonical_branch"]
+                or info.get("headRefOid") not in {previous, head}):
+            raise RuntimeError("queued PR is closed or its ownership changed")
+        return info
+    read_open_pr()
+    if scope_guard is not None:
+        scope_guard(repo, str(payload["repo"]))
+    pushed = _git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}", timeout=300)
+    if pushed.returncode:
+        raise RuntimeError(pushed.stderr.strip() or "queued follow-up push failed")
+    if read_open_pr().get("headRefOid") != head:
+        raise RuntimeError("queued follow-up remote readback mismatch")
+    payload.update(head_sha=head, status="queued", integration_state="queued",
+                   integration_reason=None, integration_observed_at=_iso_now())
+    payload.pop("integration_retry", None)
+    if scope_guard is not None:
+        scope_guard(repo, str(payload["repo"]))
+    _atomic_json(record_path, payload)
+    return payload
 
 
 def _finish_task_unlocked(repo: Path, task_id: str, *, scope_guard=None) -> dict[str, Any]:
@@ -859,7 +902,9 @@ def _finish_task_unlocked(repo: Path, task_id: str, *, scope_guard=None) -> dict
     if not record_path.exists():
         raise RuntimeError(f"unknown task: {task_id}")
     payload = json.loads(record_path.read_text(encoding="utf-8"))
-    if payload.get("status") in {"queued", "ready", "merged"}:
+    if payload.get("status") in {"queued", "ready"}:
+        return _publish_queued_followup(repo, record_path, payload, scope_guard=scope_guard)
+    if payload.get("status") == "merged":
         return payload
     if payload.get("status") not in {"active", "blocked"}:
         raise RuntimeError(f"task is not finishable: {payload.get('status')}")
@@ -886,8 +931,7 @@ def _finish_task_unlocked(repo: Path, task_id: str, *, scope_guard=None) -> dict
     head = _ok(worktree, "rev-parse", "HEAD")
     canonical_head = _ok(worktree, "rev-parse", f"refs/remotes/origin/{canonical}")
     if head == canonical_head:
-        cleanup = _cleanup_task_after_merge_unlocked if scope_guard is not None else cleanup_task_after_merge
-        cleanup(
+        _cleanup_task_after_merge_unlocked(
             str(payload["repo"]),
             branch,
             merge_sha=head,

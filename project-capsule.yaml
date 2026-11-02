@@ -4,100 +4,229 @@ identity:
   slug: github-autosync
   repository_id: R0092
 scope:
-  purpose: Synchronize and integrate an explicit allowlist of gernalix GitHub repositories from Fedora.
+  purpose: Synchronize and integrate an explicit allowlist of gernalix GitHub repositories
+    from Fedora.
   boundaries:
-    - MegaVault owns project and repository identity and registry facts.
-    - Project Git/GitHub owns backlog; local task-state exists only during execution.
-    - This repository does not manage repositories outside ALLOWED_REPOSITORIES.
+  - MegaVault owns project and repository identity and registry facts.
+  - Project Git/GitHub owns backlog; local task-state exists only during execution.
+  - This repository does not manage repositories outside ALLOWED_REPOSITORIES.
 repository:
   canonical_workdir: /home/daniele/projects/github-autosync
-  branch_policy: main is canonical and protected; make changes in isolated task/* worktrees and integrate through repo-integrator.
+  branch_policy: main is canonical and protected; make changes in isolated task/*
+    worktrees and integrate through repo-integrator.
 architecture:
-  summary: github_autosync.py orchestrates allowlisted synchronization through autosync_core.py; repo_single_writer.py creates isolated task branches and queues integration PRs; repo_integrator.py serializes integration; runtime_watchdog.py recovers the local service installation.
+  summary: github_autosync.py orchestrates allowlisted synchronization through autosync_core.py;
+    repo_single_writer.py creates isolated task branches and queues integration PRs;
+    repo_integrator.py serializes integration; runtime_watchdog.py recovers the local
+    service installation. activity_journal.py owns append-only event normalization
+    and cursor persistence separately from transport; queued PR follow-ups are serialized
+    with the integrator and may only append committed clean descendants to the same
+    verified open PR.
   entrypoints:
-    - github_autosync.py
-    - repo_single_writer.py
-    - retired_git_sources.py
-    - repo_integrator.py
-    - runtime_watchdog.py
+  - github_autosync.py
+  - repo_single_writer.py
+  - retired_git_sources.py
+  - repo_integrator.py
+  - runtime_watchdog.py
   important_paths:
-    - github_credentials.py
-    - private_bootstrap.py
-    - systemd
-    - tests
-    - README.md
+  - github_credentials.py
+  - private_bootstrap.py
+  - systemd
+  - tests
+  - README.md
+  - activity_journal.py
+  - autosync_errors.py
+  - repo_gc.py
 dependencies:
-  - name: MegaVault
-    project_id: 23
-    purpose: Canonical project and repository registry and external runtime state inventory.
+- name: MegaVault
+  project_id: 23
+  purpose: Canonical project and repository registry and external runtime state inventory.
 data:
-  schema: No application database lives in this repository. Runtime state is external JSON; the mutation activity ledger is external JSONL under /home/daniele/.local/state/codex-github-autosync.
+  schema: No application database lives in this repository. Runtime state is external
+    JSON; the mutation activity ledger is external JSONL under /home/daniele/.local/state/codex-github-autosync.
   migrations: Not applicable; there is no repository-local database schema.
 runtime:
   services:
-    - github-autosync.service
-    - repo-integrator.service
-    - github-autosync-watchdog.service
+  - github-autosync.service
+  - repo-integrator.service
+  - github-autosync-watchdog.service
   timers:
-    - github-autosync.timer
-    - repo-integrator.timer
-    - github-autosync-watchdog.timer
+  - github-autosync.timer
+  - repo-integrator.timer
+  - github-autosync-watchdog.timer
   containers: []
 devices: []
 commands:
-  setup: {not_applicable: The repository has no standalone build or package setup; host Python and GitHub CLI tools are provisioned separately.}
-  build: {not_applicable: Python scripts have no compiled build artifact.}
-  test_targeted: {argv: [python3, -B, -m, unittest, discover, -s, tests, -p, test_github_autosync_regressions.py, -v], cwd: .}
-  test_full: {argv: [python3, -B, -m, unittest, discover, -s, tests, -v], cwd: .}
-  lint: {not_applicable: No separate lint configuration is defined in this repository.}
-  deploy_install: {argv: [python3, install_systemd.py], cwd: .}
-  smoke: {argv: [python3, github_autosync.py, --dry-run, run], cwd: .}
+  setup:
+    not_applicable: The repository has no standalone build or package setup; host
+      Python and GitHub CLI tools are provisioned separately.
+  build:
+    not_applicable: Python scripts have no compiled build artifact.
+  test_targeted:
+    argv:
+    - python3
+    - -B
+    - -m
+    - unittest
+    - discover
+    - -s
+    - tests
+    - -p
+    - test_github_autosync_regressions.py
+    - -v
+    cwd: .
+  test_full:
+    argv: &id001
+    - bwrap
+    - --die-with-parent
+    - --unshare-net
+    - --unshare-pid
+    - --ro-bind
+    - /
+    - /
+    - --tmpfs
+    - /home
+    - --tmpfs
+    - /run
+    - --tmpfs
+    - /tmp
+    - --tmpfs
+    - /mnt
+    - --tmpfs
+    - /media
+    - --tmpfs
+    - /var/lib
+    - --proc
+    - /proc
+    - --dev
+    - /dev
+    - --ro-bind
+    - .
+    - /tmp/work
+    - --ro-bind
+    - /home/daniele/.local/lib/python3.14/site-packages
+    - /home/daniele/.local/lib/python3.14/site-packages
+    - --chdir
+    - /tmp/work
+    - --clearenv
+    - --setenv
+    - PATH
+    - /usr/bin:/bin
+    - --setenv
+    - HOME
+    - /tmp
+    - --setenv
+    - PYTHONPATH
+    - /tmp/work:/tmp/work/src:/home/daniele/.local/lib/python3.14/site-packages
+    - --setenv
+    - PYTHONDONTWRITEBYTECODE
+    - '1'
+    - --setenv
+    - PYTEST_DISABLE_PLUGIN_AUTOLOAD
+    - '1'
+    - /usr/bin/python3
+    - -B
+    - -m
+    - unittest
+    - discover
+    - -s
+    - tests
+    - -q
+    cwd: .
+  lint:
+    not_applicable: No separate lint configuration is defined in this repository.
+  deploy_install:
+    argv:
+    - python3
+    - install_systemd.py
+    cwd: .
+  smoke:
+    not_applicable: A dry-run may still read runtime state or contact GitHub; capsule
+      verification uses only fixture-based unit tests.
   verify:
-    fast: {argv: [python3, /home/daniele/projects/codex-roadmap/tools/project_capsule.py, --repo, ., --mode, FAST], cwd: .}
-    full: {argv: [python3, /home/daniele/projects/codex-roadmap/tools/project_capsule.py, --repo, ., --mode, FULL], cwd: .}
+    fast:
+      argv:
+      - python3
+      - /home/daniele/projects/codex-roadmap/tools/project_capsule.py
+      - --repo
+      - .
+      - --mode
+      - FAST
+      cwd: .
+    full:
+      argv:
+      - python3
+      - /home/daniele/projects/codex-roadmap/tools/project_capsule.py
+      - --repo
+      - .
+      - --mode
+      - FULL
+      cwd: .
 safety:
   invariants:
-    - Only repositories in ALLOWED_REPOSITORIES are synchronized by the service.
-    - Canonical branches remain protected; repo-integrator serializes final repository integration.
-    - C3 is a frozen archive; no active Git operation depends on its runtime.
-    - Git recovery preserves dirty or divergent user work.
+  - Only repositories in ALLOWED_REPOSITORIES are synchronized by the service.
+  - Canonical branches remain protected; repo-integrator serializes final repository
+    integration.
+  - C3 is a frozen archive; no active Git operation depends on its runtime.
+  - Git recovery preserves dirty or divergent user work.
+  - Queued follow-ups preserve the published ancestry and exact open PR ownership,
+    use normal non-force push, and require exact remote readback before clearing stale
+    integration failures.
   risky_operations:
-    - install_systemd.py changes installed user commands and systemd units; use only for an explicitly requested install or deployment.
-    - Forced github-reconcile performs network reconciliation and may push clean ahead-only branches; keep it separate from dry-run checks.
-    - Runtime state and activity logs live outside Git and must not be reset or replaced during repository work.
+  - install_systemd.py changes installed user commands and systemd units; use only
+    for an explicitly requested install or deployment.
+  - Forced github-reconcile performs network reconciliation and may push clean ahead-only
+    branches; keep it separate from dry-run checks.
+  - Runtime state and activity logs live outside Git and must not be reset or replaced
+    during repository work.
   recovery:
-    - Inspect the installed units and journal, then use runtime_watchdog.py or the documented watchdog timer to recover a clean fast-forwardable installation.
-    - Keep task worktrees and checkpoints when integration is deferred; never resolve divergence by resetting or force-pushing.
+  - Inspect the installed units and journal, then use runtime_watchdog.py or the documented
+    watchdog timer to recover a clean fast-forwardable installation.
+  - Keep task worktrees and checkpoints when integration is deferred; never resolve
+    divergence by resetting or force-pushing.
 acceptance:
-  - FAST and FULL capsule checks pass with MegaVault identity verified.
-  - Targeted regression tests pass before the capsule is integrated.
-  - Repository integration and the resulting canonical head are read back before reporting completion.
+- FAST and FULL capsule checks pass with MegaVault identity verified.
+- Targeted regression tests pass before the capsule is integrated.
+- Repository integration and the resulting canonical head are read back before reporting
+  completion.
 references:
-  c2: c2.project-capsule.v1
+  c2: Historical-only schema name; no C2/C3 dispatch or lifecycle writes.
   megavault: /home/daniele/MegaVault/megavault.sqlite
 freshness:
-  reviewed_commit: 4aae0e9c4728f25d051ae2e44ff1469078f92f62
+  reviewed_commit: 2b8d2b1d217cbdacd0411fd28bd6a40d47d2aef0
   watch_paths:
-    - github_credentials.py
-    - private_bootstrap.py
-    - README.md
-    - github_autosync.py
-    - autosync_core.py
-    - repo_single_writer.py
-    - retired_git_sources.py
-    - repo_integrator.py
-    - runtime_watchdog.py
-    - install_systemd.py
-    - systemd
-    - tests
+  - github_credentials.py
+  - private_bootstrap.py
+  - README.md
+  - github_autosync.py
+  - autosync_core.py
+  - repo_single_writer.py
+  - retired_git_sources.py
+  - repo_integrator.py
+  - runtime_watchdog.py
+  - install_systemd.py
+  - systemd
+  - tests
+  - activity_journal.py
+  - autosync_errors.py
+  - repo_gc.py
 artifacts:
   agents: AGENTS.md
   repository_guide: README.md
+  architecture: README.md
+  operations: README.md
+  data_model: activity_journal.py
 validation_hooks:
-  - id: full-unit-tests
-    argv: [python3, -B, -m, unittest, discover, -s, tests, -v]
-    cwd: .
-    safe: true
+- id: isolated-full-unit-tests
+  argv: *id001
+  cwd: .
+  safe: true
 change_verification:
-  - paths: [project-capsule.yaml, AGENTS.md]
-    commands: [test_targeted]
+- paths:
+  - '*.py'
+  - tests/*
+  - systemd/*
+  - project-capsule.yaml
+  - AGENTS.md
+  commands:
+  - test_full

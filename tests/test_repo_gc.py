@@ -331,6 +331,35 @@ class ReviewedArchiveTests(unittest.TestCase):
                 self.assertTrue((Path(archived['preservation'])/'commits.bundle').is_file())
                 self.assertNotEqual(0,fixtures.git(['show-ref','--verify','refs/heads/'+payload['branch']],remote).returncode)
 
+    def test_closed_equivalent_source_requires_receipt_and_verified_private_preservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                writer._ok(tree,'commit','--amend','-m','closed original')
+                tip=writer._ok(tree,'rev-parse','HEAD');canonical=payload['merge_sha']
+                writer._ok(tree,'push','origin',tip+':refs/heads/fixture-original-object')
+                writer._ok(remote,'update-ref','refs/heads/'+payload['branch'],tip)
+                payload.pop('merge_sha');payload.pop('integrated_head')
+                payload.update(status='queued',head_sha=tip,pr_number=19)
+                record=writer._task_record(repo,payload['task_id']);writer._atomic_json(record,payload)
+                original=writer.run
+                def provider(args,cwd=None,timeout=300):
+                    if args[:3]==['gh','pr','view']:return fixtures.cp(stdout=json.dumps(dict(state='CLOSED',headRefName=payload['branch'],headRefOid=tip,baseRefName='main',mergeCommit=None)))
+                    return original(args,cwd,timeout)
+                with patch.object(writer,'run',side_effect=provider):
+                    writer.retire_integrated_closed_task(payload['repo'],payload['branch'],expected_head=tip,canonical_sha=canonical,chat_id='01a15d5d-1567-7b20-915f-d9e72f0af83a',reason='Reviewed byte-identical replacement',scope_guard=lambda *a:None,allow_patch_equivalent=True)
+                payload=json.loads(record.read_text())
+                self.assertFalse(gc.preserved_patch_equivalent(payload,tip,'origin/main'))
+                archived=gc.archive_reviewed_worktree(repo,self.review(root,repo,tree,payload,'patch-equivalent'))
+                self.assertTrue(gc.preserved_patch_equivalent(payload,tip,'origin/main'))
+                unsafe=dict(payload);unsafe.pop('closed_pr_retirement')
+                self.assertFalse(gc.preserved_patch_equivalent(unsafe,tip,'origin/main'))
+                self.assertEqual(gc.collect_record(payload),{'removed':['remote-branch','local-branch']})
+                self.assertEqual((Path(archived['original'])/'integrated.txt').read_text(),'integrated\n')
+                self.assertTrue((Path(archived['preservation'])/'commits.bundle').is_file())
+                self.assertEqual(json.loads(record.read_text())['status'],'superseded')
+
     def test_archived_equivalent_tip_does_not_authorize_changed_branch_or_missing_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

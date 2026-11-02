@@ -69,7 +69,12 @@ def preserved_patch_equivalent(payload, tip, base):
     invalidates the evidence.
     """
     import hashlib
-    if payload.get('status') != 'merged':
+    closed = payload.get('closed_pr_retirement', {})
+    superseded = (payload.get('status') == 'superseded' and payload.get('terminal_evidence')
+                  and closed.get('status') == 'superseded' and closed.get('pr_state') == 'CLOSED'
+                  and closed.get('source_head') == tip
+                  and closed.get('equivalence', {}).get('method') == 'patch-and-exact-paths')
+    if payload.get('status') != 'merged' and not superseded:
         return False
     repo=Path(payload['repo_path']);source=Path(payload['worktree'])
     if source.exists():return False
@@ -80,6 +85,9 @@ def preserved_patch_equivalent(payload, tip, base):
             if path.parent.name != hashlib.sha256(raw).hexdigest():continue
             if (review.get('worktree') != str(source) or review.get('expected_head') != tip
                     or review.get('disposition') != 'patch-equivalent'):continue
+            if superseded:
+                if review.get('replacement_commit') != closed.get('canonical_sha'):continue
+                if writer._exact_patch_equivalence(repo,tip,closed['canonical_sha']) != closed['equivalence']['paths']:continue
             receipt=json.loads((path.parent/'receipt.json').read_text())
             if (receipt.get('status') != 'archived' or receipt.get('head') != tip
                     or receipt.get('source') != str(source)

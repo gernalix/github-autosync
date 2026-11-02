@@ -733,8 +733,27 @@ def recover_merged_task(repo_slug: str, branch: str, *, scope_guard) -> dict[str
         return {"status":"merged","pr_number":payload['pr_number'],"merge_sha":merged,"catalog":publication,"cleanup":cleanup}
 
 
+def _exact_patch_equivalence(repo: Path, head: str, canonical: str) -> list[str]:
+    """Require equivalent patches AND byte-identical current affected paths."""
+    changes = _git(repo, 'cherry', canonical, head)
+    lines = changes.stdout.splitlines()
+    if changes.returncode or not lines or any(not line.startswith('- ') for line in lines):
+        raise ValueError('source patches are not all integrated equivalents')
+    base = _ok(repo, 'merge-base', canonical, head)
+    listed = _git(repo, 'diff', '--no-renames', '--name-only', '-z', base, head)
+    if listed.returncode:
+        raise ValueError('source changed paths unavailable')
+    paths = listed.stdout.split('\0')
+    paths = [path for path in paths if path]
+    if not paths or len(paths) > 256 or _git(
+            repo, '--literal-pathspecs', 'diff', '--quiet', head, canonical, '--', *paths).returncode:
+        raise ValueError('equivalent patches require exact affected-path contents')
+    return paths
+
+
 def retire_integrated_closed_task(repo_slug: str, branch: str, *, expected_head: str,
-                                 canonical_sha: str, chat_id: str, reason: str, scope_guard) -> dict[str, Any]:
+                                 canonical_sha: str, chat_id: str, reason: str, scope_guard,
+                                 allow_patch_equivalent: bool = False) -> dict[str, Any]:
     """Retire an explicitly reviewed CLOSED PR whose source is integrated elsewhere.
 
     Preserve its true closed outcome and files; this never invents a merged PR.
@@ -772,14 +791,24 @@ def retire_integrated_closed_task(repo_slug: str, branch: str, *, expected_head:
         fetched=_git(repo,'fetch','--no-tags','origin','refs/heads/'+canonical+':refs/remotes/origin/'+canonical)
         live=_ok(repo,'ls-remote','origin','refs/heads/'+canonical).split()[0]
         if (fetched.returncode or live!=canonical_sha
-                or _ok(repo,'rev-parse','origin/'+canonical)!=live
-                or _git(repo,'merge-base','--is-ancestor',expected_head,live).returncode
+                or _ok(repo,'rev-parse','origin/'+canonical)!=live):
+            raise ValueError('canonical remote changed since review')
+        equivalence = None
+        if (_git(repo,'merge-base','--is-ancestor',expected_head,live).returncode
                 or _git(repo,'merge-base','--is-ancestor',pr_head,live).returncode):
-            raise ValueError('every source commit must be integrated in current canonical history')
+            if allow_patch_equivalent:
+                paths = _exact_patch_equivalence(repo, expected_head, live)
+                _exact_patch_equivalence(repo, pr_head, live)
+                equivalence = dict(method='patch-and-exact-paths', source_head=expected_head,
+                                   canonical_sha=live, paths=paths)
+            else:
+                raise ValueError('every source commit must be integrated in current canonical history')
         if split_source and _ok(repo,'rev-parse',expected_head+'^{tree}')!=_ok(repo,'rev-parse',pr_head+'^{tree}'):
             raise ValueError('reviewed local source differs from the exact closed PR contents')
         receipt=dict(status='superseded',pr_number=payload['pr_number'],pr_state='CLOSED',
                      source_head=expected_head,closed_pr_head=pr_head,canonical_sha=live,chat_id=chat_id,reason=reason)
+        if equivalence:
+            receipt['equivalence'] = equivalence
         scope_guard(repo,repo_slug)
         if (_ok(tree,'rev-parse','HEAD')!=expected_head or _operation_in_progress(tree)
                 or _git(tree,'status','--porcelain','--untracked-files=all').stdout.strip()):

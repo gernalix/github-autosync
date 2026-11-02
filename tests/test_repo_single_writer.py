@@ -163,6 +163,39 @@ class SingleWriterTests(unittest.TestCase):
                     self.assertEqual(stored['status'],'queued' if failure else 'superseded');self.assertNotIn('merge_sha',stored)
                     self.assertEqual((tree/'feature').read_text(),'tested contents')
 
+    def test_closed_equivalent_retirement_is_opt_in_and_checks_exact_path_bytes(self):
+        for changed in (False, True):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);repo,remote=self.make_repo(root/'git')
+                with mock.patch.object(writer,'STATE_ROOT',root/'state'), mock.patch.object(writer,'WORKTREE_ROOT',root/'trees'):
+                    task=writer.start_task(repo,'equivalent');tree=Path(task['worktree'])
+                    (tree/'feature').write_text('first line\n')
+                    writer._ok(tree,'add','feature');writer._ok(tree,'commit','-m','original')
+                    head=writer._ok(tree,'rev-parse','HEAD');writer._ok(tree,'push','origin',head+':refs/heads/'+task['branch'])
+                    seed=root/'git/seed';writer._ok(seed,'fetch','origin')
+                    writer._ok(seed,'-c','user.name=Replacement','-c','user.email=replacement@example.invalid','cherry-pick',head)
+                    if changed:
+                        (seed/'feature').write_text('first  line\n')
+                        writer._ok(seed,'add','feature');writer._ok(seed,'commit','-m','later whitespace change')
+                    writer._ok(seed,'push','origin','main');canonical=writer._ok(seed,'rev-parse','HEAD')
+                    task.update(status='queued',pr_number=19,head_sha=head);record=writer._task_record(repo,'equivalent');writer._atomic_json(record,task)
+                    original=writer.run
+                    def provider(args,cwd=None,timeout=300):
+                        if args[:3]==['gh','pr','view']:return cp(stdout=json.dumps(dict(state='CLOSED',headRefName=task['branch'],headRefOid=head,baseRefName='main',mergeCommit=None)))
+                        return original(args,cwd,timeout)
+                    options=dict(expected_head=head,canonical_sha=canonical,chat_id='01a15d5d-1567-7b20-915f-d9e72f0af83a',reason='Reviewed equivalent replacement',scope_guard=lambda *a:None)
+                    with mock.patch.object(writer,'run',side_effect=provider):
+                        with self.assertRaises(ValueError):writer.retire_integrated_closed_task(task['repo'],task['branch'],**options)
+                        if changed:
+                            with self.assertRaisesRegex(ValueError,'exact affected-path'):writer.retire_integrated_closed_task(task['repo'],task['branch'],allow_patch_equivalent=True,**options)
+                            self.assertEqual(json.loads(record.read_text())['status'],'queued')
+                        else:
+                            result=writer.retire_integrated_closed_task(task['repo'],task['branch'],allow_patch_equivalent=True,**options)
+                            self.assertEqual(result['equivalence']['paths'],['feature'])
+                            stored=json.loads(record.read_text());self.assertEqual(stored['status'],'superseded');self.assertNotIn('merge_sha',stored)
+                    self.assertEqual((tree/'feature').read_text(),'first line\n')
+                    self.assertEqual(writer._ok(remote,'rev-parse','refs/heads/'+task['branch']),head)
+
     def test_retire_superseded_rejects_unintegrated_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

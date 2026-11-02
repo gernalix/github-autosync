@@ -172,6 +172,10 @@ safety:
   - Queued follow-ups preserve the published ancestry and exact open PR ownership,
     use normal non-force push, and require exact remote readback before clearing stale
     integration failures.
+  - A closed unmerged PR stays superseded, never merged. Explicit equivalent-source
+    retirement requires every patch integrated and byte-identical affected paths;
+    ref collection additionally requires a verified private bundle and preserved original
+    checkout.
   risky_operations:
   - install_systemd.py changes installed user commands and systemd units; use only
     for an explicitly requested install or deployment.
@@ -193,7 +197,7 @@ references:
   c2: Historical-only schema name; no C2/C3 dispatch or lifecycle writes.
   megavault: /home/daniele/MegaVault/megavault.sqlite
 freshness:
-  reviewed_commit: 2b8d2b1d217cbdacd0411fd28bd6a40d47d2aef0
+  reviewed_commit: 5d762ed9cf348f2f3a140f16783f4bdd0ab34bee
   watch_paths:
   - github_credentials.py
   - private_bootstrap.py

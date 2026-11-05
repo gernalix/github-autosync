@@ -489,14 +489,20 @@ def _task_by_branch(repo_slug: str, branch: str) -> tuple[Path, dict[str, Any]] 
     root = _task_dir_for_slug(repo_slug)
     if not root.is_dir():
         return None
+    candidates = []
     for path in sorted(root.glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if str(payload.get("branch") or "") == branch:
-            return path, payload
-    return None
+        if (str(payload.get("branch") or "") == branch
+                and str(payload.get("repo") or "").lower() == repo_slug.lower()):
+            candidates.append((path, payload))
+    current = [item for item in candidates if item[1].get("status") not in {"merged", "superseded"}]
+    selected = current or candidates
+    if len(selected) > 1:
+        raise RuntimeError("ambiguous repository branch task identity")
+    return selected[0] if selected else None
 
 
 
@@ -511,15 +517,17 @@ def _observe_task(
     queue_position: int | None = None,
     queue_size: int | None = None,
 ) -> None:
-    found = _task_by_branch(repo_slug, branch)
+    # Observation cannot create or replace the PR authority granted by finish.
+    found = (_task_by_pr(repo_slug, pr_number) if pr_number is not None
+             else _task_by_branch(repo_slug, branch))
     if found is None:
         return
     path, payload = found
+    if str(payload.get("branch") or "") != branch:
+        return
     payload["integration_state"] = state
     payload["integration_reason"] = reason
     payload["integration_observed_at"] = _iso_now()
-    if pr_number is not None:
-        payload["pr_number"] = pr_number
     if pr_url is not None:
         payload["pr_url"] = pr_url
     if queue_position is not None:
@@ -1404,17 +1412,67 @@ def _retry_fingerprint(info: dict[str, Any], payload: dict[str, Any], blocked_pr
     return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
 
 
+def _read_integration_pr(repo: str, number: int) -> tuple[dict[str, Any], str | None]:
+    view = run(["gh", "pr", "view", str(number), "--repo", repo,
+                "--json", "number,title,body,state,isDraft,mergeable,baseRefName,baseRefOid,headRefName,headRefOid,statusCheckRollup,mergeCommit,isCrossRepository,headRepository,headRepositoryOwner"], timeout=120)
+    if view.returncode:
+        return {}, "pr-read-failed"
+    try:
+        info = json.loads(view.stdout)
+    except json.JSONDecodeError:
+        return {}, "pr-json-invalid"
+    return (info, None) if isinstance(info, dict) else ({}, "pr-json-invalid")
+
+
+def _authorized_pr_task(repo: str, number: int, info: dict[str, Any]) -> tuple[tuple[Path, dict[str, Any]] | None, str | None]:
+    """Remote labels describe a PR; only a queued local receipt authorizes it."""
+    try:
+        found = _task_by_pr(repo, number)
+    except RuntimeError:
+        return None, "task-identity-ambiguous"
+    if found is None:
+        return None, "task-untracked"
+    path, payload = found
+    state = str(info.get("state") or "").upper()
+    if state not in {"OPEN", "MERGED"}:
+        return None, "pr-not-open-or-merged"
+    statuses = {"queued", "ready"} if state == "OPEN" else {"queued", "ready", "merged", "catalog-pending"}
+    if payload.get("status") not in statuses:
+        return None, "task-not-queued"
+    source = info.get("headRepository") or {}
+    owner = info.get("headRepositoryOwner") or {}
+    if not isinstance(source, dict) or not isinstance(owner, dict):
+        return None, "pr-source-unverified"
+    source_repo = str(source.get("nameWithOwner") or "")
+    if not source_repo and owner.get("login") and source.get("name"):
+        source_repo = f"{owner['login']}/{source['name']}"
+    if info.get("isCrossRepository") is not False or source_repo.lower() != repo.lower():
+        return None, "pr-source-unverified"
+    branch = str(payload.get("branch") or "")
+    if (info.get("number") != number
+            or not branch.startswith(TASK_PREFIX) or info.get("headRefName") != branch
+            or not payload.get("canonical_branch") or info.get("baseRefName") != payload["canonical_branch"]
+            or not payload.get("head_sha") or info.get("headRefOid") != payload["head_sha"]):
+        return None, "task-pr-identity-mismatch"
+    try:
+        branch_owner = _task_by_branch(repo, branch)
+    except RuntimeError:
+        return None, "task-identity-ambiguous"
+    if branch_owner is None or branch_owner[0] != path:
+        return None, "task-identity-ambiguous"
+    return found, None
+
+
 def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None) -> dict[str, Any]:
     with RepoLock(repo):
-        view = run(["gh", "pr", "view", str(number), "--repo", repo,
-                    "--json", "title,body,state,isDraft,mergeable,baseRefName,baseRefOid,headRefName,headRefOid,statusCheckRollup,mergeCommit"], timeout=120)
-        if view.returncode:
-            return {"repo": repo, "number": number, "status": "deferred", "reason": "pr-read-failed"}
-        try:
-            info = json.loads(view.stdout)
-        except json.JSONDecodeError:
-            return {"repo": repo, "number": number, "status": "deferred", "reason": "pr-json-invalid"}
-        found = _task_by_branch(repo, str(info.get("headRefName") or ""))
+        info, reason = _read_integration_pr(repo, number)
+        if reason:
+            return {"repo": repo, "number": number, "status": "deferred", "reason": reason}
+        if not str(info.get("title") or "").startswith(PR_PREFIX):
+            return {"repo": repo, "number": number, "status": "ignored"}
+        found, reason = _authorized_pr_task(repo, number, info)
+        if reason:
+            return {"repo": repo, "number": number, "status": "deferred", "reason": reason}
         # baseRefOid is the PR's diff base and may lag the actual branch tip.
         # Suppression must expire as soon as the server's canonical tip moves.
         if found and info.get("baseRefName"):
@@ -1452,6 +1510,9 @@ def integrate_pr(repo: str, number: int, *, blocked_prs: list[int] | None = None
 def _integrate_pr_once(repo: str, number: int, info: dict[str, Any], *, blocked_prs: list[int] | None = None) -> dict[str, Any]:
     if not str(info.get("title") or "").startswith(PR_PREFIX):
         return {"repo": repo, "number": number, "status": "ignored"}
+    _, reason = _authorized_pr_task(repo, number, info)
+    if reason:
+        return {"repo": repo, "number": number, "status": "deferred", "reason": reason}
     head_branch = str(info.get("headRefName") or "")
     head = str(info.get("headRefOid") or "")
     if str(info.get("state") or "").upper() == "MERGED":
@@ -1590,7 +1651,21 @@ def process_ready_prs(owner: str) -> dict[str, Any]:
         repo_positions[repo_key] = repo_positions.get(repo_key, 0) + 1
         position = repo_positions[repo_key]
         size = repo_sizes[repo_key]
-        found = _task_by_pr(str(item["repo"]), int(item["number"]))
+        try:
+            found = _task_by_pr(str(item["repo"]), int(item["number"]))
+        except RuntimeError:
+            results.append({**item, "status": "ignored", "reason": "task-identity-ambiguous"})
+            continue
+        if found is None or found[1].get("status") not in {"queued", "ready"}:
+            results.append({**item, "status": "ignored", "reason": "task-not-queued"})
+            continue
+        info, reason = _read_integration_pr(str(item["repo"]), int(item["number"]))
+        if reason is None:
+            found, reason = _authorized_pr_task(str(item["repo"]), int(item["number"]), info)
+        if reason:
+            # Unowned/fork PRs must neither observe tasks nor block their queue.
+            results.append({**item, "status": "ignored", "reason": reason})
+            continue
         branch = str(found[1].get("branch") or "") if found else ""
         catalog: dict[str, Any] | None = None
         bootstrap = bool(found and private_bootstrap.authorization_path(found[0]).exists())

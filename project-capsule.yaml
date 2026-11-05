@@ -197,7 +197,7 @@ references:
   c2: Historical-only schema name; no C2/C3 dispatch or lifecycle writes.
   megavault: /home/daniele/MegaVault/megavault.sqlite
 freshness:
-  reviewed_commit: 096482de74f849d8149ec38e4b7c3d738c8e5715
+  reviewed_commit: 7324dcd2bc512693fb6d63a7e16ec33897f29726
   watch_paths:
   - github_credentials.py
   - private_bootstrap.py

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import subprocess
 import tempfile
@@ -26,6 +27,27 @@ def cp(code: int = 0, stdout: str = "", stderr: str = "") -> subprocess.Complete
 
 
 class SingleWriterTests(unittest.TestCase):
+    @contextmanager
+    def queued_prs(self, items, *, branch=None, head="abc123"):
+        """Complete owned receipts for tests of queue order and check handling."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(writer, 'STATE_ROOT', Path(tmp)):
+            infos = {}
+            for item in items:
+                repo, number = item['repo'], item['number']
+                name = branch or f'task/{number}'
+                record = writer._task_dir_for_slug(repo) / f'{number}.json'
+                record.parent.mkdir(parents=True, exist_ok=True)
+                record.write_text(json.dumps({'repo': repo, 'pr_number': number, 'status': 'queued',
+                                              'branch': name, 'canonical_branch': 'main', 'head_sha': head,
+                                              'repo_path': tmp, 'worktree': tmp}))
+                infos[(repo, number)] = {'number': number, 'title': writer.PR_PREFIX + ' owned',
+                    'state': 'OPEN', 'headRefName': name, 'headRefOid': head, 'baseRefName': 'main',
+                    'isCrossRepository': False, 'headRepository': {'nameWithOwner': repo},
+                    'headRepositoryOwner': {'login': repo.split('/')[0]}}
+            with mock.patch.object(writer, '_retry_fingerprint', return_value=None), \
+                 mock.patch.object(writer, '_redacted_source_policy', return_value=None):
+                yield infos
+
     def test_pr_number_collision_prefers_unique_current_owner_and_rejects_ambiguity(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(writer,'STATE_ROOT',Path(tmp)):
             slug='gernalix/example';root=writer._task_dir_for_slug(slug);root.mkdir(parents=True)
@@ -556,7 +578,12 @@ class SingleWriterTests(unittest.TestCase):
                 return {"repo": repo, "number": number, "status": "deferred", "reason": "checks-pending"}
             return {"repo": repo, "number": number, "status": "merged"}
         with (
+            self.queued_prs(discovered) as infos,
             mock.patch.object(writer, "discover_ready_prs", return_value=discovered),
+            mock.patch.object(writer, "_retry_pending_catalog_publications", return_value=[]),
+            mock.patch.object(writer, "_read_integration_pr", side_effect=lambda repo, number: (infos[(repo, number)], None)),
+            mock.patch.object(writer, "_ok", return_value="abc123"),
+            mock.patch.object(writer.command_catalog_bridge, "prepare", return_value={"status": "not-applicable"}),
             mock.patch.object(writer, "integrate_pr", side_effect=fake_integrate),
             mock.patch.object(writer, "cleanup_task_after_merge", return_value={"status": "no-task-record"}),
         ):
@@ -571,9 +598,13 @@ class SingleWriterTests(unittest.TestCase):
             {"repo": writer.ROADMAP_REPOSITORY, "number": 11, "url": "two"},
         ]
         with (
+            self.queued_prs(discovered) as infos,
             mock.patch.object(writer, "discover_ready_prs", return_value=discovered),
+            mock.patch.object(writer, "_retry_pending_catalog_publications", return_value=[]),
+            mock.patch.object(writer, "_read_integration_pr", side_effect=lambda repo, number: (infos[(repo, number)], None)),
+            mock.patch.object(writer, "_ok", return_value="abc123"),
+            mock.patch.object(writer.command_catalog_bridge, "prepare", return_value={"status": "not-applicable"}),
             mock.patch.object(writer, "integrate_pr", return_value={"status":"deferred","reason":"checks-pending"}) as integrate,
-            mock.patch.object(writer, "_task_by_pr", return_value=None),
         ):
             result = writer.process_ready_prs("gernalix")
         self.assertEqual(["deferred", "deferred"],
@@ -618,9 +649,12 @@ class SingleWriterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             record = root / "task.json"
-            payload = {"worktree": str(root)}
+            payload = {"worktree": str(root), "repo": "gernalix/example", "status": "queued",
+                       "pr_number": 1, "branch": "task/retry", "canonical_branch": "main", "head_sha": "b" * 40}
             record.write_text(json.dumps(payload))
             info = {"state": "OPEN", "title": "[single-writer] retry", "baseRefOid": "a" * 40, "baseRefName": "main",
+                    "number": 1, "isCrossRepository": False, "headRepository": {"nameWithOwner": "gernalix/example"},
+                    "headRepositoryOwner": {"login": "gernalix"},
                     "headRefName": "task/retry", "headRefOid": "b" * 40,
                     "statusCheckRollup": [{"conclusion": "FAILURE"}]}
             live_base = ["a" * 40]
@@ -635,6 +669,7 @@ class SingleWriterTests(unittest.TestCase):
             with (mock.patch.object(writer, "RepoLock", return_value=__import__("contextlib").nullcontext()),
                   mock.patch.object(writer, "run", side_effect=lambda args, **k: cp(stdout=json.dumps({"object": {"sha": live_base[0]}} if args[:2] == ["gh", "api"] else info))),
                   mock.patch.object(writer, "_task_by_branch", side_effect=task),
+                  mock.patch.object(writer, "_task_by_pr", side_effect=task),
                   mock.patch.object(writer, "_git", side_effect=local_git),
                   mock.patch.object(writer, "_operation_in_progress", return_value=False),
                   mock.patch.object(writer, "_integrate_pr_once", return_value=blocked) as integrate):
@@ -667,6 +702,8 @@ class SingleWriterTests(unittest.TestCase):
             if cmd[:3] == ["gh", "pr", "view"]:
                 return cp(stdout=json.dumps({
                     "title": "[single-writer] 123",
+                    "number": 4, "state": "OPEN", "isCrossRepository": False,
+                    "headRepository": {"nameWithOwner": "gernalix/example"}, "headRepositoryOwner": {"login": "gernalix"},
                     "isDraft": False,
                     "mergeable": "MERGEABLE",
                     "baseRefName": "main",
@@ -678,12 +715,14 @@ class SingleWriterTests(unittest.TestCase):
                 return cp(stdout=json.dumps({"defaultBranchRef": {"name": "main"}}))
             if cmd[:3] == ["gh", "api", "--method"]:
                 return cp(stdout=json.dumps({"merged": True, "sha": "merge123"}))
+            if cmd[:2] == ["gh", "api"]:
+                return cp(stdout=json.dumps({"object": {"sha": "a" * 40}}))
             raise AssertionError(cmd)
 
         with (
             mock.patch.object(writer, "run", side_effect=fake_run),
             mock.patch.object(writer, "_refresh_task_branch_to_latest_base", return_value={"status": "current"}),
-            mock.patch.object(writer, "STATE_ROOT", Path("/tmp/single-writer-test-state")),
+            self.queued_prs([{"repo": "gernalix/example", "number": 4}], branch="task/123"),
         ):
             result = writer.integrate_pr("gernalix/example", 4)
         self.assertEqual("merged", result["status"])
@@ -736,6 +775,8 @@ class SingleWriterTests(unittest.TestCase):
             if cmd[:3] == ["gh", "pr", "view"]:
                 return cp(stdout=json.dumps({
                     "title": "[single-writer] 123",
+                    "number": 4, "state": "OPEN", "isCrossRepository": False,
+                    "headRepository": {"nameWithOwner": "gernalix/example"}, "headRepositoryOwner": {"login": "gernalix"},
                     "isDraft": False,
                     "mergeable": "MERGEABLE",
                     "baseRefName": "main",
@@ -745,12 +786,14 @@ class SingleWriterTests(unittest.TestCase):
                 }))
             if cmd[:3] == ["gh", "repo", "view"]:
                 return cp(stdout=json.dumps({"defaultBranchRef": {"name": "main"}}))
+            if cmd[:2] == ["gh", "api"]:
+                return cp(stdout=json.dumps({"object": {"sha": "a" * 40}}))
             raise AssertionError(cmd)
 
         with (
             mock.patch.object(writer, "run", side_effect=fake_run),
             mock.patch.object(writer, "_refresh_task_branch_to_latest_base", return_value={"status": "current"}),
-            mock.patch.object(writer, "STATE_ROOT", Path("/tmp/single-writer-test-state")),
+            self.queued_prs([{"repo": "gernalix/example", "number": 4}], branch="task/123"),
         ):
             result = writer.integrate_pr("gernalix/example", 4)
         self.assertEqual("deferred", result["status"])
@@ -761,6 +804,8 @@ class SingleWriterTests(unittest.TestCase):
             if cmd[:3] == ["gh", "pr", "view"]:
                 return cp(stdout=json.dumps({
                     "title": "[single-writer] 123",
+                    "number": 4, "state": "OPEN", "isCrossRepository": False,
+                    "headRepository": {"nameWithOwner": "gernalix/example"}, "headRepositoryOwner": {"login": "gernalix"},
                     "body": "",
                     "isDraft": False,
                     "mergeable": "MERGEABLE",
@@ -771,12 +816,14 @@ class SingleWriterTests(unittest.TestCase):
                 }))
             if cmd[:3] == ["gh", "repo", "view"]:
                 return cp(stdout=json.dumps({"defaultBranchRef": {"name": "main"}}))
+            if cmd[:2] == ["gh", "api"]:
+                return cp(stdout=json.dumps({"object": {"sha": "a" * 40}}))
             raise AssertionError(cmd)
 
         with (
             mock.patch.object(writer, "run", side_effect=fake_run),
             mock.patch.object(writer, "_refresh_task_branch_to_latest_base", return_value={"status": "refreshed"}),
-            mock.patch.object(writer, "STATE_ROOT", Path("/tmp/single-writer-test-state")),
+            self.queued_prs([{"repo": "gernalix/example", "number": 4}], branch="task/123"),
         ):
             result = writer.integrate_pr("gernalix/example", 4)
         self.assertEqual("branch-refreshed", result["reason"])

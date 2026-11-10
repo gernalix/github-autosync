@@ -67,6 +67,8 @@ This checkpoints the completed task, pushes its `task/123456` branch and creates
 
 Multiple ChatGPT/Codex sessions can therefore work on the same repository concurrently without sharing a checkout. The canonical checkout is never a worker workspace.
 
+The integrator accepts only an unambiguous local queued/ready receipt bound to the exact repository, PR number, published head, task branch and canonical branch. Provider metadata must identify the head as belonging to the same repository. A matching title, branch name or public commit does not queue active work; unknown, fork, mismatched and closed PRs cannot update task observations, prepare catalogs or trigger refresh/integration. Merged receipts require the same identity before downstream publication or cleanup. Local stranded rebase recovery still uses its existing exact-tree proof rather than requiring its temporary local head to equal the published head.
+
 The canonical branch is guarded locally: direct commits/merges to it are rejected. A local fast-forward to the exact fetched remote canonical tip is synchronization, not a new canonical write. This also applies to codex-roadmap code; its historical lifecycle DB remains read-only and has no active writer.
 
 Repositories whose canonical branch is intentionally owned by a dedicated local service are excluded from the generic writer. Currently `gernalix/activity-watch-data` is owned by `activity-watch-uploader`, and `gernalix/codex-usage` is owned by the Fedora `codex-usage-publisher`: `github-reconcile` removes only its own generic reference hook (restoring any pre-existing hook) and leaves those checkouts untouched. This prevents the autosync writer from racing or blocking the service that is authoritative for each data repository.

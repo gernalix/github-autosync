@@ -25,6 +25,7 @@ class PrivateBootstrapTests(unittest.TestCase):
         self.task_path = self.root / 'task.json'
         self.task = dict(task_id='bootstrap', pr_number=1, repo='example/project',
                          branch='task/bootstrap', canonical_branch='main',
+                         status='queued', head_sha=HEAD, base_sha=BASE,
                          repo_path=str(self.clone), worktree=str(self.worktree))
         self.task_path.write_text(json.dumps(self.task))
         self.plan = dict(project_id=123, version=1,
@@ -80,6 +81,7 @@ class PrivateBootstrapTests(unittest.TestCase):
         self.cutover.execute = execute
         for name, replacement in (
             ('_task_by_pr', Mock(return_value=(self.task_path, self.task))),
+            ('_task_by_branch', Mock(return_value=(self.task_path, self.task))),
             ('_ok', Mock(side_effect=self.git)),
             ('_github_json', Mock(side_effect=self.api)),
             ('run', Mock(side_effect=self.command)),
@@ -127,6 +129,15 @@ class PrivateBootstrapTests(unittest.TestCase):
         self.pr['merged'] = True
 
     def command(self, args, **kwargs):
+        if args[:3] == ['gh', 'pr', 'view']:
+            info = dict(number=1, title=self.pr['title'], body=self.pr['body'],
+                        state=self.pr['state'].upper(), isDraft=self.pr['draft'],
+                        baseRefName=self.pr['base']['ref'], headRefName=self.pr['head']['ref'],
+                        headRefOid=self.pr['head']['sha'],
+                        isCrossRepository=self.pr['head']['repo']['id'] != self.metadata['id'],
+                        headRepository={'nameWithOwner': self.metadata['full_name']},
+                        headRepositoryOwner={'login': self.metadata['full_name'].split('/')[0]})
+            return subprocess.CompletedProcess(args, 0, json.dumps(info), '')
         endpoint = args[2]
         if 'PATCH' in args:
             self.assertTrue(self.fenced)

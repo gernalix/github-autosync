@@ -40,36 +40,39 @@ github-reconcile
 
 This forces a fresh network reconciliation instead of relying on the normal fingerprint fast path. It covers every non-archived GitHub repository already represented by an active MegaVault worktree, already present under `~/projects/<repo>`, or included in the normal autosync allowlist.
 
-Canonical branches remain protected, but work is split into two phases. Agents run concurrently in dedicated `task/*` branches/worktrees and finish as soon as their queued pull request exists. The separate `repo-integrator` service serializes only final canonical integration per repository; `github-reconcile` is limited to synchronization/audit. Stale/deleted tracking branches are still repaired mechanically when unambiguous.
+Canonical branches are protected by one local writer per repository.
+Each task works in a separate Git worktree and publishes its task branch as a
+durable checkpoint. When local checks pass, `repo-task finish` integrates the
+result directly through ordinary Git commands on Fedora. It does not create
+pull requests, wait for GitHub Actions or use a separate integration queue.
+The old `repo-integrator.timer` is retired and disabled.
 
-A failure in one repository does not abort the global pass: the remaining repositories are still reconciled, and the final JSON exposes any unresolved entries in `reconcile_issues`.
-
-`codex-roadmap` remains special: it is delegated to the canonical guarded `roadmap_pull.py` path and canonical roadmap state is never auto-committed, preserving the single-writer boundary.
-
+A failed test, merge conflict or concurrent remote change leaves the task
+branch and its worktree intact. GitHub is a Git remote, not an executor.
+Existing PRs must be transferred individually with verified source commits;
+none is silently closed or deleted.
 
 ## Parallel ChatGPT/Codex work
 
-Use one isolated worktree per task:
+Create an isolated task worktree:
 
 ```bash
-repo-task start --repo ~/projects/PersonalHub --task-id 123456 --actor codex
+repo-task start --repo ~/projects/PersonalHub --task-id local-change --actor codex
 ```
 
-The command prints the worktree path. Work only there. Worker coordination is branch/worktree isolation, not a repository lease: a dirty canonical checkout cannot block a fresh task worktree created from the fetched remote canonical tip. `repo-task heartbeat` is retained only as a compatibility activity marker. Start from the project issue; no C3 registration or PROMPT_ID is required.
-
-When the task is complete:
+Edit and test in that worktree. To finish, pass the commands that must succeed
+on the **combined candidate** (not merely on the source branch):
 
 ```bash
-repo-task finish --repo ~/projects/PersonalHub --task-id 123456
+repo-task finish --repo ~/projects/PersonalHub --task-id local-change \
+  --test-command '["python3","-m","unittest","discover","-s","tests","-q"]'
 ```
 
-This checkpoints the completed task, pushes its `task/123456` branch and creates a queued PR. The worker is then finished: it does not wait for CI or merge. The minute-by-minute `repo-integrator` service processes PRs in order per repository, bypasses failed/pending PRs only for independent changes, waits asynchronously for checks, automatically rebases a clean queued task branch when canonical has advanced, and merges only after refreshed checks pass. Declare PR dependencies with `Depends-On: #123` (or `owner/repo#123` / a GitHub PR URL) in the PR body. Unmerged dependencies, shared unmerged commits, overlapping patch context, and unavailable independence evidence remain blocked. Real rebase conflicts are surfaced as semantic conflicts rather than guessed. After integration, clean task worktrees and unchanged task branches are cleaned up safely; dirty or changed post-merge work is preserved rather than force-deleted.
-
-Multiple ChatGPT/Codex sessions can therefore work on the same repository concurrently without sharing a checkout. The canonical checkout is never a worker workspace.
-
-The integrator accepts only an unambiguous local queued/ready receipt bound to the exact repository, PR number, published head, task branch and canonical branch. Provider metadata must identify the head as belonging to the same repository. A matching title, branch name or public commit does not queue active work; unknown, fork, mismatched and closed PRs cannot update task observations, prepare catalogs or trigger refresh/integration. Merged receipts require the same identity before downstream publication or cleanup. Local stranded rebase recovery still uses its existing exact-tree proof rather than requiring its temporary local head to equal the published head.
-
-The canonical branch is guarded locally: direct commits/merges to it are rejected. A local fast-forward to the exact fetched remote canonical tip is synchronization, not a new canonical write. This also applies to codex-roadmap code; its historical lifecycle DB remains read-only and has no active writer.
+Repeat `--test-command` to require several independent validations. The tool
+checkpoints and pushes the task branch first; a missing/failed check returns
+BLOCKED, not a successful merge. A no-change task finishes without empty
+commits or PRs. It uses a Git lock and an exact authorized canonical update,
+followed by a normal push and remote SHA readback.
 
 Repositories whose canonical branch is intentionally owned by a dedicated local service are excluded from the generic writer. Currently `gernalix/activity-watch-data` is owned by `activity-watch-uploader`, and `gernalix/codex-usage` is owned by the Fedora `codex-usage-publisher`: `github-reconcile` removes only its own generic reference hook (restoring any pre-existing hook) and leaves those checkouts untouched. This prevents the autosync writer from racing or blocking the service that is authoritative for each data repository.
 
@@ -79,60 +82,15 @@ Optional forms:
 github-reconcile --dry-run
 ```
 
-A future redacted repository that is still PRIVATE can opt in to a single
-bootstrap task before canonical cutover. After queuing the task and obtaining a
-successful approved Actions `push` or `workflow_dispatch` run on its exact head, use:
-
-```bash
-repo-task authorize-private-bootstrap --repo /tmp/example/clean-clone \
-  --task-id bootstrap --cutover-plan /tmp/example/private-plan.json \
-  --expected-head <40-character-tested-head> \
-  --ci-run-id <approved-run-id> --ci-workflow .github/workflows/ci.yml
-```
-
-This stores a mode-0600 authorization beside existing private task state. It is
-bound to the task/PR, repository identity, exact head, base, approved workflow/run,
-and private plan digest. The installed canonical cutover owner must validate the
-current project/repository CAS and private command bindings with `apply=False`;
-caller-supplied JSON alone grants no authority. The reviewed plan must include
-the pushed task ref and its complete reachable object set, while its target head
-still describes the unchanged default branch. The owner repeats its verification
-under its existing writer lock, which fences the final integration without
-updating registry rows. GitHub repository privacy/identity, PR provenance,
-exact-head workflow/checks/statuses, redacted history and unchanged main are
-checked before the nonforced fast-forward. Bootstrap uses a normal atomic Git
-push with a command-local pre-push expected-base check; receive-pack rejects a
-concurrent update after advertisement. Existing hooks are preserved. The REST
-fast-forward path for active redacted repositories is unchanged. Changed plans, public
-targets, missing proof and changed heads defer integration. Bootstrap never
-automatically rebases the approved task, publishes a command catalog, activates
-routing or cleans up the reviewed clone/worktree. The cutover owner must refresh
-the private plan after integration before any separately authorized publication.
-
-Revoke without changing refs or registry state:
-
-```bash
-repo-task revoke-private-bootstrap --repo /tmp/example/clean-clone --task-id bootstrap
-```
-
-Without opt-in, future targets retain the `canonical-cutover-not-activated` gate.
-The normal active-repository integration path remains unchanged.
-
-Two periodic timers have separate responsibilities: `github-autosync.timer` synchronizes/audits repositories, while `repo-integrator.timer` owns the queued PR integration path.
-
-The integrator also performs bounded hourly terminal-aware Git maintenance using
-existing task records. Historical C3-linked worktrees are frozen and preserved.
-Only unchanged, clean managed project worktrees and tips proved contained
-in fetched canonical are removed; remote deletion is compare-and-delete fenced.
-Dirty, conflicted, active, referenced, unknown or unintegrated work is preserved.
-Scans rotate so preserved tasks cannot starve later candidates. Git object maintenance
-uses normal grace periods, never immediate pruning. No extra service or timer is used.
+Historical private-bootstrap procedures previously depended on GitHub
+Actions checks and PRs. They are **retired**, not executable as the current
+workflow. No Actions runner or GitHub PR integrator may be re-enabled.
 
 ### Project backlog and integration
 
 Project GitHub Issues (or the project's Git backlog) own pending work. Local
-task-state is created only when a task starts. C3 is a frozen archive: the integrator
-does not read its lifecycle, send terminal callbacks or clean historical C3 workers.
+task-state is created only when a task starts. C3 is a frozen archive: the
+local finish command does not mutate its lifecycle or start C3 workers.
 `start-roadmap` rejects permanently; use ordinary `repo-task start`.
 
 ## Responsibilities
@@ -142,7 +100,7 @@ does not read its lifecycle, send terminal callbacks or clean historical C3 work
 - clone a missing managed repository into its MegaVault canonical worktree when one is registered, otherwise under `/home/daniele/projects/<repo>`;
 - fetch/update a managed repository when its GitHub metadata fingerprint changes;
 - perform a lightweight **local-only audit** even when the remote fingerprint is unchanged, so dirty worktrees and local commits are not hidden by the remote fast path;
-- protect canonical branches with a local reference guard while workers remain branch-isolated and integration is asynchronous;
+- protect canonical branches with a local reference guard and integrate isolated branches on Fedora only after local tests;
 - recover a rejected clean push with one evidence-producing fetch, then retry or rebase-and-push only when the new relation makes that safe;
 - append every successful automatic repository mutation (`clone`, fast-forward `pull`, `push`) to a durable JSONL activity ledger;
 - skip network reconciliation for unchanged, clean, synchronized repositories;
@@ -292,7 +250,7 @@ prevent its own fix from being deployed.
 short Italian summary. `--json` emits the full machine-readable result; an unresolved
 repository returns exit code 2 after the other repositories have been processed.
 
-The canonical checkout is never a worker workspace. Agent changes belong in `repo-task` worktrees. Completed task PRs are serialized asynchronously by `repo-integrator`; pending checks remain queued, canonical advances are rebased automatically on clean task branches, and only real semantic conflicts require repair. C3 remains a frozen archive; no mutation writer is required.
+The canonical checkout is never a worker workspace. Agent changes belong in `repo-task` worktrees. Completed task branches are checked and integrated locally using the per-repository lock; unresolved conflicts remain as preserved task branches. C3 remains a frozen archive; no mutation writer is required.
 
 ## Verification
 
@@ -372,7 +330,7 @@ MegaVault owns the callback's live registry/root/origin authorization. The
 callback is not a new allowlist, executor or lifecycle owner. Existing callers
 without this callback retain their own authorization contract.
 
-The integrator retains hard failure fingerprints in existing task records. Unchanged PR/base/checks and local worktree state do not trigger another integration attempt. A changed input immediately permits reevaluation; no check is treated as passing by this suppression.
+Historical PR failure fingerprints remain readable but are no longer consumed by an automatic PR integrator. Current local tests and canonical Git refs determine the result.
 
 
 ### GitHub credentials from Bitwarden

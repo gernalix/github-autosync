@@ -107,7 +107,7 @@ def install_runtime() -> dict[str, Any]:
 def kick_reconcile() -> dict[str, Any]:
     reset = run(["systemctl", "--user", "reset-failed", "github-autosync.service"], timeout=30)
     enabled = run(
-        ["systemctl", "--user", "enable", "--now", "github-autosync.timer", "repo-integrator.timer"],
+        ["systemctl", "--user", "enable", "--now", "github-autosync.timer"],
         timeout=60,
     )
     started = run(

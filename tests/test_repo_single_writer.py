@@ -467,91 +467,180 @@ class SingleWriterTests(unittest.TestCase):
                 self.assertEqual("merged", waited["status"])
                 self.assertTrue(waited["no_op"])
 
-    def test_finish_task_pushes_branch_and_queues_pr(self) -> None:
+    def test_finish_integrates_on_fedora_without_pr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            repo, _ = self.make_repo(root / "git")
-            state = root / "state"
-            worktrees = root / "worktrees"
-            original_run = writer.run
-            pr_lists = 0
+            repo, bare = self.make_repo(root / "git")
+            with (mock.patch.object(writer, "STATE_ROOT", root / "state"),
+                  mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees")):
+                payload = writer.start_task(repo, "local")
+                (Path(payload["worktree"]) / "feature.txt").write_text("feature\n")
+                original_run = writer.run
 
-            def fake_run(cmd: list[str], cwd: Path | None = None, timeout: int = 300):
-                nonlocal pr_lists
-                if cmd and cmd[0] == "git":
+                def no_provider(cmd, cwd=None, timeout=300):
+                    if cmd and cmd[0] == "gh":
+                        raise AssertionError("GitHub PR/check command forbidden")
                     return original_run(cmd, cwd, timeout)
-                if cmd[:3] == ["gh", "pr", "list"]:
-                    pr_lists += 1
-                    if pr_lists == 1:
-                        return cp(stdout="[]\n")
-                    return cp(stdout='[{"number":7,"url":"https://example/pr/7"}]\n')
-                if cmd[:3] == ["gh", "pr", "create"]:
-                    return cp(stdout="https://example/pr/7\n")
-                raise AssertionError(cmd)
 
-            with (
-                mock.patch.object(writer, "STATE_ROOT", state),
-                mock.patch.object(writer, "WORKTREE_ROOT", worktrees),
-                mock.patch.object(writer, "run", side_effect=fake_run),
-            ):
-                payload = writer.start_task(repo, "alpha", "chatgpt")
+                with mock.patch.object(writer, "run", side_effect=no_provider):
+                    result = writer.finish_task(
+                        repo, "local", test_commands=[["git", "diff", "--check"]])
+                self.assertEqual("merged", result["status"])
+                self.assertEqual("local-fast-forward", result["integration"])
+                self.assertEqual("feature\n", git(["show", "main:feature.txt"], bare).stdout)
+                self.assertEqual(result["merge_sha"], git(["rev-parse", "main"], bare).stdout.strip())
+                self.assertEqual(0, result["local_tests"][0]["exit_code"])
+                self.assertNotIn("pr_number", result)
+
+    def test_finish_requires_real_local_tests_and_preserves_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, bare = self.make_repo(root / "git")
+            base = git(["rev-parse", "main"], bare).stdout.strip()
+            with (mock.patch.object(writer, "STATE_ROOT", root / "state"),
+                  mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees")):
+                payload = writer.start_task(repo, "untested")
+                (Path(payload["worktree"]) / "feature.txt").write_text("unverified\n")
+                result = writer.finish_task(repo, "untested")
+                self.assertEqual("blocked", result["status"])
+                self.assertEqual("local-test-command-required", result["integration_reason"])
+                self.assertEqual(base, git(["rev-parse", "main"], bare).stdout.strip())
+                self.assertEqual(
+                    result["head_sha"],
+                    git(["rev-parse", "refs/heads/task/untested"], bare).stdout.strip())
+
+    def test_failing_local_test_preserves_branch_not_canonical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, bare = self.make_repo(root / "git")
+            before = git(["rev-parse", "main"], bare).stdout.strip()
+            with (mock.patch.object(writer, "STATE_ROOT", root / "state"),
+                  mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees")):
+                payload = writer.start_task(repo, "fail")
+                (Path(payload["worktree"]) / "feature.txt").write_text("failed\n")
+                result = writer.finish_task(
+                    repo, "fail", test_commands=[["python3", "-c", "import sys;sys.exit(7)"]])
+                self.assertEqual("blocked", result["status"])
+                self.assertEqual("local-test-failed", result["integration_reason"])
+                self.assertEqual(7, result["local_tests"][0]["exit_code"])
+                self.assertEqual(before, git(["rev-parse", "main"], bare).stdout.strip())
+                self.assertTrue(git(["rev-parse", "refs/heads/task/fail"], bare).returncode == 0)
+
+    def test_divergent_task_is_merged_and_tested_against_latest_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, bare = self.make_repo(root / "git")
+            with (mock.patch.object(writer, "STATE_ROOT", root / "state"),
+                  mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees")):
+                payload = writer.start_task(repo, "diverged")
+                (Path(payload["worktree"]) / "feature.txt").write_text("task\n")
+                advance = root / "advance"
+                self.assertEqual(0, git(["clone", str(bare), str(advance)]).returncode)
+                self.assertEqual(0, git(["config", "user.name", "Test"], advance).returncode)
+                self.assertEqual(0, git(["config", "user.email", "test@example.invalid"], advance).returncode)
+                (advance / "upstream.txt").write_text("base\n")
+                self.assertEqual(0, git(["add", "."], advance).returncode)
+                self.assertEqual(0, git(["commit", "-m", "base advances"], advance).returncode)
+                self.assertEqual(0, git(["push", "origin", "main"], advance).returncode)
+                check = ["python3", "-c",
+                         "from pathlib import Path; assert Path('feature.txt').exists() and Path('upstream.txt').exists()"]
+                result = writer.finish_task(repo, "diverged", test_commands=[check])
+                self.assertEqual("merged", result["status"])
+                self.assertEqual("local-merge", result["integration"])
+                self.assertEqual("task\n", git(["show", "main:feature.txt"], bare).stdout)
+                self.assertEqual("base\n", git(["show", "main:upstream.txt"], bare).stdout)
+                self.assertEqual(2, len(git(["rev-list", "--parents", "-n", "1", "main"], bare).stdout.split()) - 1)
+
+    def test_catalog_pending_is_recovered_without_duplicate_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, bare = self.make_repo(root / "git")
+            with (mock.patch.object(writer, "STATE_ROOT", root / "state"),
+                  mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees")):
+                payload = writer.start_task(repo, "catalog")
+                (Path(payload["worktree"]) / "feature.txt").write_text("feature\n")
+                def prepare(worktree, repo_name, head):
+                    return {"status": "ready", "worktree": str(worktree),
+                            "source_commit": head, "repo": repo_name, "events": 0}
+                with (mock.patch.object(writer.command_catalog_bridge, "prepare", side_effect=prepare),
+                      mock.patch.object(writer.command_catalog_bridge, "publish",
+                                        side_effect=[{"status": "pending"}, {"status": "pass"}]) as publish):
+                    first = writer.finish_task(repo, "catalog", test_commands=[["git", "diff", "--check"]])
+                    self.assertEqual("catalog-pending", first["status"])
+                    integrated = git(["rev-parse", "main"], bare).stdout.strip()
+                    self.assertEqual(first["merge_sha"], integrated)
+                    self.assertTrue(Path(first["catalog_prepared"]["worktree"]).is_dir())
+                    second = writer.finish_task(repo, "catalog")
+                    self.assertEqual("merged", second["status"])
+                    self.assertEqual(integrated, git(["rev-parse", "main"], bare).stdout.strip())
+                    self.assertEqual(2, publish.call_count)
+
+    def test_concurrent_remote_update_blocks_without_overwriting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, bare = self.make_repo(root / "git")
+            with (mock.patch.object(writer, "STATE_ROOT", root / "state"),
+                  mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees")):
+                payload = writer.start_task(repo, "race")
+                (Path(payload["worktree"]) / "feature.txt").write_text("feature\n")
+                advance = root / "other"
+                self.assertEqual(0, git(["clone", str(bare), str(advance)]).returncode)
+                self.assertEqual(0, git(["config", "user.name", "Test"], advance).returncode)
+                self.assertEqual(0, git(["config", "user.email", "test@example.invalid"], advance).returncode)
+                def advance_remote(*_args):
+                    (advance / "remote.txt").write_text("changed\n")
+                    self.assertEqual(0, git(["add", "."], advance).returncode)
+                    self.assertEqual(0, git(["commit", "-m", "remote change"], advance).returncode)
+                    self.assertEqual(0, git(["push", "origin", "main"], advance).returncode)
+                    return {"status": "not-applicable"}
+                with mock.patch.object(writer.command_catalog_bridge, "prepare", side_effect=advance_remote):
+                    result = writer.finish_task(repo, "race", test_commands=[["git", "diff", "--check"]])
+                self.assertEqual("blocked", result["status"])
+                self.assertEqual("integration-input-advanced", result["integration_reason"])
+                self.assertEqual("changed\n", git(["show", "main:remote.txt"], bare).stdout)
+                self.assertEqual("", git(["ls-tree", "-r", "--name-only", "main", "feature.txt"], bare).stdout)
+                self.assertEqual(0, git(["rev-parse", "refs/heads/task/race"], bare).returncode)
+
+    def test_conflicting_edits_keep_both_histories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, bare = self.make_repo(root / "git")
+            with (mock.patch.object(writer, "STATE_ROOT", root / "state"),
+                  mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees")):
+                payload = writer.start_task(repo, "conflict")
+                (Path(payload["worktree"]) / "base.txt").write_text("task change\n")
+                advance = root / "upstream"
+                self.assertEqual(0, git(["clone", str(bare), str(advance)]).returncode)
+                self.assertEqual(0, git(["config", "user.name", "Test"], advance).returncode)
+                self.assertEqual(0, git(["config", "user.email", "test@example.invalid"], advance).returncode)
+                (advance / "base.txt").write_text("upstream change\n")
+                self.assertEqual(0, git(["add", "."], advance).returncode)
+                self.assertEqual(0, git(["commit", "-m", "upstream edit"], advance).returncode)
+                self.assertEqual(0, git(["push", "origin", "main"], advance).returncode)
+                result = writer.finish_task(repo, "conflict", test_commands=[["git", "diff", "--check"]])
+                self.assertEqual("blocked", result["status"])
+                self.assertEqual("local-merge-conflict", result["integration_reason"])
+                self.assertEqual("upstream change\n", git(["show", "main:base.txt"], bare).stdout)
+                self.assertEqual("task change\n", git(["show", "refs/heads/task/conflict:base.txt"], bare).stdout)
+
+    def test_legacy_queued_task_is_not_submitted_as_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, bare = self.make_repo(root / "git")
+            with (mock.patch.object(writer, "STATE_ROOT", root / "state"),
+                  mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees")):
+                payload = writer.start_task(repo, "legacy")
                 task = Path(payload["worktree"])
-                (task / "feature.txt").write_text("feature\n", encoding="utf-8")
-                ready = writer.finish_task(repo, "alpha")
-                self.assertEqual("queued", ready["status"])
-                self.assertEqual(7, ready["pr_number"])
-                self.assertEqual(0, git(["show-ref", "--verify", "--quiet", "refs/remotes/origin/task/alpha"], task).returncode)
-
-    def test_queued_followup_preserves_pr_and_rejects_unsafe_changes(self):
-        for scenario in ("append", "dirty", "closed", "remote-drift", "rewritten"):
-            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                repo, bare = self.make_repo(root / "git")
-                with (mock.patch.object(writer, "STATE_ROOT", root / "state"),
-                      mock.patch.object(writer, "WORKTREE_ROOT", root / "worktrees")):
-                    payload = writer.start_task(repo, "followup")
-                    task = Path(payload["worktree"])
-                    (task / "feature.txt").write_text("first\n")
-                    self.assertEqual(git(["add", "feature.txt"], task).returncode, 0)
-                    self.assertEqual(git(["commit", "-m", "first"], task).returncode, 0)
-                    original = git(["rev-parse", "HEAD"], task).stdout.strip()
-                    self.assertEqual(git(["push", "origin", "HEAD:refs/heads/" + payload["branch"]], task).returncode, 0)
-                    payload.update(status="queued", head_sha=original, pr_number=7,
-                                   integration_retry={"reason": "checks-failed"})
-                    record = writer._task_record(repo, "followup")
-                    writer._atomic_json(record, payload)
-                    if scenario == "rewritten":
-                        # A sibling commit is not a permitted append.
-                        self.assertEqual(git(["checkout", "--detach", "HEAD^"], task).returncode, 0)
-                        self.assertEqual(git(["branch", "-f", payload["branch"], "HEAD"], task).returncode, 0)
-                        self.assertEqual(git(["checkout", payload["branch"]], task).returncode, 0)
-                    (task / "feature.txt").write_text("followup\n")
-                    if scenario != "dirty":
-                        self.assertEqual(git(["add", "feature.txt"], task).returncode, 0)
-                        self.assertEqual(git(["commit", "-m", "followup"], task).returncode, 0)
-                    expected = git(["rev-parse", "HEAD"], task).stdout.strip()
-                    original_run = writer.run
-                    def fake(cmd, cwd=None, timeout=300):
-                        if cmd[0] != "gh":
-                            return original_run(cmd, cwd, timeout)
-                        self.assertEqual(cmd[:3], ["gh", "pr", "view"])
-                        remote = git(["rev-parse", "refs/heads/" + payload["branch"]], bare).stdout.strip()
-                        return cp(stdout=json.dumps({"state": "CLOSED" if scenario == "closed" else "OPEN",
-                            "headRefName": payload["branch"], "baseRefName": "main",
-                            "headRefOid": "f" * 40 if scenario == "remote-drift" else remote}))
-                    with mock.patch.object(writer, "run", side_effect=fake):
-                        if scenario == "append":
-                            updated = writer.finish_task(repo, "followup")
-                            self.assertEqual(updated["head_sha"], expected)
-                            self.assertEqual(updated["pr_number"], 7)
-                            self.assertNotIn("integration_retry", updated)
-                            self.assertEqual(writer.finish_task(repo, "followup"), updated)
-                        else:
-                            with self.assertRaises(RuntimeError):
-                                writer.finish_task(repo, "followup")
-                            self.assertEqual(json.loads(record.read_text())["head_sha"], original)
-                            self.assertEqual(git(["rev-parse", "refs/heads/" + payload["branch"]], bare).stdout.strip(), original)
-                    self.assertEqual(git(["show", "main:base.txt"], bare).stdout, "base\n")
+                (task / "feature.txt").write_text("first\n")
+                payload["status"] = "queued"
+                payload["pr_number"] = 22
+                writer._atomic_json(writer._task_record(repo, "legacy"), payload)
+                result = writer.finish_task(repo, "legacy")
+                self.assertEqual("blocked", result["status"])
+                self.assertEqual("local-test-command-required", result["integration_reason"])
+                self.assertEqual("base\n", git(["show", "main:base.txt"], bare).stdout)
+                self.assertEqual("", git(["ls-tree", "-r", "--name-only", "main", "--", "feature.txt"], bare).stdout)
+                self.assertEqual(22, result["pr_number"])
 
     def test_start_task_ignores_dirty_canonical_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

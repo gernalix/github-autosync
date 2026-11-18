@@ -1581,7 +1581,17 @@ def register_in_megavault(
     require_ok(validation, "megavault_validate_failed")
     if created:
         try:
-            ready = repo_single_writer.finish_task(megavault, task_id)
+            # The canonical seed is a test fixture, never the live registry.
+            local_validation = (
+                "from shutil import copyfile; from subprocess import check_call; "
+                "copyfile('tests/fixtures/megavault_seed.sqlite','megavault.sqlite'); "
+                "check_call(['python3','-B','megavault.py','migrate']); "
+                "check_call(['python3','-B','megavault.py','validate'])"
+            )
+            ready = repo_single_writer.finish_task(
+                megavault, task_id,
+                test_commands=[["python3", "-B", "-c", local_validation]],
+            )
         except Exception as exc:
             return {
                 "already_registered": already,
@@ -1589,14 +1599,13 @@ def register_in_megavault(
                 "deferred": deferred,
                 "validation": f"deferred_writer_finish:{type(exc).__name__}",
             }
-        return {
-            "already_registered": already,
-            "newly_registered": created,
-            "deferred": deferred,
-            "validation": "queued_single_writer",
-            "commit_changed": "False",
-            "pr": str(ready.get("pr_number") or ""),
-        }
+        if ready.get("status") != "merged":
+            return {"already_registered": already, "newly_registered": created,
+                    "deferred": deferred, "validation": "deferred_local_finish:" +
+                    str(ready.get("integration_reason") or ready.get("status"))}
+        return {"already_registered": already, "newly_registered": created,
+                "deferred": deferred, "validation": "integrated_local",
+                "commit_changed": str(bool(ready.get("merge_sha") and not ready.get("no_op")))}
     return {
         "already_registered": already,
         "newly_registered": 0,
@@ -1649,8 +1658,6 @@ def queue_merged_roadmap_completions() -> dict[str, Any]:
 SYSTEMD_RUNTIME_UNITS = (
     "github-autosync.service",
     "github-autosync.timer",
-    "repo-integrator.service",
-    "repo-integrator.timer",
     "github-autosync-watchdog.service",
     "github-autosync-watchdog.timer",
 )
@@ -1673,11 +1680,10 @@ def _systemd_runtime_needs_refresh(target_root: Path | None = None) -> bool:
 
 
 def bootstrap_repo_integrator_runtime() -> None:
-    """Keep the Fedora user-systemd runtime aligned with the canonical checkout."""
+    """Keep the remaining Fedora timers aligned; the PR integrator is retired."""
     if Path.home() != Path("/home/daniele"):
         return
-    probe = run(["systemctl", "--user", "is-enabled", "repo-integrator.timer"], timeout=30)
-    if probe.returncode == 0 and not _systemd_runtime_needs_refresh():
+    if not _systemd_runtime_needs_refresh():
         return
     installer = Path(__file__).resolve().with_name("install_systemd.py")
     if not installer.is_file():
@@ -1712,7 +1718,7 @@ def command_run(args: argparse.Namespace) -> int:
     roadmap_finalization: dict[str, Any] = {"queued": 0, "deferred": 0, "prompt_ids": [], "failed": []}
     try:
         with ExclusiveLock(state_dir / "autosync.lock"):
-            # Repository integration is owned by repo-integrator.service.
+            # Task branches are integrated by repo-task finish on Fedora.
             writer = {"found": 0, "merged": 0, "deferred": 0, "results": []}
             raw_inventory = megavault_inventory(megavault)
             inventory = raw_inventory if full_reconcile else filter_allowed_inventory(raw_inventory)

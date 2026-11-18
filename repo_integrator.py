@@ -27,16 +27,10 @@ class IntegratorLock:
             self.handle.close()
 
 def run_once(owner: str) -> dict[str, Any]:
-    queue = repo_single_writer.process_ready_prs(owner)
-    roadmap = autosync_core.queue_merged_roadmap_completions()
-    garbage_collection = repo_gc.periodic()
-    transient = {"draft","checks-pending","mergeable-unknown","branch-refreshed","queue-behind-earlier","pr-read-failed"}
-    hard = [
-        {"repo": i.get("repo"), "number": i.get("number"), "reason": i.get("reason")}
-        for i in queue.get("results", [])
-        if i.get("status") == "deferred" and str(i.get("reason") or "deferred") not in transient
-    ]
-    return {"status": "partial" if hard else "ok", "queue": queue, "roadmap_finalization": roadmap, "hard_blockers": hard, "garbage_collection": garbage_collection}
+    """Retired PR integrator: no API reads, merges, or automatic retries."""
+    return {"status": "retired", "queue": {"found": 0, "merged": 0, "deferred": 0},
+            "reason": "GitHub PR integration disabled; use repo-task finish on Fedora"}
+
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Integrate independent queued task PRs serially per repository.")

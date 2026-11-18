@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Parallel worker branches with one asynchronous per-repository integrator.
+"""Isolated task branches with a single local writer and local verification.
 
-Workers never update the canonical branch directly. They work on task/* branches
-in dedicated worktrees, push a queued pull request, and finish without waiting
-for CI or merge. A separate repo-integrator service serializes only the final
-canonical integration step for each repository.
+Task integration is performed directly on Fedora, without pull requests or
+GitHub Actions. Historical PR helpers remain for read-only recovery only.
 """
 from __future__ import annotations
 
@@ -19,6 +17,7 @@ from contextlib import closing
 import re
 import sqlite3
 import subprocess
+import tempfile
 from github_credentials import prepare_process
 import sys
 from typing import Any
@@ -233,7 +232,7 @@ try:
         auth = json.load(handle)
 except Exception:
     print(f"BLOCKED: {{CANONICAL_REF}} is single-writer protected.", file=sys.stderr)
-    print("Use repo-task start/finish; repo-integrator integrates queued tasks.", file=sys.stderr)
+    print("Use repo-task finish with locally verified tests.", file=sys.stderr)
     raise SystemExit(1)
 
 allowed = (str(auth.get("old")), str(auth.get("new")), str(auth.get("ref")))
@@ -881,11 +880,14 @@ def _checkpoint_task(worktree: Path, task_id: str, *, scope_guard=None) -> None:
         raise RuntimeError("staged diff check failed")
 
 
-def finish_task(repo: Path, task_id: str, *, scope_guard=None) -> dict[str, Any]:
+def finish_task(
+    repo: Path, task_id: str, *, test_commands: list[list[str]] | None = None,
+    scope_guard=None,
+) -> dict[str, Any]:
     with RepoLock(_repo_slug(repo)):
         if scope_guard is not None:
             scope_guard(repo, _repo_slug(repo))
-        return _finish_task_unlocked(repo, task_id, scope_guard=scope_guard)
+        return _finish_task_unlocked(repo, task_id, test_commands=test_commands, scope_guard=scope_guard)
 
 
 def _publish_queued_followup(repo, record_path, payload, *, scope_guard=None):
@@ -932,114 +934,254 @@ def _publish_queued_followup(repo, record_path, payload, *, scope_guard=None):
     return payload
 
 
-def _finish_task_unlocked(repo: Path, task_id: str, *, scope_guard=None) -> dict[str, Any]:
+def _finish_task_unlocked(
+    repo: Path, task_id: str, *, test_commands: list[list[str]] | None = None,
+    scope_guard=None,
+) -> dict[str, Any]:
+    """Validate and integrate a task locally under its per-repository writer lock.
+
+    A source-branch push is a durable checkpoint, never evidence of integration.
+    The candidate is tested in an isolated worktree *after* rebasing/merging the
+    current remote canonical tip. No PR, Actions check, or remote merge API is used.
+    """
     repo = repo.expanduser().resolve()
     task_id = _safe_task_id(task_id)
     record_path = _task_record(repo, task_id)
-    if not record_path.exists():
+    if not record_path.is_file():
         raise RuntimeError(f"unknown task: {task_id}")
     payload = json.loads(record_path.read_text(encoding="utf-8"))
-    if payload.get("status") in {"queued", "ready"}:
-        return _publish_queued_followup(repo, record_path, payload, scope_guard=scope_guard)
     if payload.get("status") == "merged":
         return payload
-    if payload.get("status") not in {"active", "blocked"}:
+    if payload.get("status") not in {"active", "blocked", "queued", "ready", "catalog-pending"}:
         raise RuntimeError(f"task is not finishable: {payload.get('status')}")
-    worktree = Path(payload["worktree"])
-    if scope_guard is not None: scope_guard(repo, str(payload["repo"]))
-    if scope_guard is None:
-        _checkpoint_task(worktree, task_id)
-    else:
-        _checkpoint_task(worktree, task_id, scope_guard=scope_guard)
-    branch = str(payload["branch"])
-
+    if Path(str(payload.get("repo_path") or "")).resolve() != repo:
+        raise RuntimeError("task repository identity changed")
+    slug = _repo_slug(repo)
+    if payload.get("repo") != slug:
+        raise RuntimeError("task remote identity changed")
     canonical = str(payload["canonical_branch"])
-    if scope_guard is not None: scope_guard(repo, str(payload["repo"]))
-    fetched = _git(
-        worktree,
-        "fetch",
-        "--no-tags",
-        "origin",
-        f"+refs/heads/{canonical}:refs/remotes/origin/{canonical}",
-        timeout=180,
-    )
-    if fetched.returncode:
-        raise RuntimeError(fetched.stderr.strip() or "canonical fetch failed")
-    head = _ok(worktree, "rev-parse", "HEAD")
-    canonical_head = _ok(worktree, "rev-parse", f"refs/remotes/origin/{canonical}")
-    if head == canonical_head:
-        _cleanup_task_after_merge_unlocked(
-            str(payload["repo"]),
-            branch,
-            merge_sha=head,
-            **({"scope_guard":scope_guard} if scope_guard is not None else {}),
-        )
-        final = json.loads(record_path.read_text(encoding="utf-8"))
-        final["integration"] = "no-op"
-        if scope_guard is not None: scope_guard(repo, str(payload["repo"]))
-        _atomic_json(record_path, final)
-        return final
+    branch = str(payload["branch"])
+    if branch != TASK_PREFIX + task_id or branch == canonical:
+        raise RuntimeError("task branch identity changed")
+    task = Path(str(payload["worktree"])).resolve()
+    if not task.is_dir() or _git_common_dir(task) != _git_common_dir(repo):
+        raise RuntimeError("task worktree missing or unrelated")
+    if _ok(task, "branch", "--show-current") != branch or _operation_in_progress(task):
+        raise RuntimeError("task worktree branch or Git state changed")
+    if _ok(repo, "branch", "--show-current") != canonical or _operation_in_progress(repo):
+        raise RuntimeError("canonical checkout is not on its expected branch")
+    if _ok(repo, "status", "--porcelain", "--untracked-files=all"):
+        raise RuntimeError("canonical checkout has uncommitted work; preserving it")
+    if test_commands is not None and (
+        not isinstance(test_commands, list)
+        or any(not isinstance(cmd, list) or not cmd or
+               any(not isinstance(arg, str) or not arg for arg in cmd)
+               for cmd in test_commands)
+    ):
+        raise ValueError("test commands must be nonempty JSON argv arrays")
+    def guard() -> None:
+        if scope_guard is not None:
+            scope_guard(repo, slug)
+    def blocked(reason: str, **extra: Any) -> dict[str, Any]:
+        payload.update(status="blocked", integration_state="blocked",
+                       integration_reason=reason, integration_observed_at=_iso_now(), **extra)
+        guard()
+        _atomic_json(record_path, payload)
+        return payload
 
-    if scope_guard is not None: scope_guard(repo, str(payload["repo"]))
-    push = _git(worktree, "push", "-u", "origin", branch, timeout=300)
-    if push.returncode:
-        raise RuntimeError(push.stderr.strip() or "task branch push failed")
-
-    title = f"{PR_PREFIX} {task_id}"
-    existing = run(
-        ["gh", "pr", "list", "--repo", payload["repo"], "--head", branch, "--state", "open", "--json", "number,url,title"],
-        timeout=120,
-    )
-    pr_number = None
-    pr_url = None
-    if existing.returncode == 0:
+    # A completed Git merge may still have an unconfirmed local command
+    # catalog publication. Never report it as already-integrated by mistake.
+    if payload.get("catalog_prepared") and payload.get("candidate_sha"):
+        candidate = str(payload["candidate_sha"])
+        if (_ok(task, "rev-parse", "HEAD") != payload.get("head_sha") or
+            _ok(task, "status", "--porcelain", "--untracked-files=all")):
+            return blocked("catalog-source-changed")
+        remote = _ok(repo, "ls-remote", "origin", f"refs/heads/{canonical}", timeout=45)
+        if not remote:
+            return blocked("catalog-remote-unavailable")
+        fetched = _git(repo, "fetch", "--no-tags", "origin",
+                       f"refs/heads/{canonical}:refs/remotes/origin/{canonical}")
+        if fetched.returncode or _git(repo, "merge-base", "--is-ancestor",
+                                    candidate, remote.split()[0]).returncode:
+            return blocked("catalog-merge-unverified")
         try:
-            rows = json.loads(existing.stdout)
-            if rows:
-                pr_number = int(rows[0]["number"])
-                pr_url = str(rows[0].get("url") or "")
+            receipt = command_catalog_bridge.publish(payload["catalog_prepared"])
         except Exception:
-            pass
-    if pr_number is None:
-        if scope_guard is not None: scope_guard(repo, str(payload["repo"]))
-        created = run(
-            [
-                "gh", "pr", "create", "--repo", payload["repo"],
-                "--base", str(payload["canonical_branch"]),
-                "--head", branch,
-                "--title", title,
-                "--body", "Queued for the asynchronous per-repository integrator. Worker work is complete; no user action is required while checks are pending.",
-            ],
-            timeout=180,
-        )
-        if created.returncode:
-            raise RuntimeError(created.stderr.strip() or created.stdout.strip() or "PR creation failed")
-        pr_url = created.stdout.strip()
-        lookup = run(
-            ["gh", "pr", "list", "--repo", payload["repo"], "--head", branch, "--state", "open", "--json", "number,url"],
-            timeout=120,
-        )
-        if lookup.returncode == 0:
-            rows = json.loads(lookup.stdout)
-            if rows:
-                pr_number = int(rows[0]["number"])
-                pr_url = str(rows[0].get("url") or pr_url)
-    payload.update({
-        "status": "queued",
-        "queued_at": _iso_now(),
-        "ready_at": _iso_now(),
-        "lease_expires_at": None,
-        "base_sha": canonical_head,
-        "head_sha": head,
-        "pr_number": pr_number,
-        "pr_url": pr_url,
-        "integration_state": "queued",
-        "integration_reason": None,
-        "integration_observed_at": _iso_now(),
-    })
-    if scope_guard is not None: scope_guard(repo, str(payload["repo"]))
-    _atomic_json(record_path, payload)
-    return payload
+            receipt = {"status": "pending", "reason": "catalog-publication-error"}
+        payload["catalog"] = receipt
+        if receipt.get("status") not in {"pass", "not-applicable"}:
+            payload.update(status="catalog-pending", integration_reason="local-catalog-pending")
+            guard()
+            _atomic_json(record_path, payload)
+            return payload
+        staging = Path(str(payload["catalog_prepared"].get("worktree") or ""))
+        if staging.is_dir() and staging != task and _git_common_dir(staging) == _git_common_dir(repo):
+            if not _ok(staging, "status", "--porcelain", "--untracked-files=all"):
+                _git(repo, "worktree", "remove", str(staging), timeout=120)
+        _cleanup_task_after_merge_unlocked(slug, branch,
+                                           expected_head=str(payload["head_sha"]),
+                                           merge_sha=candidate, scope_guard=scope_guard)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record.update(integration=payload.get("integration"),
+                      catalog=receipt, local_tests=payload.get("local_tests", []))
+        record.pop("catalog_prepared", None)
+        guard()
+        _atomic_json(record_path, record)
+        return record
+
+    guard()
+    _checkpoint_task(task, task_id, scope_guard=scope_guard)
+    head = _ok(task, "rev-parse", "HEAD")
+    if _ok(task, "status", "--porcelain", "--untracked-files=all"):
+        return blocked("task-not-clean", head_sha=head)
+    # Publish the complete task history before attempting integration.
+    guard()
+    push = _git(task, "push", "-u", "origin", f"HEAD:refs/heads/{branch}", timeout=180)
+    if push.returncode:
+        return blocked("task-push-failed", head_sha=head)
+    remote_task = _ok(task, "ls-remote", "origin", f"refs/heads/{branch}", timeout=45)
+    if not remote_task or remote_task.split()[0] != head:
+        return blocked("task-remote-checkpoint-mismatch", head_sha=head)
+    guard()
+    fetch = _git(repo, "fetch", "--no-tags", "origin",
+                 f"refs/heads/{canonical}:refs/remotes/origin/{canonical}", timeout=180)
+    if fetch.returncode:
+        return blocked("canonical-fetch-failed", head_sha=head)
+    base = _ok(repo, "rev-parse", f"refs/remotes/origin/{canonical}")
+    if _ok(repo, "ls-remote", "origin", f"refs/heads/{canonical}", timeout=45).split()[0] != base:
+        return blocked("canonical-remote-advanced", head_sha=head)
+    current = _ok(repo, "rev-parse", f"refs/heads/{canonical}")
+    if current != base:
+        # Never rewrite an independently advanced local canonical checkout.
+        if _git(repo, "merge-base", "--is-ancestor", current, base).returncode:
+            return blocked("canonical-local-diverged", head_sha=head)
+        guard()
+        update = _git(repo, "merge", "--ff-only", base, timeout=120)
+        if update.returncode:
+            return blocked("canonical-local-sync-failed", head_sha=head)
+    if _git(repo, "merge-base", "--is-ancestor", head, base).returncode == 0:
+        result = _cleanup_task_after_merge_unlocked(slug, branch, expected_head=head,
+                                                    merge_sha=base, scope_guard=scope_guard)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record.update(integration="no-op" if head == base else "already-integrated", no_op=True)
+        guard()
+        _atomic_json(record_path, record)
+        return record
+
+    if not test_commands:
+        return blocked("local-test-command-required", head_sha=head, base_sha=base)
+    # Fast-forward when possible; otherwise construct a two-parent merge
+    # without moving the protected canonical ref or touching existing worktrees.
+    if _git(repo, "merge-base", "--is-ancestor", base, head).returncode == 0:
+        candidate = head
+        integration = "local-fast-forward"
+    else:
+        merged = _git(repo, "merge-tree", "--write-tree", base, head, timeout=120)
+        if merged.returncode or not merged.stdout.splitlines():
+            return blocked("local-merge-conflict", head_sha=head, base_sha=base)
+        tree = merged.stdout.splitlines()[0].strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", tree):
+            return blocked("local-merge-tree-invalid", head_sha=head, base_sha=base)
+        candidate = _ok(repo, "commit-tree", tree, "-p", base, "-p", head,
+                        "-m", f"Integrate {branch} (locally verified)")
+        integration = "local-merge"
+    test_root = WORKTREE_ROOT / re.sub(r"[^A-Za-z0-9._-]+", "_", slug)
+    test_root.mkdir(parents=True, exist_ok=True)
+    test_dir = Path(tempfile.mkdtemp(prefix=task_id + "-test-", dir=test_root))
+    attached = False
+    finished = False
+    keep_candidate = False
+    try:
+        guard()
+        add = _git(repo, "worktree", "add", "--detach", str(test_dir), candidate, timeout=120)
+        if add.returncode:
+            return blocked("local-test-worktree-unavailable", head_sha=head)
+        attached = True
+        results = []
+        for index, argv in enumerate(test_commands, 1):
+            try:
+                check = run(argv, cwd=test_dir, timeout=300)
+                code = check.returncode
+            except subprocess.TimeoutExpired:
+                code = 124
+            # Do not persist full argv or logs (potential secrets).
+            results.append({"index": index, "program": Path(argv[0]).name,
+                            "argv_sha256": hashlib.sha256(json.dumps(argv).encode()).hexdigest(),
+                            "exit_code": code})
+            if code:
+                return blocked("local-test-failed", head_sha=head, base_sha=base,
+                               candidate_sha=candidate, local_tests=results)
+        if (_ok(test_dir, "status", "--porcelain", "--untracked-files=all")
+                or _git(repo, "diff", "--check", base, candidate).returncode):
+            return blocked("local-test-tree-not-clean", head_sha=head, candidate_sha=candidate,
+                           local_tests=results)
+        catalog = command_catalog_bridge.prepare(test_dir, slug, head)
+        if catalog.get("status") not in {"ready", "not-applicable"}:
+            return blocked("local-catalog-preparation-failed", head_sha=head,
+                           candidate_sha=candidate, local_tests=results)
+        # Recheck every input immediately before the sole canonical update.
+        if (_ok(repo, "rev-parse", f"refs/heads/{canonical}") != base or
+            _ok(repo, "branch", "--show-current") != canonical or
+            _ok(repo, "status", "--porcelain", "--untracked-files=all") or
+            _ok(task, "rev-parse", "HEAD") != head or
+            _ok(repo, "ls-remote", "origin", f"refs/heads/{canonical}", timeout=45).split()[0] != base or
+            _ok(task, "ls-remote", "origin", f"refs/heads/{branch}", timeout=45).split()[0] != head):
+            return blocked("integration-input-advanced", head_sha=head, base_sha=base,
+                           local_tests=results)
+        guard()
+        auth = authorize_ref_update(repo, base, candidate, canonical)
+        try:
+            ff = _git(repo, "merge", "--ff-only", candidate, timeout=120)
+        finally:
+            auth.unlink(missing_ok=True)
+        if ff.returncode:
+            return blocked("authorized-local-merge-failed", head_sha=head,
+                           candidate_sha=candidate, local_tests=results)
+        guard()
+        publish = _git(repo, "push", "origin", f"refs/heads/{canonical}:refs/heads/{canonical}",
+                       timeout=180)
+        if publish.returncode or _ok(repo, "ls-remote", "origin",
+                                    f"refs/heads/{canonical}", timeout=45).split()[0] != candidate:
+            return blocked("canonical-push-or-readback-failed", head_sha=head,
+                           candidate_sha=candidate, local_tests=results)
+        catalog["merge_sha"] = candidate
+        payload.update(status="catalog-pending", integration_reason="local-catalog-pending",
+                       head_sha=head, base_sha=base, merge_sha=candidate, candidate_sha=candidate,
+                       local_tests=results, integration=integration, catalog_prepared=catalog)
+        keep_candidate = True
+        guard()
+        _atomic_json(record_path, payload)
+        try:
+            receipt = command_catalog_bridge.publish(catalog)
+        except Exception:
+            receipt = {"status": "pending", "reason": "catalog-publication-error"}
+        payload["catalog"] = receipt
+        if receipt.get("status") not in {"pass", "not-applicable"}:
+            guard()
+            _atomic_json(record_path, payload)
+            return payload
+        finished = True
+        keep_candidate = False
+    finally:
+        if not keep_candidate and attached and _git(test_dir, "status", "--porcelain", "--untracked-files=all").stdout.strip() == "":
+            _git(repo, "worktree", "remove", str(test_dir), timeout=120)
+        elif attached and not keep_candidate:
+            payload["local_test_worktree"] = str(test_dir)
+            guard()
+            _atomic_json(record_path, payload)
+        elif not attached:
+            test_dir.rmdir()
+    if finished:
+        _cleanup_task_after_merge_unlocked(slug, branch, expected_head=head,
+                                           merge_sha=candidate, scope_guard=scope_guard)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record.update(integration=integration, local_tests=payload["local_tests"],
+                      base_sha=base, merge_sha=candidate, catalog=payload["catalog"])
+        record.pop("catalog_prepared", None)
+        guard()
+        _atomic_json(record_path, record)
+        return record
+    return blocked("local-integration-incomplete", head_sha=head)
 
 
 def _check_rollup_activity_key(item: dict[str, Any]) -> tuple[str, str] | None:
@@ -1848,12 +1990,13 @@ def mark_roadmap_completion_queued(task_id: str) -> dict[str, Any]:
     return payload
 
 
-def finish_task_any(task_id: str, repo: str | None = None) -> dict[str, Any]:
+def finish_task_any(task_id: str, repo: str | None = None, *,
+                    test_commands: list[list[str]] | None = None) -> dict[str, Any]:
     found = _find_task_record_any(task_id, repo)
     if found is None:
         return {"status": "no-task-record", "task_id": _safe_task_id(task_id)}
     _, payload = found
-    return finish_task(Path(str(payload["repo_path"])), task_id)
+    return finish_task(Path(str(payload["repo_path"])), task_id, test_commands=test_commands)
 
 
 def wait_task_any(task_id: str, *, timeout: float = 900.0, repo: str | None = None) -> dict[str, Any]:
@@ -1883,9 +2026,12 @@ def build_parser() -> argparse.ArgumentParser:
     finish = sub.add_parser("finish")
     finish.add_argument("--repo", type=Path, required=True)
     finish.add_argument("--task-id", required=True)
+    finish.add_argument("--test-command", action="append", default=[],
+                        help="JSON argv array for a local validation; repeat for multiple checks")
     finish_any = sub.add_parser("finish-any")
     finish_any.add_argument("--task-id", required=True)
     finish_any.add_argument("--repo")
+    finish_any.add_argument("--test-command", action="append", default=[])
     status_any = sub.add_parser("status-any")
     status_any.add_argument("--task-id", required=True)
     status_any.add_argument("--repo")
@@ -1947,11 +2093,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             _print_start(payload)
         elif args.command == "finish":
-            payload = finish_task(args.repo, args.task_id)
-            print(payload.get("pr_url") or f"PR #{payload.get('pr_number')}")
+            tests = [json.loads(item) for item in args.test_command]
+            payload = finish_task(args.repo, args.task_id, test_commands=tests)
+            print(json.dumps({"status": payload.get("status"), "integration": payload.get("integration"),
+                              "merge_sha": payload.get("merge_sha"),
+                              "reason": payload.get("integration_reason")}, sort_keys=True))
+            return 0 if payload.get("status") == "merged" else 2
         elif args.command == "finish-any":
-            payload = finish_task_any(args.task_id, args.repo)
+            tests = [json.loads(item) for item in args.test_command]
+            payload = finish_task_any(args.task_id, args.repo, test_commands=tests)
             print(json.dumps(payload, sort_keys=True))
+            return 0 if payload.get("status") in {"merged", "no-task-record"} else 2
         elif args.command == "status-any":
             print(json.dumps(task_status_any(args.task_id, args.repo), sort_keys=True))
         elif args.command == "retire-superseded":
@@ -1989,7 +2141,8 @@ def main(argv: list[str] | None = None) -> int:
             from repo_gc import archive_reviewed_worktree
             print(json.dumps(archive_reviewed_worktree(args.repo,args.review_file),sort_keys=True))
         elif args.command == "process":
-            print(json.dumps(process_ready_prs(args.owner), sort_keys=True))
+            print(json.dumps({"status": "disabled", "reason": "PR queue retired; use local finish"}, sort_keys=True))
+            return 2
         return 0
     except Exception as exc:
         print(f"repo-task: {exc}", file=sys.stderr)

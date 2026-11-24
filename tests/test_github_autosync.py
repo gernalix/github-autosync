@@ -387,7 +387,7 @@ class AutosyncTests(unittest.TestCase):
     def test_runtime_deploy_contract_covers_managed_local_runtimes(self) -> None:
         self.assertIn("gernalix/workflowy-importer", autosync.ALLOWED_REPOSITORIES)
         self.assertIn("gernalix/chrome-codex-switcher", autosync.ALLOWED_REPOSITORIES)
-        self.assertIn("gernalix/PersonalHub", autosync.ALLOWED_REPOSITORIES)
+        self.assertNotIn("gernalix/PersonalHub", autosync.ALLOWED_REPOSITORIES)
         self.assertIn("gernalix/oracle-uptime-kuma", autosync.ALLOWED_REPOSITORIES)
         self.assertIn("gernalix/workflowy-import", autosync.ALLOWED_REPOSITORIES)
         self.assertEqual(
@@ -688,6 +688,48 @@ class AutosyncTests(unittest.TestCase):
             sync.assert_not_called()
             audit.assert_not_called()
 
+
+    def test_fallback_audit_does_not_touch_separately_owned_repositories(self) -> None:
+        remotes = (
+            "git@github.com:gernalix/PersonalHub.git",
+            "https://github.com/gernalix/codex-usage.git",
+            "https://github.com/gernalix/activity-watch-data",
+        )
+        with mock.patch.object(autosync, "_worktree_basics") as probe:
+            for remote in remotes:
+                with self.subTest(remote=remote):
+                    self.assertEqual(
+                        ([], False), autosync.audit_worktree(
+                            {"remote_url": remote}, auto_push=True, report_behind=False,
+                        ),
+                    )
+        probe.assert_not_called()
+
+    def test_full_reconcile_excludes_personalhub_even_if_it_is_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            local = root / "projects" / "PersonalHub"
+            local.mkdir(parents=True)
+            remote = "https://github.com/gernalix/PersonalHub"
+            inventory = {"slug": "PersonalHub", "worktree": str(local), "remote_url": remote}
+            repo = {"name": "PersonalHub", "url": remote, "archived": "0"}
+            args = autosync.build_parser().parse_args([
+                "--projects-dir", str(local.parent), "--state-dir", str(root / "state"),
+                "--megavault", str(root / "mv"), "--no-data-mirror", "reconcile-all",
+            ])
+            with (
+                mock.patch.object(autosync, "megavault_inventory", return_value=[inventory]),
+                mock.patch.object(autosync, "github_repos", return_value=[repo]),
+                mock.patch.object(autosync, "sync_changed_repo") as sync,
+                mock.patch.object(autosync, "git_repo_matches_remote") as probe,
+                mock.patch.object(autosync, "audit_inventory", return_value=([], 0)) as audit,
+                mock.patch.object(autosync, "megavault_registered_remotes", return_value=set()),
+                mock.patch.object(autosync, "register_in_megavault", return_value={"validation": "not_needed"}),
+            ):
+                self.assertEqual(0, autosync.command_run(args))
+            sync.assert_not_called()
+            probe.assert_not_called()
+            self.assertEqual([], audit.call_args.args[0])
 
     def test_reconcile_all_includes_non_allowlisted_repo_already_present_locally(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

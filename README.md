@@ -10,15 +10,14 @@ The service manages **only** these repositories:
 - `gernalix/vm_oracle`
 - `gernalix/MegaVault`
 - `gernalix/fedora-system-monitor`
-- `gernalix/codex-usage`
 - `gernalix/github-autosync`
 - `gernalix/workflowy-importer`
 - `gernalix/chrome-codex-switcher`
-- `gernalix/PersonalHub`
 - `gernalix/codex-usage-monitor`
 - `gernalix/fedora-t7-backup`
 - `gernalix/amici_fb`
 - `gernalix/salute`
+- `gernalix/oracle-uptime-kuma`
 - `gernalix/workflowy-import`
 
 All other current or future GitHub repositories are ignored completely until explicitly added to `ALLOWED_REPOSITORIES`. They are not cloned, fetched, pulled, pushed, audited, registered in MegaVault, or persisted in repo state.
@@ -75,6 +74,8 @@ commits or PRs. It uses a Git lock and an exact authorized canonical update,
 followed by a normal push and remote SHA readback.
 
 Repositories whose canonical branch is intentionally owned by a dedicated local service are excluded from the generic writer. Currently `gernalix/activity-watch-data` is owned by `activity-watch-uploader`, and `gernalix/codex-usage` is owned by the Fedora `codex-usage-publisher`: `github-reconcile` removes only its own generic reference hook (restoring any pre-existing hook) and leaves those checkouts untouched. This prevents the autosync writer from racing or blocking the service that is authoritative for each data repository.
+
+These publisher repositories also stay outside the fallback worktree audit when scoped GitHub discovery omits them. `gernalix/PersonalHub` uses its explicit local workflow and is excluded from both periodic sync and `github-reconcile`.
 
 Optional forms:
 

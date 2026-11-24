@@ -14,6 +14,7 @@ import repo_single_writer
 INDEPENDENT_CANONICAL_WRITER_REPOSITORIES = (
     repo_single_writer.INDEPENDENT_CANONICAL_WRITER_REPOSITORIES
 )
+LOCAL_ONLY_REMOTE = "https://github.com/gernalix/personalhub"
 
 
 ALLOWED_REPOSITORIES = frozenset(
@@ -22,11 +23,9 @@ ALLOWED_REPOSITORIES = frozenset(
         "gernalix/vm_oracle",
         "gernalix/MegaVault",
         "gernalix/fedora-system-monitor",
-        "gernalix/codex-usage",
         "gernalix/github-autosync",
         "gernalix/workflowy-importer",
         "gernalix/chrome-codex-switcher",
-        "gernalix/PersonalHub",
         "gernalix/codex-usage-monitor",
         "gernalix/fedora-t7-backup",
         "gernalix/amici_fb",
@@ -48,6 +47,18 @@ def is_allowed_repo(owner: str, name: str) -> bool:
 def is_independent_canonical_writer_repo(owner: str, name: str) -> bool:
     key = allowed_repo_key(owner, name).lower()
     return any(key == repo.lower() for repo in INDEPENDENT_CANONICAL_WRITER_REPOSITORIES)
+
+
+def is_local_only_remote(url: str) -> bool:
+    return normalize_remote(url) == LOCAL_ONLY_REMOTE
+
+
+def has_separate_writer(url: str) -> bool:
+    normalized = normalize_remote(url)
+    return normalized == LOCAL_ONLY_REMOTE or any(
+        normalized == f"https://github.com/{repo.lower()}"
+        for repo in INDEPENDENT_CANONICAL_WRITER_REPOSITORIES
+    )
 
 
 def github_remote_key(url: str) -> str | None:

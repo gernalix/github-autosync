@@ -31,6 +31,8 @@ from repository_policy import (
     allowed_repo_key,
     is_allowed_repo,
     is_independent_canonical_writer_repo,
+    is_local_only_remote,
+    has_separate_writer,
     github_remote_key,
     filter_allowed_repos,
     filter_allowed_inventory,
@@ -1158,6 +1160,8 @@ def _worktree_basics(
 def audit_worktree(
     entry: dict[str, Any], *, auto_push: bool, report_behind: bool, fetch_remote: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
+    if has_separate_writer(str(entry["remote_url"])):
+        return [], False
     worktree, problems, upstream_name, fetched_remote = _worktree_basics(entry)
     if problems:
         return problems, False
@@ -1379,7 +1383,9 @@ def sync_changed_repo(
     }
     if inventory_entry:
         entry.update(inventory_entry)
-    if is_independent_canonical_writer_repo(str(repo.get("owner") or DEFAULT_OWNER), repo["name"]):
+    if has_separate_writer(repo["url"]) or is_independent_canonical_writer_repo(
+        str(repo.get("owner") or DEFAULT_OWNER), repo["name"]
+    ):
         return "external-writer", None
     if not worktree.exists():
         return clone_repo(repo, projects_dir, dry_run=dry_run, target_worktree=worktree), None
@@ -1720,7 +1726,10 @@ def command_run(args: argparse.Namespace) -> int:
         with ExclusiveLock(state_dir / "autosync.lock"):
             # Task branches are integrated by repo-task finish on Fedora.
             writer = {"found": 0, "merged": 0, "deferred": 0, "results": []}
-            raw_inventory = megavault_inventory(megavault)
+            raw_inventory = [
+                entry for entry in megavault_inventory(megavault)
+                if not is_local_only_remote(str(entry["remote_url"]))
+            ]
             inventory = raw_inventory if full_reconcile else filter_allowed_inventory(raw_inventory)
             try:
                 discovered_repos = github_repos(args.owner)
@@ -1751,7 +1760,10 @@ def command_run(args: argparse.Namespace) -> int:
                 ]
             else:
                 selected = filter_allowed_repos(args.owner, discovered_repos)
-            repos = [{**repo, "owner": args.owner} for repo in selected]
+            repos = [
+                {**repo, "owner": args.owner} for repo in selected
+                if not is_local_only_remote(repo["url"])
+            ]
             inventory_by_remote: dict[str, dict[str, Any]] = {}
             for entry in inventory:
                 key = normalize_remote(str(entry["remote_url"]))

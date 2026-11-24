@@ -6,10 +6,11 @@ from pathlib import Path
 import shlex
 
 REFERENCE = 'FEDORA_GITHUB_ENV'
+REFERENCE_ENV = 'BWS_GITHUB_REFERENCE'
 
 
-def runtime_command() -> list[str]:
-    return [str(Path.home() / '.local/bin/bws-credential'), '--ref', REFERENCE,
+def runtime_command(reference: str = REFERENCE) -> list[str]:
+    return [str(Path.home() / '.local/bin/bws-credential'), '--ref', reference,
             '--var', 'GH_TOKEN=GITHUB_TOKEN', '--']
 
 
@@ -20,15 +21,18 @@ def prepare_process(cmd: list[str], env: dict[str, str] | None = None
     clean = dict(os.environ if env is None else env)
     for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'BWS_ACCESS_TOKEN', 'GH_DEBUG'):
         clean.pop(key, None)
-    return [*runtime_command(), *cmd], clean
+    reference = clean.pop(REFERENCE_ENV, REFERENCE)
+    return [*runtime_command(reference), *cmd], clean
 
 
-def git_credential_helper() -> str:
+def git_credential_helper(reference: str | None = None) -> str:
     # Git supplies the operation argument and private stdin/stdout protocol.
     # This is process-scoped configuration, not a global credential change.
+    if reference is None:
+        reference = os.environ.get(REFERENCE_ENV, REFERENCE)
     command = shlex.join(['/usr/bin/env', '-u', 'GH_TOKEN', '-u', 'GITHUB_TOKEN',
                           '-u', 'BWS_ACCESS_TOKEN', '-u', 'GH_DEBUG',
-                          *runtime_command(), 'gh', 'auth', 'git-credential'])
+                          *runtime_command(reference), 'gh', 'auth', 'git-credential'])
     # Git's quit=true protocol stops other helpers and interactive prompting.
     # https://git-scm.com/docs/gitcredentials#_custom_helpers
     return ('!f() { ' + command + ' "$@" || { '

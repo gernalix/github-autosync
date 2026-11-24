@@ -19,7 +19,7 @@ class GitHubCredentialBoundaryTests(unittest.TestCase):
 import os,pathlib,sys
 assert not any(k in os.environ for k in ['GH_TOKEN','GITHUB_TOKEN','BWS_ACCESS_TOKEN','GH_DEBUG'])
 args=sys.argv[1:]
-assert args[:5]==['--ref','FEDORA_GITHUB_ENV','--var','GH_TOKEN=GITHUB_TOKEN','--']
+assert args[:5]==['--ref',os.environ.get('EXPECTED_REFERENCE','FEDORA_GITHUB_ENV'),'--var','GH_TOKEN=GITHUB_TOKEN','--']
 p=pathlib.Path(__file__).with_name('count');n=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(n))
 cmd=args[5:]
 os.execvpe(cmd[0],cmd,dict(os.environ,GH_TOKEN='inert-'+str(n)))
@@ -40,8 +40,10 @@ if sys.argv[1:]==['auth','git-credential','get']:
  print('username=inert-user\\npassword='+os.environ['GH_TOKEN']+'\\n')
 else:print('accepted-'+str(n))
 ''');self.gh.chmod(0o755)
-        runtime=[str(self.bws),'--ref','FEDORA_GITHUB_ENV','--var','GH_TOKEN=GITHUB_TOKEN','--']
-        p=patch.object(credentials,'runtime_command',return_value=runtime);p.start();self.addCleanup(p.stop)
+        def runtime(reference=credentials.REFERENCE):
+            return [str(self.bws), '--ref', reference, '--var', 'GH_TOKEN=GITHUB_TOKEN', '--']
+
+        p=patch.object(credentials,'runtime_command',side_effect=runtime);p.start();self.addCleanup(p.stop)
         askpass=self.root/'askpass'
         askpass.write_text('#!/bin/sh\nprintf called > "'+str(self.root/'askpass-called')+'"\nexit 1\n');askpass.chmod(0o755)
         p=patch.dict(os.environ,{'PATH':str(self.root)+':'+os.environ['PATH'],'GH_TOKEN':'inert-old','GITHUB_TOKEN':'inert-old','BWS_ACCESS_TOKEN':'inert-bootstrap','GH_DEBUG':'api','GIT_ASKPASS':str(askpass)});p.start();self.addCleanup(p.stop)
@@ -65,6 +67,27 @@ else:print('accepted-'+str(n))
         result=autosync_core.run(['/bin/sh','-c','printf %s "$MARKER"'],env={'MARKER':'non-secret-fixture'})
         self.assertEqual(result.stdout,'non-secret-fixture')
         self.assertFalse((self.root/'count').exists())
+
+    def test_scoped_reference_is_used_by_gh_and_git_helpers(self):
+        reference = 'FEDORA_FIXTURE_GITHUB_ENV'
+        with patch.dict(os.environ, {credentials.REFERENCE_ENV: reference, 'EXPECTED_REFERENCE': reference}):
+            command, child_env = credentials.prepare_process(['gh', 'api', 'repos/fixture'])
+            self.assertNotIn(credentials.REFERENCE_ENV, child_env)
+            result = subprocess.run(command, env=child_env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.stdout.strip(), 'accepted-1', result.stderr)
+            self.assertEqual(result.returncode, 0)
+
+            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                       GIT_TERMINAL_PROMPT='0')
+            for helper in (credentials.git_credential_helper(),
+                           credentials.git_credential_helper(reference)):
+                result = subprocess.run(
+                    ['git', '-c', 'credential.helper=', '-c', 'credential.helper=' + helper,
+                     'credential', 'fill'],
+                    input='protocol=https\nhost=github.com\n\n', env=env, cwd=self.root,
+                    capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_git_private_credential_protocol_uses_vault_helper(self):
         env=dict(os.environ,GIT_CONFIG_GLOBAL=os.devnull,GIT_CONFIG_SYSTEM=os.devnull,GIT_TERMINAL_PROMPT='0')

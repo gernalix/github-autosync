@@ -336,8 +336,11 @@ Historical PR failure fingerprints remain readable but are no longer consumed by
 ### GitHub credentials from Bitwarden
 
 GitHub CLI subprocesses in the synchronizer and task writer fetch
-`GITHUB_TOKEN` from `FEDORA_GITHUB_ENV` through the Fedora `bws-credential`
-runtime on every invocation. Only `gh` receives it as `GH_TOKEN`; the parent
+`GITHUB_TOKEN` through the Fedora `bws-credential` runtime on every invocation.
+Set `BWS_GITHUB_REFERENCE` in the consumer's service to select a dedicated vault
+entry. This also selects the credential for the private-bootstrap helper.
+Standalone invocations without a selection use `FEDORA_GITHUB_ENV`. Only
+`gh` receives the credential as `GH_TOKEN`; the parent
 worker does not receive the fetched environment value. Other commands launched
 directly by the worker keep their own environment.
 Inherited GitHub tokens are excluded for these calls, and vault errors do not
@@ -347,6 +350,11 @@ process-scoped configuration. If retrieval fails, the helper returns Git's
 `quit=true` response to prevent other helpers and interactive prompts, as
 defined in the [Git credential protocol](https://git-scm.com/docs/gitcredentials#_custom_helpers).
 Existing SSH authentication remains separate.
+
+For regular HTTPS Git operations, generate the service's credential helper
+using `git_credential_helper(reference)` with the same vault reference, and
+install it in that service's unit-local Git configuration. Verify both the
+GitHub CLI and Git credential paths before switching the service.
 
 The Fedora runtime must be configured and its desktop Secret Service unlocked.
 No token renewal/revocation at GitHub is performed by this boundary. The initial

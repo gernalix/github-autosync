@@ -15,13 +15,12 @@ repository:
   branch_policy: main is canonical and protected; make changes in isolated task/*
     worktrees and integrate through repo-integrator.
 architecture:
-  summary: github_autosync.py orchestrates allowlisted synchronization through autosync_core.py;
-    repo_single_writer.py creates isolated task branches and queues integration PRs;
-    repo_integrator.py serializes integration; runtime_watchdog.py recovers the local
-    service installation. activity_journal.py owns append-only event normalization
-    and cursor persistence separately from transport; queued PR follow-ups are serialized
-    with the integrator and may only append committed clean descendants to the same
-    verified open PR.
+  summary: >-
+    github_autosync.py orchestrates allowlisted synchronization through autosync_core.py.
+    repo_single_writer.py creates isolated task branches, publishes durable Git checkpoints
+    and integrates locally on Fedora after validating the exact candidate. activity_journal.py
+    owns append-only event normalization and cursor persistence. repo_integrator.py retains
+    historical PR support; its timer is retired.
   entrypoints:
   - github_autosync.py
   - repo_single_writer.py
@@ -48,11 +47,11 @@ data:
 runtime:
   services:
   - github-autosync.service
-  - repo-integrator.service
+  - repo-integrator.service (retired legacy integration)
   - github-autosync-watchdog.service
   timers:
   - github-autosync.timer
-  - repo-integrator.timer
+  - repo-integrator.timer (retired legacy integration)
   - github-autosync-watchdog.timer
   containers: []
 devices: []
@@ -197,7 +196,7 @@ references:
   c2: Historical-only schema name; no C2/C3 dispatch or lifecycle writes.
   megavault: /home/daniele/MegaVault/megavault.sqlite
 freshness:
-  reviewed_commit: 7324dcd2bc512693fb6d63a7e16ec33897f29726
+  reviewed_commit: 2d0109432892bdccb826f326c411f4686c30c498
   watch_paths:
   - github_credentials.py
   - private_bootstrap.py

@@ -121,6 +121,7 @@ def preserved_integrated_history(payload, tip, base):
         try:
             raw=path.read_bytes();review=json.loads(raw)
             if path.parent.name!=hashlib.sha256(raw).hexdigest():continue
+            if 'task_id' in review and review['task_id'] != payload.get('task_id'):continue
             if (review.get('head')!=tip or review.get('branch')!=payload.get('branch')
                     or review.get('source')!=payload.get('worktree')
                     or review.get('disposition')!='integrated-ref'):continue
@@ -136,6 +137,7 @@ def preserved_integrated_history(payload, tip, base):
         try:
             raw=path.read_bytes();review=json.loads(raw)
             if path.parent.name!=hashlib.sha256(raw).hexdigest():continue
+            if 'task_id' in review and review['task_id'] != payload.get('task_id'):continue
             if (review.get('disposition')!='integrated' or review.get('expected_head')!=tip
                     or review.get('worktree')!=payload.get('worktree')):continue
             receipt=json.loads((path.parent/'receipt.json').read_text())
@@ -160,11 +162,52 @@ def preserved_integrated_split_tips(payload, local_tip, remote_tip, base):
             and writer._git(Path(payload['repo_path']),'merge-base','--is-ancestor',remote_tip,base).returncode==0)
 
 
-def preserve_integrated_ref(payload, tip, base, chat_id, *, scope_guard):
+def verify_integrated_web_task(repo, slug, task_id, tip, canonical_sha, *, worktree=None):
+    """Prove provenance from the exact ordinary Web task, never from a synthetic chat UUID."""
+    repo = Path(repo).resolve()
+    if not isinstance(task_id, str) or not re.fullmatch(r'[A-Za-z0-9._-]{1,80}', task_id):
+        raise ValueError('exact registered Web task ID required')
+    if not all(re.fullmatch(r'[0-9a-f]{40}', str(x)) for x in (tip, canonical_sha)):
+        raise ValueError('exact Git revisions required')
+    branch = 'task/' + task_id
+    found = writer._task_by_branch(slug, branch)
+    if not found:
+        raise ValueError('Web task owner not found')
+    _, task = found
+    path = Path(str(task.get('worktree') or '/')).resolve()
+    if (task.get('task_id') != task_id or task.get('branch') != branch
+            or str(task.get('repo', '')).lower() != slug.lower()
+            or Path(str(task.get('repo_path') or '/')).resolve() != repo
+            or task.get('actor') != 'chatgpt-web'
+            or task.get('status') != 'merged'
+            or task.get('integration_state') != 'merged'
+            or task.get('integration') not in {'local-fast-forward', 'local-merge'}
+            or task.get('roadmap_prompt_id') or task.get('pr_number')
+            or not c3_allows(task)
+            or task.get('canonical_branch') != writer._canonical_branch(repo)
+            or task.get('integrated_head') != tip or task.get('head_sha') != tip
+            or not re.fullmatch(r'[0-9a-f]{40}', str(task.get('merge_sha') or ''))
+            or not path.is_relative_to(writer.WORKTREE_ROOT.resolve())
+            or (worktree is not None and path != Path(worktree).resolve())):
+        raise ValueError('Web task provenance does not match an integrated local owner')
+    merge = task['merge_sha']
+    if (writer._git(repo, 'merge-base', '--is-ancestor', tip, merge).returncode
+            or writer._git(repo, 'merge-base', '--is-ancestor', merge, canonical_sha).returncode):
+        raise ValueError('Web task integration is not reachable in canonical history')
+    return task
+
+
+def preserve_integrated_ref(payload, tip, base, chat_id, *, scope_guard, task_id=None):
     """Caller holds RepoLock; preserve an integrated ref whose checkout is absent."""
     import hashlib,os,uuid
-    uuid.UUID(chat_id)
+    if (chat_id is None) == (task_id is None):
+        raise ValueError('exactly one archival provenance is required')
+    if chat_id is not None: uuid.UUID(chat_id)
     repo=Path(payload['repo_path']);branch=payload['branch']
+    if task_id is not None:
+        if scope_guard is None: raise ValueError('scope guard required for Web task preservation')
+        scope_guard(repo, payload['repo'])
+        verify_integrated_web_task(repo, payload['repo'], task_id, tip, writer._ok(repo,'rev-parse',base), worktree=payload['worktree'])
     terminal=(payload.get('status')=='merged' or
               (payload.get('status')=='superseded' and payload.get('terminal_evidence')))
     if not terminal or not branch.startswith('task/') or Path(payload['worktree']).exists():
@@ -181,7 +224,8 @@ def preserve_integrated_ref(payload, tip, base, chat_id, *, scope_guard):
         raise ValueError('another checkout still uses the ref')
     review={'disposition':'integrated-ref','repo':payload['repo'],'branch':branch,'head':tip,
             'canonical_sha':writer._ok(repo,'rev-parse',base),'source':payload['worktree'],
-            'chat_id':chat_id,'source_state':'checkout already absent; no original files removed'}
+            'source_state':'checkout already absent; no original files removed'}
+    review.update({'task_id':task_id} if task_id is not None else {'chat_id':chat_id})
     raw=json.dumps(review,sort_keys=True).encode();digest=hashlib.sha256(raw).hexdigest()
     root=writer.STATE_ROOT/'preserved-refs'/payload['repo'].replace('/','_')/digest
     root.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -615,7 +659,7 @@ def _verify_retired_git_review(review):
         raise ValueError('retired execution units are not confirmed inactive')
 
 
-def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_integrated_history=False, allow_reviewed_terminal_history=False, allow_reviewed_retired_history=False):
+def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_integrated_history=False, allow_reviewed_terminal_history=False, allow_reviewed_retired_history=False, task_id=None):
     """Privately preserve a reviewed, inactive worktree before retiring its checkout.
 
     The review is an explicit input, not lifecycle authority. Current Git and
@@ -629,12 +673,18 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
     repo=Path(repo).resolve();review_file=Path(review_file)
     raw=review_file.read_bytes();review=json.loads(raw)
     required={'worktree','expected_head','canonical_sha','status_sha256','disposition','replacement_commit','chat_id','inactive_confirmation','worktree_fingerprint','index_sha256'}
+    if task_id is not None:
+        if (scope_guard is None or not allow_integrated_history or allow_reviewed_terminal_history
+                or allow_reviewed_retired_history or review.get('disposition') != 'integrated'
+                or review.get('task_id') != task_id):
+            raise ValueError('Web task archival requires exact integrated review and scope guard')
+        required.remove('chat_id'); required.add('task_id')
     if allow_reviewed_retired_history:required.add('retirement_sha256')
     if allow_reviewed_retired_history and 'independent_git_fingerprint' in review:required|={'independent_git_fingerprint','independent_registered_head'}
     if set(review)!=required or not all(isinstance(v,str) and v.strip() for v in review.values()):
         raise ValueError('complete explicit archival review required')
     import uuid
-    uuid.UUID(review['chat_id'])
+    if task_id is None: uuid.UUID(review['chat_id'])
     if review['disposition'] not in {'integrated','patch-equivalent','superseded'}:
         raise ValueError('unsupported archival disposition')
     slug=writer._repo_slug(repo);path=Path(review['worktree']).resolve()
@@ -649,6 +699,8 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
     snapshot=lambda:worktree_snapshot(path)
     with writer.RepoLock(slug):
         if scope_guard is not None: scope_guard(repo, slug)
+        if task_id is not None:
+            verify_integrated_web_task(repo, slug, task_id, review['expected_head'], review['canonical_sha'], worktree=path)
         receipt=root/'receipt.json'
         if receipt.exists():
             saved=json.loads(receipt.read_text())
@@ -658,6 +710,8 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
         row=next((row for row in rows if row.get('worktree')==str(path)),None)
         retired=_legacy_path(path)
         retired_source=allow_reviewed_retired_history and review['disposition']=='superseded'
+        if task_id is not None and (not row or row.get('branch') != 'refs/heads/task/'+task_id):
+            raise ValueError('registered worktree branch does not match Web task')
         if not row or 'locked' in row or (retired and not allow_reviewed_retired_history):
             raise ValueError('unregistered, locked or frozen worktree')
         if retired_source:
@@ -769,6 +823,10 @@ def archive_reviewed_worktree(repo, review_file, *, scope_guard=None, allow_inte
         original=root/'original'
         if original.exists():raise ValueError('preserved original destination occupied')
         if scope_guard is not None: scope_guard(repo, slug)
+        if task_id is not None:
+            verify_integrated_web_task(repo, slug, task_id, head, live, worktree=path)
+            if writer._ok(repo,'ls-remote','origin','refs/heads/'+canonical).split()[0] != live:
+                raise ValueError('canonical remote changed during Web task archival')
         if retired_source:verify_retired_source(repo,review,scope_guard,worktree=path)
         elif allow_reviewed_retired_history:_verify_retired_git_review(review)
         if independent:

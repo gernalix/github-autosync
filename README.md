@@ -287,6 +287,16 @@ Numeric task IDs alone no longer identify C3: only positive modern merged-PR or
 explicit supersession evidence permits terminal collection; actual C3 markers
 remain protected.
 
+The MegaVault finalizer has a scoped alternative for ordinary, locally
+integrated ChatGPT Web tasks: the owner accepts the exact registered task ID
+instead of a Codex chat UUID. This requires a live scope guard, an unambiguous
+`chatgpt-web` owner with positive local integration evidence, unchanged
+source SHA and verified canonical ancestry. It archives only that task's
+clean checkout and validates its preservation receipt before collecting its
+refs; a ref-only remainder is preserved as a verified bundle. It cannot use
+this provenance for unrelated, active, superseded, PR-based or retired C2/C3
+work. The explicit chat-UUID review contract is unchanged.
+
 An explicit MegaVault review can preserve an integrated, clean Git checkout
 inside a retired C2 directory. It additionally binds `retirement_sha256` to the
 existing retirement marker, verifies its execution units are inactive both before

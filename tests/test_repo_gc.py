@@ -428,6 +428,72 @@ class ReviewedArchiveTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError,'active or frozen'):gc.archive_reviewed_worktree(repo,review)
                     self.assertTrue(tree.exists())
 
+    def test_web_task_provenance_archives_only_exact_owner_and_collects_refs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                payload.update(actor='chatgpt-web',integration='local-fast-forward',
+                               integration_state='merged',head_sha=payload['integrated_head'])
+                record=writer._task_record(repo,payload['task_id'])
+                writer._atomic_json(record,payload)
+                review=self.review(root,repo,tree,payload)
+                value=json.loads(review.read_text());value.pop('chat_id')
+                value['task_id']=payload['task_id'];review.write_text(json.dumps(value))
+                guard=lambda *args:None
+                tip=payload['integrated_head']
+                kwargs=dict(scope_guard=guard,allow_integrated_history=True,task_id=payload['task_id'])
+                with self.assertRaisesRegex(ValueError,'exact integrated review'):
+                    gc.archive_reviewed_worktree(repo,review,allow_integrated_history=True,task_id=payload['task_id'])
+                with self.assertRaisesRegex(ValueError,'exact integrated review'):
+                    gc.archive_reviewed_worktree(repo,review,**dict(kwargs,task_id='another'))
+                for field, bad in [('actor','codex'),('status','active'),('head_sha','0'*40),('roadmap_prompt_id','123456')]:
+                    writer._atomic_json(record,dict(payload,**{field:bad}))
+                    with self.assertRaisesRegex(ValueError,'provenance'):
+                        gc.archive_reviewed_worktree(repo,review,**kwargs)
+                    self.assertTrue(tree.exists())
+                writer._atomic_json(record,payload)
+                with self.assertRaisesRegex(ValueError,'must be archived'):
+                    writer.cleanup_terminal_task(payload['repo'],payload['branch'],expected_head=tip,
+                        canonical_sha=payload['merge_sha'],scope_guard=guard,preservation_task_id=payload['task_id'])
+                # The only copy of an ignored artifact must survive as original.
+                exclude=Path(writer._ok(repo,'rev-parse','--git-path','info/exclude'))
+                if not exclude.is_absolute():exclude=repo/exclude
+                with exclude.open('a') as stream:stream.write('private-artifact\n')
+                (tree/'private-artifact').write_text('synthetic artifact')
+                review=self.review(root,repo,tree,payload)
+                value=json.loads(review.read_text());value.pop('chat_id');value['task_id']=payload['task_id']
+                review.write_text(json.dumps(value))
+                receipt=gc.archive_reviewed_worktree(repo,review,**kwargs)
+                self.assertEqual('archived',receipt['status'])
+                self.assertEqual('synthetic artifact',(Path(receipt['original'])/'private-artifact').read_text())
+                self.assertTrue(gc.preserved_integrated_history(payload,tip,'origin/main'))
+                self.assertFalse(gc.preserved_integrated_history(dict(payload,task_id='other'),tip,'origin/main'))
+                result=writer.cleanup_terminal_task(payload['repo'],payload['branch'],expected_head=tip,
+                    canonical_sha=payload['merge_sha'],scope_guard=guard,preservation_task_id=payload['task_id'])
+                self.assertEqual(['remote-branch','local-branch'],result['removed'])
+                self.assertEqual('merged',json.loads(record.read_text())['status'])
+
+    def test_web_task_ref_only_preserves_bundle_without_chat_uuid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.object(writer,'STATE_ROOT',root/'state'),patch.object(writer,'WORKTREE_ROOT',root/'worktrees'):
+                repo,remote,tree,payload=self.fixture(root)
+                payload.update(actor='chatgpt-web',integration='local-fast-forward',
+                               integration_state='merged',head_sha=payload['integrated_head'])
+                writer._atomic_json(writer._task_record(repo,payload['task_id']),payload)
+                self.assertEqual(0,fixtures.git(['worktree','remove',str(tree)],repo).returncode)
+                tip=payload['integrated_head']
+                result=writer.cleanup_terminal_task(payload['repo'],payload['branch'],expected_head=tip,
+                    canonical_sha=payload['merge_sha'],scope_guard=lambda *args:None,preservation_task_id=payload['task_id'])
+                self.assertEqual(['remote-branch','local-branch'],result['removed'])
+                self.assertTrue(gc.preserved_integrated_history(payload,tip,'origin/main'))
+                reviews=list((writer.STATE_ROOT/'preserved-refs').glob('*/*/review.json'))
+                self.assertEqual(1,len(reviews))
+                proof=json.loads(reviews[0].read_text())
+                self.assertEqual(payload['task_id'],proof['task_id'])
+                self.assertNotIn('chat_id',proof)
+
     def test_explicit_integrated_history_preserves_original_then_collects_only_refs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

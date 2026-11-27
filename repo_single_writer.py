@@ -826,7 +826,7 @@ def retire_integrated_closed_task(repo_slug: str, branch: str, *, expected_head:
         return receipt
 
 
-def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, canonical_sha: str, scope_guard=None, preservation_chat_id=None) -> dict[str, Any]:
+def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, canonical_sha: str, scope_guard=None, preservation_chat_id=None, preservation_task_id=None) -> dict[str, Any]:
     """Collect only an already terminal record; never manufacture merged status."""
     with RepoLock(repo_slug):
         if scope_guard is not None: scope_guard()
@@ -847,7 +847,21 @@ def cleanup_terminal_task(repo_slug: str, branch: str, *, expected_head: str, ca
             if (fetched.returncode or _ok(repo,'rev-parse',tracking)!=live
                     or _ok(repo,'ls-remote','origin','refs/heads/'+payload['canonical_branch']).split()[0]!=live):
                 return {"status":"preserved","reason":"canonical-fetch-changed"}
-        from repo_gc import collect_record,preserve_integrated_ref
+        from repo_gc import collect_record,preserve_integrated_ref,preserved_integrated_history,verify_integrated_web_task
+        if preservation_task_id is not None:
+            if (preservation_chat_id is not None or scope_guard is None
+                    or branch != 'task/'+preservation_task_id):
+                raise ValueError('exact scoped Web task cleanup required')
+            scope_guard(repo,repo_slug)
+            verify_integrated_web_task(repo, repo_slug, preservation_task_id, expected_head, live, worktree=payload['worktree'])
+            if Path(payload['worktree']).exists():
+                raise ValueError('Web task checkout must be archived before ref cleanup')
+            if not preserved_integrated_history(payload,expected_head,tracking):
+                if tip.returncode != 0:
+                    raise ValueError('missing Web task preservation receipt or local ref')
+                preserve_integrated_ref(payload,expected_head,tracking,None,scope_guard=scope_guard,task_id=preservation_task_id)
+            if not preserved_integrated_history(payload,expected_head,tracking):
+                raise ValueError('Web task preservation readback failed')
         if (preservation_chat_id and tip.returncode==0
                 and _git(repo,'merge-base','--is-ancestor',expected_head,'refs/remotes/origin/'+payload['canonical_branch']).returncode==0):
             preserve_integrated_ref(payload,expected_head,'refs/remotes/origin/'+payload['canonical_branch'],
